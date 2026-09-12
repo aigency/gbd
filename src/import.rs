@@ -704,29 +704,34 @@ enum Code {
     /// Inside a span opened by a run of this many backticks; only a run of
     /// the same length closes it, so a literal backtick inside is fine.
     Span(usize),
-    /// Inside a fence opened by a run of this many backticks; a run at
-    /// least as long closes it.
-    Fence(usize),
+    /// Inside a fence opened by a run of this many backticks or tildes (the
+    /// char says which); a run of the same char at least as long closes it.
+    Fence(char, usize),
 }
 
 /// Advance the code state across `literal`.
 fn note_code(literal: &str, code: &mut Code) {
-    let mut run = 0usize;
+    let (mut run, mut run_char) = (0usize, '`');
     for c in literal.chars().chain(std::iter::once('\0')) {
-        if c == '`' {
+        if matches!(c, '`' | '~') && (run == 0 || c == run_char) {
             run += 1;
+            run_char = c;
             continue;
         }
         if run > 0 {
             *code = match *code {
-                Code::Prose if run >= 3 => Code::Fence(run),
-                Code::Prose => Code::Span(run),
-                Code::Span(n) if n == run => Code::Prose,
-                Code::Fence(n) if run >= n => Code::Prose,
+                Code::Prose if run >= 3 => Code::Fence(run_char, run),
+                Code::Prose if run_char == '`' => Code::Span(run),
+                Code::Span(n) if run_char == '`' && n == run => Code::Prose,
+                Code::Fence(f, n) if run_char == f && run >= n => Code::Prose,
                 same => same,
             };
         }
         run = 0;
+        if matches!(c, '`' | '~') {
+            run = 1;
+            run_char = c;
+        }
     }
 }
 
@@ -1233,6 +1238,16 @@ mod tests {
             rewrite_ids("see\u{a0}wx-2.", &known),
             "see\u{a0}#102.",
             "multi-byte whitespace"
+        );
+        assert_eq!(
+            rewrite_ids("~~~\nbd show wx-2\n~~~\nwx-2", &known),
+            "~~~\nbd show wx-2\n~~~\n#102",
+            "a tilde fence is left alone"
+        );
+        assert_eq!(
+            rewrite_ids("a~b wx-2", &known),
+            "a~b #102",
+            "a lone tilde is prose"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }

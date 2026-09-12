@@ -1990,8 +1990,8 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
         .next()
         .unwrap();
     assert!(
-        fixed.starts_with("Umbrella; the auth fix is #102."),
-        "{fixed}"
+        fixed.starts_with("Umbrella; the auth fix is #102. Tracked as #101."),
+        "a self-reference is rewritten too: {fixed}"
     );
     assert!(
         !calls.contains("issue edit 103 -R acme/widgets --body-file"),

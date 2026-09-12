@@ -1277,6 +1277,11 @@ fn import_run(
     let start_date = plan
         .items
         .iter()
+        .filter(|i| {
+            !done
+                .get(&i.bead)
+                .is_some_and(|m| m.phase == import::Phase::Done)
+        })
         .any(|i| i.start_date.is_some())
         .then(|| fields::start_date_field(org))
         .transpose()?;
@@ -1676,10 +1681,13 @@ impl Run<'_> {
                         reason: import::CloseReason::Completed,
                     };
                 }
-                Err(err) => warn(
-                    &mut warnings,
-                    format!("could not read its state, using the export's: {err:#}"),
-                ),
+                Err(err) => {
+                    warn(
+                        &mut warnings,
+                        format!("could not read its state, using the export's: {err:#}"),
+                    );
+                    self.unsure_blockers.insert(item.bead.clone());
+                }
             }
         }
         if let import::State::Closed { reason } = item.state {
@@ -1765,11 +1773,12 @@ impl Run<'_> {
             else {
                 continue;
             };
-            // Only what comes later in the plan was unknown at creation.
+            // Only what comes later in the plan, and the bead itself, was
+            // unknown at creation.
             let later: BTreeMap<String, u64> = self
                 .numbers
                 .iter()
-                .filter(|(b, _)| pos.get(b.as_str()).is_some_and(|&p| p > i))
+                .filter(|(b, _)| pos.get(b.as_str()).is_some_and(|&p| p >= i))
                 .map(|(b, n)| (b.clone(), *n))
                 .collect();
             if later.is_empty() || import::rewrite_ids(&item.body, &later) == item.body {
