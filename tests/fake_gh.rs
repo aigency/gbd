@@ -2380,6 +2380,29 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         h.calls()
     );
 
+    // GraphQL reports the secondary limit without a status line; still retried.
+    let h = Harness::new();
+    h.on_seq(
+        "search",
+        "search(query: $q",
+        &[
+            "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+            &search_response(&format!("{NODE_10},{NODE_8}")),
+        ],
+    );
+    fs::write(h.gh_dir.path().join("search.code.1"), "1").unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .success();
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        2,
+        "{}",
+        h.calls()
+    );
+
     // The primary hourly quota is not retried either: it will not clear in time.
     let h = Harness::new();
     h.on_fail(

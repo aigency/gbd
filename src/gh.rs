@@ -73,8 +73,11 @@ fn failure_text(output: &Output) -> String {
 /// backoffs for it would be pointless, so that one fails immediately.
 fn rate_limited(output: &Output) -> bool {
     let msg = failure_text(output);
+    // `gh api graphql` reports the secondary limit inside a 200 with no
+    // status line, so the explicit wording counts on its own; the vaguer
+    // "abuse" wording needs the status to back it up.
     let status = msg.contains("http 429") || msg.contains("http 403");
-    status && (msg.contains("secondary rate limit") || msg.contains("abuse"))
+    msg.contains("secondary rate limit") || (status && msg.contains("abuse"))
 }
 
 /// `retry-after: 30` → 30 000 ms, when gh relays the header.
