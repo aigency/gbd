@@ -7,21 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-09-12
-
-### Added
-
-- feat: store priority on the org issue field as P0-P4
-
-## [0.1.0] - 2026-09-11
-
-### Added
-
-- feat: ship gbd CLI wrapping gh, with xbm-style install and release
+## [1.0.0] - 2026-09-12
 
 ### Other
 
-- Planning spec: GBD on GitHub Issues and Projects
-- Initial commit
+- feat!: gbd 1.0.0
 
 
