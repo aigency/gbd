@@ -849,6 +849,13 @@ fn has_closer(s: &str, n: usize) -> bool {
     false
 }
 
+/// `str::find` without regard to ASCII case; `needle` is ASCII.
+fn find_ignore_ascii_case(hay: &str, needle: &str) -> Option<usize> {
+    hay.as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Byte index of the `>` that closes an HTML tag whose `<` sits just before
 /// `s`, quotes respected; None when it does not close in the paragraph.
 fn tag_end(s: &str) -> Option<usize> {
@@ -906,15 +913,16 @@ fn is_indented(line: &str) -> bool {
 /// block (the import footer and command examples), a bare URL (a word
 /// containing `://`, words ending at whitespace or angle or square
 /// brackets, so parentheses inside a URL are part of it), a Markdown
-/// link destination (`](…)`), a reference definition (`[label]: …`), and
-/// an HTML tag or comment (`<a href="…">`); the link's visible text is
-/// still rewritten. Anything not in `known` stays as written.
+/// link destination (`](…)`), a reference definition (`[label]: …`), an
+/// HTML tag or comment (`<a href="…">`), and a `<code>` or `<pre>` element;
+/// the link's visible text is still rewritten. Anything not in `known`
+/// stays as written.
 ///
 /// An indented code block is a line indented four spaces or a tab after a
 /// blank line (or at the start), through the next line indented less. A
 /// nested list item indented that far after a blank line counts too and is
-/// left as written: the safe direction. Fences are seen through block-quote
-/// markers; no other container is modelled beyond its indentation.
+/// left as written: the safe direction. Block-quote markers are seen
+/// through; no other container is modelled beyond its indentation.
 pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     fn id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
@@ -938,7 +946,9 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         // all destination, and an indented code block is copied through.
         if out.is_empty() || out.ends_with('\n') {
             let line = &rest[..line_end];
-            let blank = line.trim().is_empty();
+            // Block-quote markers are seen through by the line rules.
+            let (_, inner) = unquote(line);
+            let blank = inner.trim().is_empty();
             // Inside a fence every line is code, and only a line of the
             // fence closes it, or the block quote it sits in ending.
             let mut verbatim = None;
@@ -958,10 +968,10 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                     // A blank line ends the paragraph, and any span in it.
                     md = Code::Prose;
                 }
-                if indented && !blank && !is_indented(line) {
+                if indented && !blank && !is_indented(inner) {
                     indented = false;
                 }
-                if !indented && prev_blank && !blank && is_indented(line) {
+                if !indented && prev_blank && !blank && is_indented(inner) {
                     indented = true;
                 }
                 if indented {
@@ -993,11 +1003,30 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
             }
         }
         // Inside an HTML tag: copy it through its `>`; one that never
-        // closes is prose.
+        // closes is prose. A `<code>` or `<pre>` element is code through
+        // its closing tag.
         if md == Code::Prose && out.ends_with('<') && rest.starts_with(tag_start) {
             if let Some(i) = tag_end(rest) {
-                out.push_str(&rest[..=i]);
-                rest = &rest[i + 1..];
+                let name: String = rest[..i]
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect();
+                let mut end = i + 1;
+                if matches!(name.as_str(), "code" | "pre") && !rest[..i].ends_with('/') {
+                    let close = format!("</{name}");
+                    end = match find_ignore_ascii_case(&rest[end..], &close) {
+                        Some(j) => {
+                            let after = end + j + close.len();
+                            rest[after..]
+                                .find('>')
+                                .map_or(rest.len(), |k| after + k + 1)
+                        }
+                        None => rest.len(),
+                    };
+                }
+                out.push_str(&rest[..end]);
+                rest = &rest[end..];
                 continue;
             }
         }
@@ -1635,6 +1664,26 @@ mod tests {
             rewrite_ids("> see wx-2", &known),
             "> see #102",
             "quoted prose is prose"
+        );
+        assert_eq!(
+            rewrite_ids("> para\n>\n>     bd show wx-2\n\nwx-2", &known),
+            "> para\n>\n>     bd show wx-2\n\n#102",
+            "indented code inside a block quote"
+        );
+        assert_eq!(
+            rewrite_ids("<code>bd show wx-2</code> wx-2", &known),
+            "<code>bd show wx-2</code> #102",
+            "a code element is code"
+        );
+        assert_eq!(
+            rewrite_ids("<pre>\nwx-2\n</PRE>\nwx-2", &known),
+            "<pre>\nwx-2\n</PRE>\n#102",
+            "a pre element is code, whatever the case of its closing tag"
+        );
+        assert_eq!(
+            rewrite_ids("<code/> wx-2 <b>wx-2</b>", &known),
+            "<code/> #102 <b>#102</b>",
+            "a self-closing code tag and other elements are prose"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
