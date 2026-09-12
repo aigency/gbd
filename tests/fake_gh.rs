@@ -2376,6 +2376,25 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         h.calls()
     );
 
+    // The primary hourly quota is not retried either: it will not clear in time.
+    let h = Harness::new();
+    h.on_fail(
+        "search",
+        "search(query: $q",
+        "HTTP 403: API rate limit exceeded for user ID 1. (https://docs.github.com/rest/overview/rate-limits-for-the-rest-api)",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        1,
+        "{}",
+        h.calls()
+    );
+
     // A plain failure is not retried: a create behind a 502 may have gone through.
     let h = Harness::new();
     h.on_fail("search", "search(query: $q", "HTTP 502: Bad Gateway");

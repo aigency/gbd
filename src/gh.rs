@@ -22,12 +22,13 @@ pub fn run(args: &[&str]) -> Result<String> {
     retrying(args, None)
 }
 
-/// Run, and when GitHub answers with a secondary rate limit (HTTP 403
-/// "rate limit"/"abuse" or HTTP 429), wait and try again: those answers
-/// mean the request was rejected, so repeating it is safe. Anything else,
-/// 5xx included, is returned as is, since a create behind a 502 may have
-/// gone through. Waits double from `GBD_BACKOFF_MS` (default 15 s) over
-/// five retries, or follow a `retry-after: N` in the message.
+/// Run, and when GitHub answers with its secondary rate limit (HTTP 403 or
+/// 429 saying "secondary rate limit" or "abuse"), wait and try again: that
+/// answer means the request was rejected, so repeating it is safe. The
+/// primary hourly quota is not retried (it will not clear in time), and
+/// neither is anything else, 5xx included, since a create behind a 502
+/// may have gone through. Waits double from `GBD_BACKOFF_MS` (default
+/// 15 s) over five retries, or follow a `retry-after: N` in the message.
 fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
     const RETRIES: u32 = 5;
     let base: u64 = std::env::var("GBD_BACKOFF_MS")
@@ -64,10 +65,13 @@ fn failure_text(output: &Output) -> String {
     text.to_ascii_lowercase()
 }
 
+/// The secondary (abuse) limit only: it clears in seconds to minutes. The
+/// primary hourly quota also says "rate limit", but waiting five short
+/// backoffs for it would be pointless, so that one fails immediately.
 fn rate_limited(output: &Output) -> bool {
     let msg = failure_text(output);
-    msg.contains("http 429")
-        || (msg.contains("http 403") && (msg.contains("rate limit") || msg.contains("abuse")))
+    let status = msg.contains("http 429") || msg.contains("http 403");
+    status && (msg.contains("secondary rate limit") || msg.contains("abuse"))
 }
 
 /// `retry-after: 30` → 30 000 ms, when gh relays the header.
