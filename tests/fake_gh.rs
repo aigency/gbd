@@ -2353,6 +2353,138 @@ fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
 }
 
 #[test]
+fn a_secondary_rate_limit_is_retried_after_waiting() {
+    let h = Harness::new();
+    h.on_seq(
+        "search",
+        "search(query: $q",
+        &[
+            "HTTP 429: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+            &search_response(&format!("{NODE_10},{NODE_8}")),
+        ],
+    );
+    fs::write(h.gh_dir.path().join("search.code.1"), "1").unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("child B"))
+        .stderr(predicate::str::contains(
+            "gh: rate limited; retrying in 1s (1 of 5)",
+        ));
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        2,
+        "{}",
+        h.calls()
+    );
+
+    // GraphQL reports the secondary limit without a status line; still retried.
+    let h = Harness::new();
+    h.on_seq(
+        "search",
+        "search(query: $q",
+        &[
+            "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+            &search_response(&format!("{NODE_10},{NODE_8}")),
+        ],
+    );
+    fs::write(h.gh_dir.path().join("search.code.1"), "1").unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .success();
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        2,
+        "{}",
+        h.calls()
+    );
+
+    // The primary hourly quota is not retried either: it will not clear in time.
+    let h = Harness::new();
+    h.on_fail(
+        "search",
+        "search(query: $q",
+        "HTTP 403: API rate limit exceeded for user ID 1. (https://docs.github.com/rest/overview/rate-limits-for-the-rest-api)",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        1,
+        "{}",
+        h.calls()
+    );
+
+    // A plain failure is not retried: a create behind a 502 may have gone through.
+    let h = Harness::new();
+    h.on_fail("search", "search(query: $q", "HTTP 502: Bad Gateway");
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        1,
+        "{}",
+        h.calls()
+    );
+
+    // `issue create` is several mutations in one: never retried, even on a
+    // real secondary limit, since the issue may already exist.
+    let h = Harness::new();
+    h.on_fail(
+        "create",
+        "issue create -R acme/widgets",
+        "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["create", "One shot", "-t", "Task"])
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("issue create").count(),
+        1,
+        "{}",
+        h.calls()
+    );
+
+    // The words in the command itself never count: only what gh printed.
+    let h = Harness::new();
+    h.on_fail(
+        "create",
+        "issue create -R acme/widgets",
+        "HTTP 502: Bad Gateway",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args([
+            "create",
+            "HTTP 403 rate limit abuse",
+            "-t",
+            "Task",
+            "--body",
+            "HTTP 429",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("issue create").count(),
+        1,
+        "{}",
+        h.calls()
+    );
+}
+
+#[test]
 fn import_reconciles_comments_from_github_before_resuming() {
     let h = Harness::new();
     board_fixtures(&h);

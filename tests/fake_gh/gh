@@ -5,7 +5,8 @@
 # substring of the invocation ("$*"), print NAME.out and exit with NAME.code
 # (default 0). First match in sorted filename order wins. If NAME.out.1,
 # NAME.out.2, … exist, successive matches return them in order (for
-# read-modify-read flows). Every invocation is appended to
+# read-modify-read flows; NAME.code.N sets that match's exit code). Every
+# invocation is appended to
 # $FAKE_GH_DIR/calls.log; stdin (any bare `-` argument: --input -, --body-file -)
 # is logged on the following line as "STDIN: ...".
 set -u
@@ -35,6 +36,7 @@ for args in "$dir"/*.args; do
       fi
       code=0
       [ -e "$base.code" ] && code=$(cat "$base.code")
+      [ -e "$base.code.$n" ] && code=$(cat "$base.code.$n")
       exit "$code"
       ;;
   esac

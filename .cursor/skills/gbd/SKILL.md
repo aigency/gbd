@@ -45,3 +45,9 @@ One command. Type, priority, parent, blocked-by together:
 
 `gbd remember "insight"` / `gbd recall <key>` / `gbd forget <key>` / `gbd memories`.
 One closed untyped issue with org field **gbd Role = Memory**. Not AGENTS.md.
+
+## Migrating from Beads
+
+`gbd import --from-beads beads.jsonl --dry-run` shows the plan; `--yes`
+creates the issues. One shot, resumable through `beads-map.jsonl`, not
+a sync: after it, `bd` is retired for the repo.

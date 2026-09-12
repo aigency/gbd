@@ -19,7 +19,84 @@ fn base_command() -> Command {
 
 /// Run `gh` with the given args. Returns stdout (trimmed) on success.
 pub fn run(args: &[&str]) -> Result<String> {
-    finish(args, &spawn(args, None)?)
+    retrying(args, None)
+}
+
+/// Run, and when GitHub answers with its secondary rate limit (HTTP 403 or
+/// 429 saying "secondary rate limit" or "abuse"), wait and try again: that
+/// answer means the request was rejected, so repeating it is safe. The
+/// primary hourly quota is not retried (it will not clear in time), and
+/// neither is anything else, 5xx included, since a create behind a 502
+/// may have gone through; `gh issue create` is never retried at all, being
+/// several mutations in one. gh does not relay the `Retry-After` header for
+/// these commands, so the wait is what GitHub documents for that case:
+/// at least a minute, doubling on each retry (`GBD_BACKOFF_MS` sets the
+/// first wait; five retries). A `retry-after: N` in the message, when gh
+/// does print one, is honoured instead.
+fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
+    const RETRIES: u32 = 5;
+    let base: u64 = std::env::var("GBD_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+    // `gh issue create --type` is two mutations (create, then set the
+    // type; parent and blocked-by add more): a limit hit on a later one
+    // leaves the issue in place, so repeating the command would duplicate
+    // it. That command gets one attempt; `gbd import` finds an issue whose
+    // record was lost on its next run.
+    let composite = args.first() == Some(&"issue") && args.get(1) == Some(&"create");
+    let mut wait = base;
+    for attempt in 1..=RETRIES {
+        let output = spawn(args, stdin)?;
+        // Classified on what gh printed, never on the command line: a body
+        // that happens to say "rate limit" must not turn a 502 into a retry.
+        if composite || output.status.success() || !rate_limited(&output) {
+            return finish(args, &output);
+        }
+        let ms = retry_after_ms(&output).unwrap_or(wait);
+        eprintln!(
+            "gh: rate limited; retrying in {}s ({attempt} of {RETRIES})",
+            ms.div_ceil(1000)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        wait = wait.saturating_mul(2);
+    }
+    finish(args, &spawn(args, stdin)?)
+}
+
+/// gh's own output for a failed call, lowercased: stderr, else stdout.
+fn failure_text(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&output.stdout)
+    } else {
+        stderr
+    };
+    text.to_ascii_lowercase()
+}
+
+/// The secondary (abuse) limit only: it clears in seconds to minutes. The
+/// primary hourly quota also says "rate limit", but waiting five short
+/// backoffs for it would be pointless, so that one fails immediately.
+fn rate_limited(output: &Output) -> bool {
+    let msg = failure_text(output);
+    // `gh api graphql` reports the secondary limit inside a 200 with no
+    // status line, so the explicit wording counts on its own; the vaguer
+    // "abuse" wording needs the status to back it up.
+    let status = msg.contains("http 429") || msg.contains("http 403");
+    msg.contains("secondary rate limit") || (status && msg.contains("abuse"))
+}
+
+/// `retry-after: 30` → 30 000 ms, when gh relays the header.
+fn retry_after_ms(output: &Output) -> Option<u64> {
+    let msg = failure_text(output);
+    let idx = msg.find("retry-after:")?;
+    let secs: String = msg[idx + "retry-after:".len()..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    secs.parse::<u64>().ok().map(|s| s.saturating_mul(1000))
 }
 
 fn finish(args: &[&str], output: &Output) -> Result<String> {
@@ -38,7 +115,7 @@ fn finish(args: &[&str], output: &Output) -> Result<String> {
 
 /// Run `gh` with `stdin` piped in (for `--body-file -` and friends).
 pub fn run_stdin(args: &[&str], stdin: &[u8]) -> Result<String> {
-    finish(args, &spawn(args, Some(stdin))?)
+    retrying(args, Some(stdin))
 }
 
 pub fn run_json<T: DeserializeOwned>(args: &[&str]) -> Result<T> {
@@ -97,7 +174,7 @@ pub fn api(method: &str, path: &str, body: Option<&Value>) -> Result<String> {
         args.push("-".into());
     }
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    finish(&str_args, &spawn(&str_args, stdin.as_deref())?)
+    retrying(&str_args, stdin.as_deref())
 }
 
 pub fn api_json<T: DeserializeOwned>(method: &str, path: &str, body: Option<&Value>) -> Result<T> {
