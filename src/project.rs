@@ -4,19 +4,25 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::gh;
 use crate::repo::Repo;
 
 pub const STATUS_READY: &str = "Ready";
 pub const STATUS_IN_PROGRESS: &str = "In Progress";
+/// Maintained by gbd from GitHub's open-blocker count, never set by hand:
+/// project views cannot filter on `is:blocked`, so the board carries it.
+pub const STATUS_BLOCKED: &str = "Blocked";
 pub const STATUS_DEFERRED: &str = "Deferred";
 pub const STATUS_DONE: &str = "Done";
 
-/// The four options `gbd init` puts on the Status field, with colors.
-pub const STATUSES: [(&str, &str); 4] = [
+/// The five options `gbd init` puts on the Status field, in column order,
+/// with colors.
+pub const STATUSES: [(&str, &str); 5] = [
     (STATUS_READY, "GREEN"),
     (STATUS_IN_PROGRESS, "YELLOW"),
+    (STATUS_BLOCKED, "RED"),
     (STATUS_DEFERRED, "GRAY"),
     (STATUS_DONE, "PURPLE"),
 ];
@@ -263,48 +269,112 @@ impl Board {
         Ok(())
     }
 
-    /// Make sure Ready / In Progress / Deferred / Done exist on Status.
+    /// `option id → (color, description)` for Status. `gh project
+    /// field-list` returns ids and names only.
+    fn option_details(&self) -> Result<HashMap<String, (String, String)>> {
+        const QUERY: &str = r"query($id: ID!) {
+  node(id: $id) { ... on ProjectV2SingleSelectField { options { id name color description } } }
+}";
+        let data = gh::graphql(QUERY, &[("id", &self.status_field_id)]).map_err(scope_error)?;
+        let options = data
+            .pointer("/data/node/options")
+            .and_then(Value::as_array)
+            .context("reading Status options")?;
+        Ok(options
+            .iter()
+            .filter_map(|o| {
+                let id = o.get("id")?.as_str()?.to_string();
+                let color = o.get("color")?.as_str()?.to_string();
+                let description = o
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Some((id, (color, description)))
+            })
+            .collect())
+    }
+
+    /// Make sure every option in [`STATUSES`] exists on Status.
     ///
-    /// `updateProjectV2Field` replaces the option list wholesale, so existing
-    /// option names are carried over. On a board `gbd init` just created,
-    /// GitHub's default `Todo` is renamed to `Ready`; on an existing board it
-    /// is kept, so no item silently loses its status.
+    /// `updateProjectV2Field` replaces the option list wholesale. Existing
+    /// options are carried over with their ids, colors, and descriptions:
+    /// GitHub keeps an option's identity, and so every card's value, only
+    /// when the id is sent. A missing option is slotted in after the nearest
+    /// earlier gbd status the board has (Blocked lands between In Progress
+    /// and Deferred on a pre-1.2 board). On a board `gbd init` just created,
+    /// GitHub's default `Todo` is renamed to `Ready`; on an existing board
+    /// it is kept, so no item silently loses its status.
     pub fn ensure_statuses(&mut self, fresh: bool) -> Result<bool> {
-        let mut names: Vec<(String, &str)> = self
+        struct Opt {
+            /// None for an option that does not exist yet.
+            id: Option<String>,
+            name: String,
+            /// None: keep the board's color.
+            color: Option<&'static str>,
+        }
+        let mut options: Vec<Opt> = self
             .status_options
             .iter()
-            .map(|o| {
-                let color = STATUSES
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(&o.name))
-                    .map_or("GRAY", |(_, c)| *c);
-                (o.name.clone(), color)
+            .map(|o| Opt {
+                id: Some(o.id.clone()),
+                name: o.name.clone(),
+                color: None,
             })
             .collect();
-        if fresh && !self.has_status(STATUS_READY) {
-            if let Some(todo) = names
-                .iter_mut()
-                .find(|(n, _)| n.eq_ignore_ascii_case("Todo"))
-            {
-                *todo = (STATUS_READY.to_string(), "GREEN");
-            }
-        }
         let mut changed = false;
-        for (want, color) in STATUSES {
-            if !names.iter().any(|(n, _)| n.eq_ignore_ascii_case(want)) {
-                names.push((want.to_string(), color));
+        if fresh && !self.has_status(STATUS_READY) {
+            if let Some(todo) = options
+                .iter_mut()
+                .find(|o| o.name.eq_ignore_ascii_case("Todo"))
+            {
+                todo.name = STATUS_READY.to_string();
+                todo.color = Some("GREEN");
                 changed = true;
             }
         }
-        if !changed && (!fresh || self.has_status(STATUS_READY)) {
+        for (pos, (want, color)) in STATUSES.iter().enumerate() {
+            if options.iter().any(|o| o.name.eq_ignore_ascii_case(want)) {
+                continue;
+            }
+            let at = STATUSES[..pos]
+                .iter()
+                .rev()
+                .find_map(|(prev, _)| {
+                    options
+                        .iter()
+                        .position(|o| o.name.eq_ignore_ascii_case(prev))
+                })
+                .map_or(options.len(), |i| i + 1);
+            options.insert(
+                at,
+                Opt {
+                    id: None,
+                    name: (*want).to_string(),
+                    color: Some(color),
+                },
+            );
+            changed = true;
+        }
+        if !changed {
             return Ok(false);
         }
-        let options = names
+        let current = self.option_details()?;
+        // JSON string literals are valid GraphQL string literals.
+        let lit = |s: &str| serde_json::to_string(s).unwrap_or_default();
+        let options = options
             .iter()
-            .map(|(n, c)| {
+            .map(|o| {
+                let kept = o.id.as_deref().and_then(|id| current.get(id));
+                let color = o.color.or(kept.map(|(c, _)| c.as_str())).unwrap_or("GRAY");
+                let description = kept.map_or("", |(_, d)| d.as_str());
+                let id =
+                    o.id.as_deref()
+                        .map_or(String::new(), |id| format!(r#"id: "{id}", "#));
                 format!(
-                    r#"{{name: "{}", color: {c}, description: ""}}"#,
-                    n.replace('"', "\\\"")
+                    "{{{id}name: {}, color: {color}, description: {}}}",
+                    lit(&o.name),
+                    lit(description)
                 )
             })
             .collect::<Vec<_>>()
@@ -440,6 +510,9 @@ pub fn status_for(word: &str) -> Result<&'static str> {
             "in_progress" | "inprogress" | "claimed" => STATUS_IN_PROGRESS,
             "deferred" | "defer" => STATUS_DEFERRED,
             "done" | "closed" => STATUS_DONE,
+            "blocked" => bail!(
+                "blocked is not set by hand; it follows from open blockers (gbd dep add <n> <blocker>)"
+            ),
             other => bail!("unknown status {other:?}; use ready, in_progress, deferred, or done"),
         },
     )

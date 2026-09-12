@@ -406,7 +406,7 @@ fn board_fixtures(h: &Harness) {
          r#"{"id":"PVT_1","number":7,"title":"widgets board","url":"https://github.com/orgs/acme/projects/7"}"#)
      .on("pfields", "project field-list 7 --owner acme --format json",
          r#"{"fields":[{"id":"F_status","name":"Status","type":"ProjectV2SingleSelectField","options":[
-            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
             {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
      .on("padd", "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/12 --format json",
          r#"{"id":"PVTI_12"}"#)
@@ -665,7 +665,7 @@ fn board_sync_adds_open_issues_that_have_no_status() {
         // #4 is assigned in snapshot.json: the pre-board in-progress signal.
         // BTreeMap order puts "In Progress" before "Ready".
         .stdout(predicate::str::contains(
-            "added #4 as In Progress, #5 #6 #8 #9 as Ready (1 already had a Status)",
+            "added #4 as In Progress, #5 #6 #8 #9 as Ready; 1 unchanged",
         ));
     let calls = h.calls();
     assert_eq!(calls.matches("project item-add").count(), 5, "{calls}");
@@ -730,10 +730,16 @@ fn status_change_with_a_board_moves_the_card_only() {
         !calls.contains("--add-assignee"),
         "board is authoritative; no assignee edit: {calls}"
     );
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("In Progress"), "")),
+    );
     h.gbd()
         .args(["update", "12", "--status", "ready"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("updated #12 (status Ready)"));
     let calls = h.calls();
     assert!(
         calls.contains("--single-select-option-id O_ready"),
@@ -1073,6 +1079,11 @@ fn undefer_deletes_the_field_value_and_moves_the_card_to_ready() {
         "clear",
         "--method DELETE -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/12/issue-field-values/7886557",
         "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Deferred"), "")),
     );
     h.gbd()
         .args(["undefer", "12"])
@@ -1120,8 +1131,23 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
         r#"{"id":"PVT_8","number":8,"title":"widgets board","url":"https://github.com/orgs/acme/projects/8"}"#)
     .on("05-pfields", "project field-list 8 --owner acme --format json",
         r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
+            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
+    .on("06-options", "updateProjectV2Field", r#"{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_status"}}}}"#)
+    .on("07-details", "options { id name color description }",
+        r#"{"data":{"node":{"options":[
+            {"id":"O_ready","name":"Ready","color":"GREEN","description":""},
+            {"id":"O_wip","name":"In Progress","color":"BLUE","description":"hands on"},
+            {"id":"O_def","name":"Deferred","color":"GRAY","description":null},
+            {"id":"O_done","name":"Done","color":"PURPLE","description":""}]}}}"#);
+    // The board predates Blocked: the first read shows four options.
+    fs::write(
+        h.gh_dir.path().join("05-pfields.out.1"),
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
             {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
-            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#);
+            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#,
+    )
+    .unwrap();
     h.gbd()
         .args(["init", "--no-memory", "--no-skills"])
         .assert()
@@ -1133,6 +1159,15 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
         "must adopt, not create a second board: {calls}"
     );
     assert!(!calls.contains("project link"), "{calls}");
+    // Existing options go back with their ids (without them GitHub treats
+    // the list as new options and clears every card's Status) and with the
+    // board's own colors and descriptions, not gbd's defaults.
+    assert!(
+        calls.contains(
+            r#"{id: "O_wip", name: "In Progress", color: BLUE, description: "hands on"}, {name: "Blocked", color: RED, description: ""}, {id: "O_def", name: "Deferred", color: GRAY, description: ""}"#
+        ),
+        "Blocked slotted in between In Progress and Deferred, existing options kept: {calls}"
+    );
     let cfg = fs::read_to_string(h.cwd.path().join(".gbd.yml")).unwrap();
     assert!(cfg.contains("project: 8\n"), "{cfg}");
     // Second run: same result, still no create.
@@ -1141,6 +1176,12 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
         .assert()
         .success();
     assert!(!h.calls().contains("project create"), "{}", h.calls());
+    assert_eq!(
+        h.calls().matches("updateProjectV2Field").count(),
+        1,
+        "options are complete after the first run: {}",
+        h.calls()
+    );
 }
 
 #[test]
@@ -1241,7 +1282,7 @@ fn init_pages_linked_projects_before_deciding_to_create() {
         r#"{"id":"PVT_8","number":8,"title":"widgets board","url":"https://github.com/orgs/acme/projects/8"}"#)
     .on("06-pfields", "project field-list 8 --owner acme --format json",
         r#"{"fields":[{"id":"F_status","name":"Status","options":[
-            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
             {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#);
     h.gbd()
         .args(["init", "--no-memory", "--no-skills"])
@@ -1282,4 +1323,506 @@ fn an_old_gh_is_refused_before_any_other_call() {
         .assert()
         .success()
         .stdout(predicate::str::contains("gh: 2.94.0"));
+}
+
+// ---------------------------------------------------------------------------
+// Blocked on the board (#19)
+
+/// A row node for `acme/widgets#number`: `open_blockers` is GitHub's own
+/// count, `status` its card on board #7 (None: not on the board), and
+/// `blocking` the JSON nodes of the issues it blocks.
+fn card_node(
+    number: u64,
+    state: &str,
+    open_blockers: u32,
+    status: Option<&str>,
+    blocking: &str,
+) -> String {
+    let item = status.map_or(String::new(), |s| {
+        format!(
+            r#"{{"project":{{"number":7,"owner":{{"login":"acme"}}}},"fieldValueByName":{{"name":"{s}"}}}}"#
+        )
+    });
+    format!(
+        r#"{{"id":"I{number}","number":{number},"title":"issue {number}","url":"https://github.com/acme/widgets/issues/{number}","state":"{state}",
+          "issueType":{{"name":"Task"}},"assignees":{{"nodes":[]}},"parent":null,
+          "issueDependenciesSummary":{{"blockedBy":{open_blockers},"blocking":0}},
+          "blockedBy":{{"nodes":[]}},"blocking":{{"nodes":[{blocking}]}},
+          "issueFieldValues":{{"nodes":[]}},
+          "projectItems":{{"pageInfo":{{"hasNextPage":false}},"nodes":[{item}]}}}}"#
+    )
+}
+
+fn detail_response(node: &str) -> String {
+    format!(r#"{{"data":{{"repository":{{"issue":{node}}}}}}}"#)
+}
+
+#[test]
+fn create_with_open_deps_is_added_to_the_board_as_blocked() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/42",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(42, "OPEN", 2, None, "")),
+    )
+    .on(
+        "padd42",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/42 --format json",
+        r#"{"id":"PVTI_42"}"#,
+    )
+    .on("pedit42", "project item-edit --id PVTI_42", "");
+    h.gbd()
+        .args(["create", "Wire the board", "-t", "Task", "--deps", "12,13"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status Blocked"));
+    let calls = h.calls();
+    assert!(calls.contains("--blocked-by 12,13"), "{calls}");
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn create_without_deps_is_ready_and_does_not_fetch() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/42",
+    )
+    .on(
+        "padd42",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/42 --format json",
+        r#"{"id":"PVTI_42"}"#,
+    )
+    .on("pedit42", "project item-edit --id PVTI_42", "");
+    h.gbd()
+        .args(["create", "Wire the board", "-t", "Task"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status Ready"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("issue(number"),
+        "no fetch without deps: {calls}"
+    );
+    assert!(
+        calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn dep_add_moves_a_ready_card_to_blocked() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "edit",
+        "issue edit 12 -R acme/widgets --add-blocked-by 9",
+        "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 1, Some("Ready"), "")),
+    );
+    h.gbd()
+        .args(["dep", "add", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "#12 is blocked by #9; #12 → Blocked",
+        ));
+    let calls = h.calls();
+    let edit = calls.find("--add-blocked-by 9").expect(&calls);
+    let card = calls
+        .find("--single-select-option-id O_blocked")
+        .expect(&calls);
+    assert!(
+        edit < card,
+        "the dependency lands before the card moves: {calls}"
+    );
+}
+
+#[test]
+fn dep_add_leaves_an_in_progress_card_alone() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "edit",
+        "issue edit 12 -R acme/widgets --add-blocked-by 9",
+        "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 1, Some("In Progress"), "")),
+    );
+    h.gbd()
+        .args(["dep", "add", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 is blocked by #9\n"));
+    let calls = h.calls();
+    assert!(calls.contains("--add-blocked-by 9"), "{calls}");
+    assert!(
+        !calls.contains("project item-"),
+        "someone's decision, not touched: {calls}"
+    );
+}
+
+#[test]
+fn dep_remove_moves_a_blocked_card_back_to_ready() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "edit",
+        "issue edit 12 -R acme/widgets --remove-blocked-by 9",
+        "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Blocked"), "")),
+    );
+    h.gbd()
+        .args(["dep", "remove", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "#12 no longer blocked by #9; #12 → Ready",
+        ));
+    assert!(
+        h.calls().contains("--single-select-option-id O_ready"),
+        "{}",
+        h.calls()
+    );
+}
+
+#[test]
+fn close_frees_the_blocked_cards_it_was_holding() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #14: last blocker gone, Blocked → Ready. #15: another blocker is
+    // still open. #16: In Progress is someone's decision. #17: closed.
+    let blocking = [
+        card_node(14, "OPEN", 0, Some("Blocked"), ""),
+        card_node(15, "OPEN", 1, Some("Blocked"), ""),
+        card_node(16, "OPEN", 0, Some("In Progress"), ""),
+        card_node(17, "CLOSED", 0, Some("Blocked"), ""),
+    ]
+    .join(",");
+    h.on(
+        "close",
+        "issue close 12 -R acme/widgets --reason completed",
+        "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "CLOSED", 0, Some("Done"), &blocking)),
+    )
+    .on(
+        "padd14",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/14 --format json",
+        r#"{"id":"PVTI_14"}"#,
+    )
+    .on("pedit14", "project item-edit --id PVTI_14", "");
+    h.gbd()
+        .args(["close", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "closed #12 (completed); #14 → Ready",
+        ));
+    let calls = h.calls();
+    assert!(
+        calls.contains(
+            "--id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id O_done"
+        ),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(
+            "--id PVTI_14 --project-id PVT_1 --field-id F_status --single-select-option-id O_ready"
+        ),
+        "{calls}"
+    );
+    for untouched in ["issues/15 ", "issues/16 ", "issues/17 "] {
+        assert!(!calls.contains(untouched), "{untouched} untouched: {calls}");
+    }
+    assert_eq!(
+        calls.matches("api graphql").count(),
+        1,
+        "one fetch: {calls}"
+    );
+
+    let out = h.gbd().args(["close", "12", "--json"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["moved"],
+        serde_json::json!([{ "number": 14, "status": "Ready" }])
+    );
+}
+
+#[test]
+fn board_sync_reconciles_ready_and_blocked_cards() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // On the board: #10 Ready but blocked, #9 Blocked but free, #8 In
+    // Progress and blocked, #6 Blocked and blocked. Off the board: #7, blocked.
+    h.on(
+        "items",
+        "items(first: 100",
+        r#"{"data":{"node":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"fieldValueByName":{"name":"Ready"},"content":{"__typename":"Issue","number":10,"title":"a","repository":{"nameWithOwner":"acme/widgets"}}},
+            {"fieldValueByName":{"name":"Blocked"},"content":{"__typename":"Issue","number":9,"title":"b","repository":{"nameWithOwner":"acme/widgets"}}},
+            {"fieldValueByName":{"name":"In Progress"},"content":{"__typename":"Issue","number":8,"title":"c","repository":{"nameWithOwner":"acme/widgets"}}},
+            {"fieldValueByName":{"name":"Blocked"},"content":{"__typename":"Issue","number":6,"title":"d","repository":{"nameWithOwner":"acme/widgets"}}}
+        ]}}}}"#,
+    )
+    .on(
+        "snapshot",
+        "issues(states: [OPEN]",
+        &search_snapshot_with(
+            &[
+                card_node(10, "OPEN", 1, Some("Ready"), ""),
+                card_node(9, "OPEN", 0, Some("Blocked"), ""),
+                card_node(8, "OPEN", 1, Some("In Progress"), ""),
+                card_node(6, "OPEN", 1, Some("Blocked"), ""),
+                card_node(7, "OPEN", 1, None, ""),
+            ]
+            .join(","),
+        ),
+    )
+    .on(
+        "anyadd",
+        "project item-add 7 --owner acme --url",
+        r#"{"id":"PVTI_new"}"#,
+    )
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .args(["board", "sync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "board #7: added #7 as Blocked; moved #10 to Blocked, #9 to Ready; 2 unchanged",
+        ));
+    let calls = h.calls();
+    assert_eq!(calls.matches("project item-add").count(), 3, "{calls}");
+    assert_eq!(
+        calls.matches("--single-select-option-id O_blocked").count(),
+        2,
+        "#7 and #10: {calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_ready").count(),
+        1,
+        "#9: {calls}"
+    );
+    for untouched in ["issues/8 ", "issues/6 "] {
+        assert!(!calls.contains(untouched), "{untouched} untouched: {calls}");
+    }
+}
+
+#[test]
+fn update_status_blocked_is_refused() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.gbd()
+        .args(["update", "12", "--status", "blocked"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("blocked is not set by hand"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("issue edit") && !calls.contains("project"),
+        "refused before any change: {calls}"
+    );
+}
+
+#[test]
+fn doctor_flags_a_board_that_predates_blocked() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(
+        h.gh_dir.path().join("pfields.out"),
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
+            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#,
+    )
+    .unwrap();
+    h.on("fields", FIELDS_GET, "[]")
+        .on("types", TYPES_GET, "[]");
+    h.gbd()
+        .args(["doctor", "--no-skills"])
+        .assert()
+        .stdout(predicate::str::contains(
+            "!     board  #7 missing Status options Blocked. Run: gbd init",
+        ));
+}
+
+#[test]
+fn create_with_blocking_moves_the_cards_it_blocks() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #42 has no blockers itself (Ready); #12, which it now blocks, was Ready.
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/42",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(
+            42,
+            "OPEN",
+            0,
+            None,
+            &card_node(12, "OPEN", 1, Some("Ready"), ""),
+        )),
+    )
+    .on(
+        "padd42",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/42 --format json",
+        r#"{"id":"PVTI_42"}"#,
+    )
+    .on("pedit42", "project item-edit --id PVTI_42", "");
+    h.gbd()
+        .args(["create", "Ship first", "-t", "Task", "--blocking", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(Status Ready); #12 → Blocked"));
+    let calls = h.calls();
+    assert!(
+        calls.contains(
+            "--id PVTI_42 --project-id PVT_1 --field-id F_status --single-select-option-id O_ready"
+        ),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id O_blocked"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn status_ready_lands_on_blocked_while_a_blocker_is_open() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 1, Some("Deferred"), "")),
+    );
+    h.gbd()
+        .args(["update", "12", "--status", "ready"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated #12 (status Blocked)"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(!calls.contains("O_ready"), "{calls}");
+}
+
+#[test]
+fn reopen_lands_on_blocked_and_reblocks_what_it_holds() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #12 still has an open blocker; #14, which it blocks, went Ready when
+    // #12 was closed.
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(
+            12,
+            "CLOSED",
+            1,
+            Some("Done"),
+            &card_node(14, "OPEN", 1, Some("Ready"), ""),
+        )),
+    )
+    .on("reopen", "issue reopen 12 -R acme/widgets", "")
+    .on(
+        "padd14",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/14 --format json",
+        r#"{"id":"PVTI_14"}"#,
+    )
+    .on("pedit14", "project item-edit --id PVTI_14", "");
+    h.gbd()
+        .args(["reopen", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reopened #12; #14 → Blocked"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--id PVTI_14 --project-id PVT_1 --field-id F_status --single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    let card = calls.find("PVTI_12").expect(&calls);
+    let reopen = calls.find("issue reopen").expect(&calls);
+    assert!(card < reopen, "card first, then the issue: {calls}");
+}
+
+#[test]
+fn delete_frees_the_cards_it_was_holding() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #14 had only #12 as a blocker; #15 has another one.
+    let blocking = [
+        card_node(14, "OPEN", 1, Some("Blocked"), ""),
+        card_node(15, "OPEN", 2, Some("Blocked"), ""),
+    ]
+    .join(",");
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Ready"), &blocking)),
+    )
+    .on("delete", "issue delete 12 -R acme/widgets --yes", "")
+    .on(
+        "padd14",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/14 --format json",
+        r#"{"id":"PVTI_14"}"#,
+    )
+    .on("pedit14", "project item-edit --id PVTI_14", "");
+    h.gbd()
+        .args(["delete", "12", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted #12; #14 → Ready"));
+    let calls = h.calls();
+    let fetch = calls.find("issue(number").expect(&calls);
+    let delete = calls.find("issue delete").expect(&calls);
+    assert!(
+        fetch < delete,
+        "blockees are read before the issue is gone: {calls}"
+    );
+    assert!(
+        calls.contains(
+            "--id PVTI_14 --project-id PVT_1 --field-id F_status --single-select-option-id O_ready"
+        ),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("issues/15 "),
+        "#15 is still blocked: {calls}"
+    );
 }

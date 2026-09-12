@@ -97,19 +97,19 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 
 | Command | Does |
 | --- | --- |
-| `create "Title" -t Bug -p 1 --parent 88 --deps 12,13 --blocking 40` | One `gh issue create` carrying type, parent, and both edge lists; Priority and board Status set right after. `q` is the same and prints only `repo#n`. |
+| `create "Title" -t Bug -p 1 --parent 88 --deps 12,13 --blocking 40` | One `gh issue create` carrying type, parent, and both edge lists; Priority and board Status set right after (`--deps` on open issues → Blocked; `--blocking` moves those cards to Blocked). `q` is the same and prints only `repo#n`. |
 | `show <id>` | The issue with fields, parent, children, blocked-by, and blocking, rendered like `bd show`. |
 | `list [--state open\|closed\|all] [--type T] [--assignee A] [--parent N] [--search Q] [--flat]` | A tree with children under parents: `○ #12 ● P1 [bug] Title`. |
 | `search "<GitHub search syntax>"` | Same output as `list`. |
 | `ready [--claim] [--explain] [--strict-parent] [--include-epics] [--sort priority\|unblocks\|path]` | See above. |
 | `update <id> [--claim] [--status ready\|in_progress\|deferred\|done] [--priority P1] [--type T] [--title] [--body] [--add-assignee] [--remove-assignee]` | Beads `update` / `set-state`. `--claim` runs first and, if refused, nothing else is touched. |
 | `assign <id> [login]` | Default `@me`. |
-| `close <id> [--reason completed\|not_planned\|duplicate]` | Board → Done. |
-| `reopen <id>` | Board → Ready. |
+| `close <id> [--reason completed\|not_planned\|duplicate]` | Board → Done. Cards this issue was blocking go Blocked → Ready once their last open blocker is gone. |
+| `reopen <id>` | Board → Ready (Blocked if it still has open blockers); what it blocks goes back to Blocked. |
 | `duplicate <id> <of>` | Close as duplicate with a comment. |
 | `delete <id> --yes` | Prefer `close --reason not_planned`. |
 | `defer <id…> [--until WHEN] [--reason WHY]` | Beads `defer`. `WHEN`: `YYYY-MM-DD`, `today`, `tomorrow`, `+1h`, `+3d`, `+2w`, `next monday`, or a weekday. Board → Deferred; `--reason` becomes a comment. With a board `--until` is optional. |
-| `undefer <id…>` | Clear Start date, board → Ready. |
+| `undefer <id…>` | Clear Start date, board → Ready (Blocked if it still has open blockers). |
 | `priority <id> P2` | Org **Priority** field. Accepts `P0`–`P4` or `0`–`4`. |
 | `comment <id> "…"` / `note` / `comments <id>` | Comments are Beads notes. |
 | `label <id> --add x --remove y` | Plain labels only; never state. |
@@ -118,7 +118,7 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 
 | Command | Does |
 | --- | --- |
-| `dep add <id> <blocker>` / `dep remove` / `link` | `#id` is blocked by `#blocker` (native issue dependencies, cross-repo by URL). |
+| `dep add <id> <blocker>` / `dep remove` / `link` | `#id` is blocked by `#blocker` (native issue dependencies, cross-repo by URL). The card moves Ready → Blocked, and back once no open blocker remains. |
 | `dep list <id>` | Direct blockers and blockees. |
 | `dep tree <id>` | Upstream blockers, downstream blockees, and the sub-issue subtree, walked in memory from one snapshot. |
 | `children <id>` | Sub-issues, as a tree. |
@@ -130,7 +130,7 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 | Command | Does |
 | --- | --- |
 | `board` | The board URL and every item grouped by Status, Done included. |
-| `board sync` | Put every open issue on the board: In Progress if assigned, else Ready. Items with a Status are left alone. |
+| `board sync` | Put every open issue on the board (In Progress if assigned, else Blocked or Ready) and make Ready ⇄ Blocked agree with GitHub's open-blocker counts. In Progress, Deferred, and Done cards are left alone. |
 | `status` | `open ready blocked in-progress deferred assigned-to-me closed-last-7d`. |
 | `count [--state]`, `stale [--days N]`, `statuses`, `types` | Small views. |
 
@@ -163,7 +163,7 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 | parent / epic children | **sub-issues** | `create --parent`, `parent --set` |
 | `open` | issue open, board **Ready** | `update --status ready`, `reopen` |
 | `in_progress` | board **In Progress** (an assignee, when there is no board) | `update --claim`, `ready --claim` |
-| `blocked` | derived: GitHub `is:blocked` (an open blocker) | never set directly |
+| `blocked` | derived: GitHub `is:blocked` (an open blocker); mirrored to board **Blocked** by gbd | never set by hand; `dep add`, `close`, `board sync` keep it |
 | `deferred` | board **Deferred** and/or org field **Start date** in the future | `defer` |
 | `closed` | issue closed, board **Done** | `close` |
 | `defer_until` | org issue field **Start date** | `defer --until` |
@@ -175,7 +175,9 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 
 ## The board
 
-`gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Ready / In Progress / Deferred / Done**, links the repo, and writes `project: N` to `.gbd.yml`. From then on `create` adds new issues as Ready, and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` skips In Progress and Deferred. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
+`gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Ready / In Progress / Blocked / Deferred / Done**, links the repo, and writes `project: N` to `.gbd.yml`. On a board from an earlier gbd, re-running `init` adds the missing option in place. From then on `create` adds new issues as Ready (Blocked when `--deps` names an open issue), and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` skips In Progress and Deferred. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
+
+**Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back. `update --status ready`, `reopen`, and `undefer` land on Blocked instead when a blocker is still open. Only Ready and Blocked ever swap; In Progress, Deferred, and Done are someone's decision. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
 
 Without `project:` in `.gbd.yml`, gbd still works: an assignee means in progress, and `defer --until` means deferred.
 
@@ -193,7 +195,7 @@ GitHub [issue types](https://docs.github.com/en/issues/tracking-your-work-with-i
 | Issue field **Priority** | single-select, options **P0 P1 P2 P3 P4** | `-p`, `priority`, `ready` ranking |
 | Issue field **Start date** | date (GitHub's default; recreated if deleted) | `defer --until`, `ready` |
 | Issue field **gbd Role** | single-select, option **Memory** | the memories issue, excluded from `ready` |
-| Project **`<repo> board`** | Status options **Ready / In Progress / Deferred / Done**, linked to the repo | `claim`, `update --status`, `close`, `board` |
+| Project **`<repo> board`** | Status options **Ready / In Progress / Blocked / Deferred / Done**, linked to the repo | `claim`, `update --status`, `close`, `dep add`, `board` |
 
 If the org still has GitHub's default Priority (Urgent / High / Medium / Low), init **renames those options in place** (Urgent→P0 … Low→P3) and adds P4, so existing values survive. Init never maps P0 onto "High" at read or write time.
 
@@ -203,7 +205,7 @@ Init still writes the repo files and says what it could not create. An owner doe
 
 - Issue types: `https://github.com/organizations/ORG/settings/issue-types` — enable the five above (GitHub ships Task, Bug, Feature; add Epic purple and Chore gray; disable Enhancement).
 - Issue fields: `https://github.com/organizations/ORG/settings/issue-fields` — Priority options P0 red, P1 orange, P2 yellow, P3 green, P4 gray; a **date** field named exactly `Start date`; a single-select `gbd Role` with option `Memory`.
-- Projects: create `<repo> board` under the org, set Status to Ready / In Progress / Deferred / Done, link the repo, then `gbd config set project <number>`.
+- Projects: create `<repo> board` under the org, set Status to Ready / In Progress / Blocked / Deferred / Done, link the repo, then `gbd config set project <number>`.
 
 Then re-run `gbd init` in the repo. Note that a GitHub App installation token (the kind some cloud agents run with) usually cannot edit org settings even for an admin; use an org-owner's own login for this step.
 
