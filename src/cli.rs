@@ -8,12 +8,14 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::beads;
 use crate::config::{self, Config};
 use crate::fields;
 use crate::gh;
 use crate::ids::{self, IssueRef};
+use crate::import;
 use crate::init::{self, InitOpts};
 use crate::issue::{self, Issue, Scope};
 use crate::memory::{self, RememberOutcome};
@@ -212,6 +214,15 @@ pub enum Commands {
     Priority { id: String, value: String },
     /// Open issues that are is:blocked, with their blockers
     Blocked,
+    /// Move a Beads tracker onto GitHub (one shot; --dry-run prints the plan)
+    Import {
+        /// JSONL from `bd export --include-memories`
+        #[arg(long = "from-beads", value_name = "FILE")]
+        from_beads: PathBuf,
+        /// Print the plan and write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
         insight: String,
@@ -568,6 +579,10 @@ fn dispatch(cli: Cli) -> Result<u8> {
             cmd_list(&ctx, &q, 50, true)
         }
         Commands::Blocked => cmd_blocked(&Ctx::open(explicit, json)?),
+        Commands::Import {
+            from_beads,
+            dry_run,
+        } => cmd_import(&Ctx::open(explicit, json)?, &from_beads, dry_run),
         Commands::Ready {
             claim,
             explain,
@@ -1073,6 +1088,19 @@ fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
             render::tree(&issues)
         }
     });
+    Ok(0)
+}
+
+/// Beads → GitHub, planned in memory first. Only the plan exists so far:
+/// without `--dry-run` the command refuses, so nothing half-imports.
+fn cmd_import(ctx: &Ctx, from_beads: &Path, dry_run: bool) -> Result<u8> {
+    if !dry_run {
+        bail!("gbd import can only --dry-run in this version; creating the issues is the next release");
+    }
+    let export = beads::load(from_beads)?;
+    let plan = import::plan(&export);
+    let source = from_beads.display().to_string();
+    ctx.emit(&plan, || import::render(&plan, &source, 25));
     Ok(0)
 }
 

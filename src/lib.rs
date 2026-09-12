@@ -6,6 +6,7 @@ pub mod config;
 pub mod fields;
 pub mod gh;
 pub mod ids;
+pub mod import;
 pub mod init;
 pub mod issue;
 pub mod memory;
