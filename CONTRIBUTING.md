@@ -31,6 +31,7 @@ Tests never touch the network. `tests/fake_gh/gh` is a fake `gh` placed first on
 - Branch from `main`, open a PR. The title must be a [conventional commit](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:`, `chore:`); it becomes the squash commit and decides the next version (`feat` → minor, `fix` → patch, `!` or a `BREAKING CHANGE:` footer → major). Docs-only merges do not cut a release.
 - Required checks: `fmt`, `clippy`, `test (ubuntu-latest)`, `test (macos-latest)`. PRs merge through a merge queue.
 - Keep the README truthful: it describes the current binary. If you change a command, change its row.
+- The PR title and body become the squash commit message. Never put the CI skip marker (the bracketed "skip ci" token) in either, even to talk about it: GitHub honours it anywhere in a pushed commit message and would skip CI and the release for that merge. It belongs only in the release commit the workflow writes.
 - `gbd init` writes `AGENTS.md`, `CLAUDE.md`, and three `SKILL.md` files from constants in `src/init.rs`; a test fails if the checked-in copies drift, so edit the constants and regenerate.
 
 ## Reporting bugs and proposing features

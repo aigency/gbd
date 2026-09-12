@@ -170,7 +170,8 @@ jobs:
   release:
     name: release
     needs: [build, smoke]
-    runs-on: ubuntu-22.04
+    # ubuntu-24.04: the `minisign` package exists in noble and not in jammy.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -206,7 +207,10 @@ jobs:
             echo "MINISIGN_KEY is not set; Cargo.toml declares a pubkey, so an unsigned release would be uninstallable with cargo binstall" >&2
             exit 1
           fi
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign >/dev/null \
+            || { echo "minisign is not installable on this runner image; the release job needs ubuntu-24.04 or newer" >&2; exit 1; }
+          minisign -v
           KEY="$RUNNER_TEMP/minisign.key"
           umask 077
           printf '%s\n' "$MINISIGN_KEY" > "$KEY"
