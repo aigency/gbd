@@ -222,7 +222,7 @@ fn board_status(b: &Bead, open_blocker: bool) -> &'static str {
 
 /// Kahn's algorithm over parent and blocked-by edges, ties broken by
 /// creation time then id. Returns the order and what could not be placed
-/// (members of a cycle, or behind one).
+/// (members of a cycle, or behind one), which `residual` then orders.
 fn order(export: &Export) -> (Vec<String>, Vec<String>) {
     let by_id: HashMap<&str, &Bead> = export.issues.iter().map(|b| (b.id.as_str(), b)).collect();
     let key = |id: &str| -> (String, String) {
@@ -258,17 +258,18 @@ fn order(export: &Export) -> (Vec<String>, Vec<String>) {
         }
         placed.push(id);
     }
-    let mut stuck: Vec<(String, String)> = indegree
+    let mut stuck: Vec<String> = indegree
         .iter()
         .filter(|(_, n)| **n > 0)
-        .map(|(id, _)| key(id))
+        .map(|(id, _)| (*id).to_string())
         .collect();
     stuck.sort();
-    (placed, stuck.into_iter().map(|(_, id)| id).collect())
+    (placed, stuck)
 }
 
-/// Tarjan's walk over the residual graph; only components of size > 1
-/// are real cycles.
+/// Tarjan's walk over the residual graph. Components come out in reverse
+/// topological order of the condensation, which is exactly what placing
+/// them needs; the ones of size > 1 are real cycles.
 struct Tarjan<'a> {
     out: &'a BTreeMap<&'a str, Vec<&'a str>>,
     index: HashMap<&'a str, usize>,
@@ -276,7 +277,8 @@ struct Tarjan<'a> {
     on_stack: BTreeSet<&'a str>,
     stack: Vec<&'a str>,
     next: usize,
-    found: Vec<Vec<String>>,
+    /// Every component, in emission order.
+    components: Vec<Vec<String>>,
 }
 impl<'a> Tarjan<'a> {
     fn visit(&mut self, v: &'a str) {
@@ -306,17 +308,15 @@ impl<'a> Tarjan<'a> {
                     break;
                 }
             }
-            if comp.len() > 1 {
-                comp.sort();
-                self.found.push(comp);
-            }
+            self.components.push(comp);
         }
     }
 }
 
-/// Strongly connected components of size > 1 among `ids`, walking only
-/// edges inside `ids`. Tarjan, iterative enough for a few thousand nodes.
-fn cycles(export: &Export, ids: &[String]) -> Vec<Vec<String>> {
+/// Place what Kahn could not: components in topological order (a bead
+/// behind a cycle comes after the cycle, whatever its timestamp), members
+/// of a cycle by creation time then id. Also returns the cycles.
+fn residual(export: &Export, ids: &[String]) -> (Vec<String>, Vec<Vec<String>>) {
     let set: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
     let by_id: HashMap<&str, &Bead> = export.issues.iter().map(|b| (b.id.as_str(), b)).collect();
     // Edges point downstream: blocker → blocked, parent → child.
@@ -336,15 +336,29 @@ fn cycles(export: &Export, ids: &[String]) -> Vec<Vec<String>> {
         on_stack: BTreeSet::new(),
         stack: Vec::new(),
         next: 0,
-        found: Vec::new(),
+        components: Vec::new(),
     };
     for id in &set {
         if !t.index.contains_key(id) {
             t.visit(id);
         }
     }
-    t.found.sort();
-    t.found
+    let mut components = t.components;
+    components.reverse();
+    for c in &mut components {
+        c.sort_by_key(|id| (by_id[id.as_str()].created_at.clone(), id.clone()));
+    }
+    let mut cycles: Vec<Vec<String>> = components
+        .iter()
+        .filter(|c| c.len() > 1)
+        .map(|c| {
+            let mut c = c.clone();
+            c.sort();
+            c
+        })
+        .collect();
+    cycles.sort();
+    (components.into_iter().flatten().collect(), cycles)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,11 +367,11 @@ fn cycles(export: &Export, ids: &[String]) -> Vec<Vec<String>> {
 pub fn plan(export: &Export) -> Plan {
     let by_id: HashMap<&str, &Bead> = export.issues.iter().map(|b| (b.id.as_str(), b)).collect();
     let (placed, stuck) = order(export);
-    let cycle_groups = cycles(export, &stuck);
+    let (behind, cycle_groups) = residual(export, &stuck);
     let mut skipped: Vec<Skip> = Vec::new();
     let mut items = Vec::new();
     let mut done: BTreeSet<&str> = BTreeSet::new();
-    for id in placed.iter().chain(&stuck) {
+    for id in placed.iter().chain(&behind) {
         let b = by_id[id.as_str()];
         let (issue_type, native) = issue_type(&b.kind);
         if !native {
@@ -399,8 +413,9 @@ pub fn plan(export: &Export) -> Plan {
                 what: format!("{} edge to {} has no GitHub relation", e.kind, e.to),
             });
         }
-        let open_blocker = b
-            .blocked_by
+        // From the edges that survived, so a card never says Blocked when
+        // the issue behind it has no blocker.
+        let open_blocker = blocked_by
             .iter()
             .filter_map(|t| by_id.get(t.as_str()))
             .any(|t| t.status != Status::Closed);
@@ -693,7 +708,7 @@ mod tests {
     fn a_cycle_is_reported_and_broken_at_the_end() {
         let lines = "{\"id\":\"c-1\",\"title\":\"one\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"dependencies\":[{\"issue_id\":\"c-1\",\"depends_on_id\":\"c-2\",\"type\":\"blocks\"}]}\n\
                      {\"id\":\"c-2\",\"title\":\"two\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-02T00:00:00Z\",\"dependencies\":[{\"issue_id\":\"c-2\",\"depends_on_id\":\"c-1\",\"type\":\"blocks\"}]}\n\
-                     {\"id\":\"c-3\",\"title\":\"three\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-03T00:00:00Z\",\"dependencies\":[{\"issue_id\":\"c-3\",\"depends_on_id\":\"c-1\",\"type\":\"blocks\"}]}\n\
+                     {\"id\":\"c-3\",\"title\":\"three\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2025-12-31T00:00:00Z\",\"dependencies\":[{\"issue_id\":\"c-3\",\"depends_on_id\":\"c-1\",\"type\":\"blocks\"}]}\n\
                      {\"id\":\"c-0\",\"title\":\"free\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-04T00:00:00Z\"}\n";
         let e = beads::parse(lines.as_bytes()).unwrap();
         let p = plan(&e);
@@ -702,8 +717,14 @@ mod tests {
         assert_eq!(
             ids,
             vec!["c-0", "c-1", "c-2", "c-3"],
-            "free first, then the stuck ones by time"
+            "free first; the cycle by time; c-3 after the cycle it depends on, although older"
         );
+        assert_eq!(
+            item(&p, "c-1").status,
+            project::STATUS_READY,
+            "no blocker survived, so not Blocked"
+        );
+        assert_eq!(item(&p, "c-2").status, project::STATUS_BLOCKED);
         assert!(
             item(&p, "c-1").blocked_by.is_empty(),
             "the closing edge is dropped"

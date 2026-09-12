@@ -401,22 +401,27 @@ impl Ctx {
     }
 
     fn emit<T: Serialize>(&self, value: &T, human: impl FnOnce() -> String) {
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(value).unwrap());
-        } else {
-            let text = human();
-            if text.is_empty() {
-                return;
-            }
-            print!("{text}");
-            if !text.ends_with('\n') {
-                println!();
-            }
-        }
+        emit_to(self.json, value, human);
     }
 
     fn search_prefix(&self) -> String {
         format!("repo:{} is:issue", self.repo.name_with_owner)
+    }
+}
+
+/// JSON record or human text, on stdout.
+fn emit_to<T: Serialize>(json: bool, value: &T, human: impl FnOnce() -> String) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value).unwrap());
+    } else {
+        let text = human();
+        if text.is_empty() {
+            return;
+        }
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
     }
 }
 
@@ -582,7 +587,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
         Commands::Import {
             from_beads,
             dry_run,
-        } => cmd_import(&Ctx::open(explicit, json)?, &from_beads, dry_run),
+        } => cmd_import(explicit, json, &from_beads, dry_run),
         Commands::Ready {
             claim,
             explain,
@@ -1093,14 +1098,17 @@ fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
 
 /// Beads → GitHub, planned in memory first. Only the plan exists so far:
 /// without `--dry-run` the command refuses, so nothing half-imports.
-fn cmd_import(ctx: &Ctx, from_beads: &Path, dry_run: bool) -> Result<u8> {
+fn cmd_import(explicit: Option<&str>, json: bool, from_beads: &Path, dry_run: bool) -> Result<u8> {
     if !dry_run {
         bail!("gbd import can only --dry-run in this version; creating the issues is the next release");
     }
+    // A dry run is local: no gh, no auth, no repo lookup. `explicit` is
+    // for the real run, which opens a Ctx.
+    let _ = explicit;
     let export = beads::load(from_beads)?;
     let plan = import::plan(&export);
     let source = from_beads.display().to_string();
-    ctx.emit(&plan, || import::render(&plan, &source, 25));
+    emit_to(json, &plan, || import::render(&plan, &source, 25));
     Ok(0)
 }
 

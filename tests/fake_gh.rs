@@ -1844,10 +1844,10 @@ fn import_dry_run_prints_the_plan_and_calls_nothing() {
             "Import plan: 8 issues, 1 memories",
         ))
         .stdout(predicate::str::contains("Nothing written (--dry-run)."));
-    let calls = h.calls();
     assert!(
-        !calls.contains("issue") && !calls.contains("api graphql") && !calls.contains("project"),
-        "a dry run touches nothing: {calls}"
+        h.calls().is_empty(),
+        "a dry run is local: not even gh --version or auth: {}",
+        h.calls()
     );
     // The importer itself is not here yet: refuse rather than half-import.
     h.gbd()
