@@ -80,14 +80,16 @@ jobs:
       release: ${{ steps.compute.outputs.release }}
     steps:
       # Check out `main` (not github.sha): a queued run picks up release
-      # commits pushed by the run before it. The token is what `git push`
-      # will use; see the header comment.
+      # commits pushed by the run before it. No credential is persisted:
+      # RELEASE_TOKEN can rewrite protected main, so it is handed to git
+      # only inside the push step, never left in the checkout for the tool
+      # installers or anything else in this job to read.
       - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
           fetch-tags: true
-          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
       - name: Compute next version
         id: compute
@@ -203,11 +205,28 @@ jobs:
           git commit -m "chore(release): $TAG [skip ci]"
           git tag "$TAG"
 
+      # The only step that can see RELEASE_TOKEN. The credential helper reads
+      # it from this step's environment, so it is never written to disk, to
+      # git config, or to a URL.
+      - name: Push release commit and tag
+        if: steps.compute.outputs.release == 'true'
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 \
+            && git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG is already on origin — nothing to push"
+            exit 0
+          fi
           # --atomic is load-bearing: without it, a raced push can PARTIALLY
           # succeed — main rejected as non-fast-forward while the tag still
           # lands — leaving a stray tag pointing at a commit that never
           # reached main.
-          git push --atomic origin main "$TAG"
+          git -c credential.helper= \
+              -c credential.helper='!f() { echo "username=x-access-token"; echo "password=$RELEASE_TOKEN"; }; f' \
+              push --atomic origin main "$TAG"
 
       - name: Dispatch the build on the tag and wait for it
         if: steps.compute.outputs.release == 'true'
