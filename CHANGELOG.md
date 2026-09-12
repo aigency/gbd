@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-12
+
+### Added
+
+- feat: signed releases (minisign + build provenance) (#4)
+
+### Documentation
+
+- docs: gbd is on crates.io; list binstall and cargo install (#3)
+
+### Fixed
+
+- fix(release): push the release commit with RELEASE_TOKEN (#5)
+
+### Other
+
+- build(deps): bump the cargo-minor group with 5 updates (#1)
+
 ## [1.0.0] - 2026-09-12
 
 ### Other
