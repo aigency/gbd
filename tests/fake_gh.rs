@@ -2374,6 +2374,9 @@ fn import_reconciles_comments_from_github_before_resuming() {
     // wx-2 is done in the file and closed in the export, but was reopened on
     // GitHub since: wx-1.1 (blocked by it) must land on Blocked, not Ready.
     .on("state-102", "issue view 102 -R acme/widgets --json state", "{\"state\":\"OPEN\"}")
+    // wx-1 (resumed, planned open) was closed by hand meanwhile: Done, not Ready.
+    .on("state-101", "issue view 101 -R acme/widgets --json state", "{\"state\":\"CLOSED\"}")
+    .on("state-103", "issue view 103 -R acme/widgets --json state", "{\"state\":\"OPEN\"}")
     // wx-1's body was already rewritten (and touched by hand) before the kill.
     .on(
         "body-101",
@@ -2390,7 +2393,7 @@ fn import_reconciles_comments_from_github_before_resuming() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "imported 2 issues (0 closed, 2 finished from an earlier run, 1 already imported)",
+            "imported 2 issues (1 closed, 2 finished from an earlier run, 1 already imported)",
         ));
     let calls = h.calls();
     assert!(!calls.contains("issue create"), "{calls}");
@@ -2412,6 +2415,11 @@ fn import_reconciles_comments_from_github_before_resuming() {
     assert!(
         calls.contains("issue view 102 -R acme/widgets --json state"),
         "a finished blocker is read live: {calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_done").count(),
+        1,
+        "wx-1, closed on GitHub meanwhile: {calls}"
     );
     assert!(
         calls.contains("--single-select-option-id O_blocked"),
@@ -2602,4 +2610,39 @@ fn import_of_memories_alone_needs_no_board() {
         "no board, no fields: {calls}"
     );
     assert!(calls.contains("\n## deploy-runbook\n"), "{calls}");
+}
+
+#[test]
+fn import_with_everything_done_only_retries_the_memories() {
+    let h = Harness::new(); // no board configured
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        concat!(
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"done\"}\n",
+        ),
+    )
+    .unwrap();
+    h.on(
+        "mem-view",
+        "issue view 3 -R acme/widgets --json body",
+        "{\"body\":\"\"}",
+    )
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no issues left to import (3 already imported); memories: 1 new, 0 updated on #3",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("project view")
+            && !calls.contains("issue-fields")
+            && !calls.contains("issue create"),
+        "{calls}"
+    );
 }

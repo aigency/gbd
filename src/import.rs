@@ -692,10 +692,33 @@ impl Mapping {
 
 /// `wx-12` → `#101` for every mention whose target is in `known`. A token
 /// is a maximal run of id characters; trailing dots are punctuation. Left
-/// alone: a token wrapped in backticks (the import footer), a bare URL
-/// (a word containing `://`, words ending at whitespace or brackets), and
-/// a Markdown link destination (`](…)`); the link's visible text is still
-/// rewritten. Anything not in `known` stays as written.
+/// alone: anything inside a code span or a fenced block (the import footer
+/// and command examples), a bare URL (a word containing `://`, words
+/// ending at whitespace or brackets), and a Markdown link destination
+/// (`](…)`); the link's visible text is still rewritten. Anything not in
+/// `known` stays as written.
+/// Track Markdown code state across `literal`: a backtick run of three or
+/// more opens or closes a fence, a shorter run opens or closes a span
+/// (only outside a fence).
+fn note_code(literal: &str, in_fence: &mut bool, in_span: &mut bool) {
+    let mut run = 0usize;
+    for c in literal.chars().chain(std::iter::once('\0')) {
+        if c == '`' {
+            run += 1;
+            continue;
+        }
+        match run {
+            1 | 2 if !*in_fence => *in_span = !*in_span,
+            0..=2 => {}
+            _ => {
+                *in_fence = !*in_fence;
+                *in_span = false;
+            }
+        }
+        run = 0;
+    }
+}
+
 pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     fn id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
@@ -705,6 +728,7 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    let (mut in_fence, mut in_span) = (false, false);
     while !rest.is_empty() {
         // Inside `](…)`: copy the destination through its closing paren.
         if out.ends_with("](") {
@@ -726,17 +750,19 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         if let Some(p) = literal.rfind("](") {
             if !literal[p..].contains(')') {
                 let head = &literal[..p + 2];
+                note_code(head, &mut in_fence, &mut in_span);
                 out.push_str(head);
                 rest = &rest[head.len()..];
                 continue;
             }
         }
+        note_code(literal, &mut in_fence, &mut in_span);
         out.push_str(literal);
         rest = &rest[start..];
         let end = rest.find(|c: char| !id_char(c)).unwrap_or(rest.len());
         let token = &rest[..end];
         let core = token.trim_end_matches('.');
-        let fenced = out.ends_with('`') && rest[end..].starts_with('`');
+        let fenced = in_fence || in_span;
         let in_url = {
             let word_start = out.rfind(boundary).map_or(0, |i| i + 1);
             let word_end = rest[end..].find(boundary).map_or(rest.len(), |i| end + i);
@@ -1164,6 +1190,21 @@ mod tests {
             rewrite_ids("[wx-2](broken wx-2", &known),
             "[#102](broken wx-2",
             "an unclosed destination copies through"
+        );
+        assert_eq!(
+            rewrite_ids("run `bd show wx-2` then wx-2", &known),
+            "run `bd show wx-2` then #102",
+            "a code span is left alone"
+        );
+        assert_eq!(
+            rewrite_ids("```\nbd dep add wx-1.1 wx-2\n```\nwx-2 done", &known),
+            "```\nbd dep add wx-1.1 wx-2\n```\n#102 done",
+            "a fenced block is left alone"
+        );
+        assert_eq!(
+            rewrite_ids("``wx-2`` wx-2", &known),
+            "``wx-2`` #102",
+            "double-backtick span"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }

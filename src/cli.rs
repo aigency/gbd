@@ -1217,15 +1217,35 @@ fn import_run(
     mapping: &Path,
     done: &BTreeMap<String, import::Mapped>,
 ) -> Result<u8> {
-    // An export of memories alone needs no board and no fields.
-    if plan.items.is_empty() {
+    // Nothing left to create or finish (an export of memories alone, or a
+    // re-run after everything landed): only the memories, and no board or
+    // field lookups to get in the way of that.
+    let unfinished = plan
+        .items
+        .iter()
+        .filter(|i| {
+            !done
+                .get(&i.bead)
+                .is_some_and(|m| m.phase == import::Phase::Done)
+        })
+        .count();
+    if unfinished == 0 {
+        let already = plan.items.len();
         let (issue, added, updated) = memories_for_import(ctx, &plan.memories)?;
         ctx.emit(
             &json!({
-                "created": [], "memories": { "issue": issue, "added": added, "updated": updated },
+                "created": [], "already_imported": plan.already_imported,
+                "memories": { "issue": issue, "added": added, "updated": updated },
                 "warnings": [], "skipped": plan.skipped, "problems": plan.problems,
             }),
-            || format!("no issues to import; memories: {added} new, {updated} updated on #{issue}"),
+            || {
+                let issues = if already == 0 {
+                    "no issues to import".to_string()
+                } else {
+                    format!("no issues left to import ({already} already imported)")
+                };
+                format!("{issues}; memories: {added} new, {updated} updated on #{issue}")
+            },
         );
         return Ok(0);
     }
@@ -1631,6 +1651,22 @@ impl Run<'_> {
         // and a card that says Ready or Blocked follows the blockers' real
         // state (a blocker whose close failed still blocks).
         let mut state = item.state.clone();
+        // A resumed bead planned open may have been closed on GitHub since;
+        // that stands.
+        if t.resumed && matches!(item.state, import::State::Open) {
+            match issue_is_open(self.ctx, number) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state = import::State::Closed {
+                        reason: import::CloseReason::Completed,
+                    };
+                }
+                Err(err) => warn(
+                    &mut warnings,
+                    format!("could not read its state, using the export's: {err:#}"),
+                ),
+            }
+        }
         if let import::State::Closed { reason } = item.state {
             if let Err(err) = target.gh_issue("close", &["--reason", reason.as_flag()]) {
                 warn(
