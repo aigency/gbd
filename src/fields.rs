@@ -215,15 +215,26 @@ pub fn ensure_start_date_field(org: &str) -> Result<IssueField> {
         .ok_or_else(|| anyhow::anyhow!("{START_DATE_FIELD} field missing after create"))
 }
 
+/// The org's Start date field.
+pub fn start_date_field(org: &str) -> Result<IssueField> {
+    find_typed_field(org, START_DATE_FIELD, "date")?
+        .ok_or_else(|| anyhow::anyhow!("no {START_DATE_FIELD} issue field on org {org}"))
+}
+
 pub fn set_start_date(repo: &Repo, number: u64, date: &str) -> Result<String> {
     let date = parse_iso_date(date)?;
-    let field = find_typed_field(repo.owner(), START_DATE_FIELD, "date")?.ok_or_else(|| {
-        anyhow::anyhow!("no {START_DATE_FIELD} issue field on org {}", repo.owner())
-    })?;
+    let field = start_date_field(repo.owner())?;
+    write_value(repo, number, field.id, &date)?;
+    Ok(date)
+}
+
+/// One field value on one issue. Callers that write many issues look the
+/// field up once and reuse its id.
+pub fn write_value(repo: &Repo, number: u64, field_id: u64, value: &str) -> Result<()> {
     let body = json!({
         "issue_field_values": [{
-            "field_id": field.id,
-            "value": date,
+            "field_id": field_id,
+            "value": value,
         }]
     });
     gh::api(
@@ -234,7 +245,7 @@ pub fn set_start_date(repo: &Repo, number: u64, date: &str) -> Result<String> {
         ),
         Some(&body),
     )?;
-    Ok(date)
+    Ok(())
 }
 
 /// Remove a field's value from an issue. The API is a DELETE on the field
@@ -411,37 +422,28 @@ pub fn ensure_priority_field(org: &str) -> Result<IssueField> {
     find_priority_field(org)?.ok_or_else(|| anyhow::anyhow!("Priority field missing after create"))
 }
 
-pub fn set_priority(repo: &Repo, number: u64, rank: u8) -> Result<String> {
-    let field = find_priority_field(repo.owner())?.ok_or_else(|| {
-        anyhow::anyhow!("no {PRIORITY_FIELD} issue field on org {}", repo.owner())
-    })?;
+/// The org's Priority field, checked to carry P0–P4.
+pub fn priority_field(org: &str) -> Result<IssueField> {
+    let field = find_priority_field(org)?
+        .ok_or_else(|| anyhow::anyhow!("no {PRIORITY_FIELD} issue field on org {org}"))?;
     if !has_p0_p4(&field) {
         bail!(
-            "{PRIORITY_FIELD} options are {}, not P0–P4. Run: gbd init\nOrg settings: https://github.com/organizations/{}/settings/issue-fields",
+            "{PRIORITY_FIELD} options are {}, not P0–P4. Run: gbd init\nOrg settings: https://github.com/organizations/{org}/settings/issue-fields",
             field
                 .options
                 .iter()
                 .map(|o| o.name.as_str())
                 .collect::<Vec<_>>()
-                .join(", "),
-            repo.owner()
+                .join(", ")
         );
     }
+    Ok(field)
+}
+
+pub fn set_priority(repo: &Repo, number: u64, rank: u8) -> Result<String> {
+    let field = priority_field(repo.owner())?;
     let option = option_name(rank)?;
-    let body = json!({
-        "issue_field_values": [{
-            "field_id": field.id,
-            "value": option,
-        }]
-    });
-    gh::api(
-        "POST",
-        &format!(
-            "repos/{}/issues/{number}/issue-field-values",
-            repo.name_with_owner
-        ),
-        Some(&body),
-    )?;
+    write_value(repo, number, field.id, option)?;
     Ok(option.to_string())
 }
 
