@@ -177,8 +177,22 @@ fn body_of(b: &Bead) -> String {
     if !b.labels.is_empty() {
         let _ = write!(body, " Beads labels: {}.", b.labels.join(", "));
     }
+    let closed = b.closed_at.as_deref().and_then(date_of).map(|d| {
+        match b
+            .close_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            Some(reason) => format!("{d} ({reason})"),
+            None => d,
+        }
+    });
     let extras = [
         ("Owner", b.owner.clone()),
+        ("Started", b.started_at.as_deref().and_then(date_of)),
+        ("Closed", closed),
+        ("Updated", b.updated_at.as_deref().and_then(date_of)),
         ("Due", b.due_at.as_deref().and_then(date_of)),
         ("Estimate", b.estimated_minutes.map(|m| format!("{m} min"))),
         ("Ref", b.external_ref.clone()),
@@ -641,7 +655,7 @@ mod tests {
         assert!(epic.body.starts_with("Umbrella for the API rework."));
         assert!(
             epic.body.ends_with(
-                "---\nImported from Beads `wx-1` (created 2026-03-01 by dev1). Beads labels: area:api. Owner: dev1."
+                "---\nImported from Beads `wx-1` (created 2026-03-01 by dev1). Beads labels: area:api. Owner: dev1. Updated: 2026-03-05."
             ),
             "{}",
             epic.body
@@ -649,13 +663,13 @@ mod tests {
         assert!(
             item(&p, "wx-3")
                 .body
-                .ends_with("(created 2026-03-03 by dev2)."),
-            "nothing extra, no tail"
+                .ends_with("(created 2026-03-03 by dev2). Updated: 2026-03-03."),
+            "only what the bead has"
         );
         assert!(
             item(&p, "wx-4")
                 .body
-                .ends_with("(created 2026-02-20 by dev2). Owner: dev2. Estimate: 30 min."),
+                .ends_with("(created 2026-02-20 by dev2). Owner: dev2. Closed: 2026-02-21 (shipped in 1.4). Updated: 2026-02-21. Estimate: 30 min."),
             "{}",
             item(&p, "wx-4").body
         );
