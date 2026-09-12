@@ -723,18 +723,27 @@ impl Mapping {
     }
 }
 
-/// `[label]:` then a destination, after up to three spaces, as `CommonMark`
-/// defines a link reference definition's first line; the whitespace after
-/// the colon is optional.
-fn is_reference_definition(line: &str) -> bool {
+/// The bytes at the start of `rest` that a link reference definition
+/// takes: `[label]:` after up to three spaces, then the destination, which
+/// `CommonMark` lets follow on the next line. None when it is not one.
+fn reference_definition_end(rest: &str) -> Option<usize> {
+    let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+    let line = &rest[..line_end];
     let trimmed = line.trim_start_matches(' ');
     if line.len() - trimmed.len() > 3 || !trimmed.starts_with('[') {
-        return false;
+        return None;
     }
-    let Some(close) = trimmed.find(']') else {
-        return false;
-    };
-    close > 1 && trimmed[close + 1..].starts_with(':') && !trimmed[close + 2..].trim().is_empty()
+    let close = trimmed.find(']')?;
+    if close < 2 || !trimmed[close + 1..].starts_with(':') {
+        return None;
+    }
+    if !trimmed[close + 2..].trim().is_empty() {
+        return Some(line_end);
+    }
+    // Nothing after the colon: the destination is the next line, if any.
+    let next = &rest[line_end..];
+    let next_end = next.find('\n').map_or(next.len(), |i| i + 1);
+    (!next[..next_end].trim().is_empty()).then_some(line_end + next_end)
 }
 
 /// The fence a line opens, as (char, run length): three or more backticks
@@ -860,7 +869,7 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                 if fence_close(line, c, n) {
                     md = Code::Prose;
                 }
-                true
+                Some(line_end)
             } else {
                 if blank {
                     // A blank line ends the paragraph, and any span in it.
@@ -872,19 +881,21 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                 if !indented && prev_blank && !blank && is_indented(line) {
                     indented = true;
                 }
-                if indented || is_reference_definition(line) {
-                    true
+                if indented {
+                    Some(line_end)
+                } else if let Some(len) = reference_definition_end(rest) {
+                    Some(len)
                 } else if let Some((c, n)) = fence_open(line) {
                     md = Code::Fence(c, n);
-                    true
+                    Some(line_end)
                 } else {
-                    false
+                    None
                 }
             };
             prev_blank = blank;
-            if verbatim {
-                out.push_str(line);
-                rest = &rest[line_end..];
+            if let Some(len) = verbatim {
+                out.push_str(&rest[..len]);
+                rest = &rest[len..];
                 continue;
             }
         }
@@ -1407,9 +1418,14 @@ mod tests {
             "the space after the colon is optional"
         );
         assert_eq!(
-            rewrite_ids("[wx-2]:", &known),
-            "[#102]:",
+            rewrite_ids("[wx-2]:\n\nwx-2", &known),
+            "[#102]:\n\n#102",
             "without a destination it is prose"
+        );
+        assert_eq!(
+            rewrite_ids("[doc]:\n/issues/wx-2\n\n[wx-2][doc]", &known),
+            "[doc]:\n/issues/wx-2\n\n[#102][doc]",
+            "the destination may follow on the next line"
         );
         assert_eq!(
             rewrite_ids("```\necho '```' wx-2\n```\nwx-2", &known),
