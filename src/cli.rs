@@ -222,6 +222,9 @@ pub enum Commands {
         /// Print the plan and write nothing
         #[arg(long)]
         dry_run: bool,
+        /// Create the issues. One shot, not a sync: run it once per tracker.
+        #[arg(long)]
+        yes: bool,
     },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
@@ -587,7 +590,8 @@ fn dispatch(cli: Cli) -> Result<u8> {
         Commands::Import {
             from_beads,
             dry_run,
-        } => cmd_import(explicit, json, &from_beads, dry_run),
+            yes,
+        } => cmd_import(explicit, json, &from_beads, dry_run, yes),
         Commands::Ready {
             claim,
             explain,
@@ -922,45 +926,45 @@ fn cmd_doctor(explicit: Option<&str>, no_skills: bool, json: bool) -> Result<u8>
     Ok(u8::from(!report.ok))
 }
 
-fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
-    let rank = args
-        .priority
-        .as_deref()
-        .map(fields::parse_rank)
-        .transpose()?;
-    let parent = args
-        .parent
-        .as_deref()
-        .map(|p| ctx.target(p))
-        .transpose()?
-        .map(|t| t.number.to_string());
-    let deps = args
-        .deps
-        .as_deref()
-        .map(ids::parse_number_list)
-        .transpose()?
-        .filter(|v| !v.is_empty())
-        .map(|v| v.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
-    let blocking = args
-        .blocking
-        .as_deref()
-        .map(ids::parse_number_list)
-        .transpose()?
-        .filter(|v| !v.is_empty())
-        .map(|v| v.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
+/// What one `gh issue create` carries: title, body, type, parent, and both
+/// edge lists, so there is never a create-then-attach step. `create` and
+/// `import` both go through here.
+struct NewIssue<'a> {
+    title: &'a str,
+    body: &'a str,
+    issue_type: &'a str,
+    parent: Option<u64>,
+    blocked_by: &'a [u64],
+    blocking: &'a [u64],
+}
 
-    // One gh call carries title, body, type, parent, and both edge lists.
+/// `12,13` for flags and JSON; None when empty.
+fn csv(numbers: &[u64]) -> Option<String> {
+    (!numbers.is_empty()).then(|| {
+        numbers
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+/// Returns the new issue's number and URL.
+fn create_issue(ctx: &Ctx, new: &NewIssue<'_>) -> Result<(u64, String)> {
+    let parent = new.parent.map(|p| p.to_string());
+    let deps = csv(new.blocked_by);
+    let blocking = csv(new.blocking);
     let mut gh_args: Vec<&str> = vec![
         "issue",
         "create",
         "-R",
         &ctx.repo.name_with_owner,
         "--title",
-        &args.title,
+        new.title,
         "--body",
-        &args.body,
+        new.body,
         "--type",
-        &args.r#type,
+        new.issue_type,
     ];
     if let Some(p) = &parent {
         gh_args.extend(["--parent", p]);
@@ -974,11 +978,48 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
     let url = gh::run(&gh_args).with_context(|| {
         format!(
             "creating issue (type {:?} must exist on org {}: gbd types)",
-            args.r#type,
+            new.issue_type,
             ctx.repo.owner()
         )
     })?;
-    let number = ids::number_from_url(&url)?;
+    Ok((ids::number_from_url(&url)?, url))
+}
+
+fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
+    let rank = args
+        .priority
+        .as_deref()
+        .map(fields::parse_rank)
+        .transpose()?;
+    let parent = args
+        .parent
+        .as_deref()
+        .map(|p| ctx.target(p))
+        .transpose()?
+        .map(|t| t.number);
+    let deps = args
+        .deps
+        .as_deref()
+        .map(ids::parse_number_list)
+        .transpose()?
+        .unwrap_or_default();
+    let blocking = args
+        .blocking
+        .as_deref()
+        .map(ids::parse_number_list)
+        .transpose()?
+        .unwrap_or_default();
+    let (number, url) = create_issue(
+        ctx,
+        &NewIssue {
+            title: &args.title,
+            body: &args.body,
+            issue_type: &args.r#type,
+            parent,
+            blocked_by: &deps,
+            blocking: &blocking,
+        },
+    )?;
     let t = ctx.target(&number.to_string())?;
 
     let mut warnings = Vec::new();
@@ -999,7 +1040,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
             // Edges move cards: the new issue starts Blocked while GitHub
             // counts an open blocker (a closed one blocks nothing), and what
             // it blocks leaves Ready. One fetch, only when an edge was given.
-            let detail = if deps.is_none() && blocking.is_none() {
+            let detail = if deps.is_empty() && blocking.is_empty() {
                 None
             } else {
                 match t.fetch(ctx.scope()) {
@@ -1014,7 +1055,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
             };
             let initial = match &detail {
                 Some(d) => ready_or_blocked(&d.issue),
-                None if deps.is_some() => project::STATUS_BLOCKED,
+                None if !deps.is_empty() => project::STATUS_BLOCKED,
                 None => project::STATUS_READY,
             };
             let status = match t.set_board_status(Some(&board), initial) {
@@ -1046,7 +1087,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
         &json!({
             "number": number, "id": id, "url": url, "title": args.title,
             "type": args.r#type, "priority": priority, "status": status,
-            "parent": parent, "blocked_by": deps, "blocking": blocking,
+            "parent": parent.map(|p| p.to_string()), "blocked_by": csv(&deps), "blocking": csv(&blocking),
             "moved": moves_json(&moved),
         }),
         || {
@@ -1098,18 +1139,192 @@ fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
 
 /// Beads → GitHub, planned in memory first. Only the plan exists so far:
 /// without `--dry-run` the command refuses, so nothing half-imports.
-fn cmd_import(explicit: Option<&str>, json: bool, from_beads: &Path, dry_run: bool) -> Result<u8> {
-    if !dry_run {
-        bail!("gbd import can only --dry-run in this version; creating the issues is the next release");
-    }
-    // A dry run is local: no gh, no auth, no repo lookup. `explicit` is
-    // for the real run, which opens a Ctx.
-    let _ = explicit;
+fn cmd_import(
+    explicit: Option<&str>,
+    json: bool,
+    from_beads: &Path,
+    dry_run: bool,
+    yes: bool,
+) -> Result<u8> {
     let export = beads::load(from_beads)?;
     let plan = import::plan(&export);
     let source = from_beads.display().to_string();
-    emit_to(json, &plan, || import::render(&plan, &source, 25));
+    if dry_run {
+        // Local: no gh, no auth, no repo lookup.
+        emit_to(json, &plan, || import::render(&plan, &source, 25));
+        return Ok(0);
+    }
+    let ctx = Ctx::open(explicit, json)?;
+    if !yes {
+        bail!(
+            "this creates {} issues in {} and writes {} memories. Add --yes, or --dry-run to see the plan first",
+            plan.items.len(),
+            ctx.repo.name_with_owner,
+            plan.memories
+        );
+    }
+    import_run(&ctx, &plan, &export)
+}
+
+/// Execute the plan top to bottom: one `gh issue create` per bead, its
+/// edges pointing at issues made earlier in this run, then Priority, Start
+/// date, assignee, comments, the close, and the card. The create is fatal
+/// (resuming is the mapping file's job); the rest warn and move on, since
+/// `board sync` and one edit repair them.
+fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<u8> {
+    let board = ctx.board()?;
+    let org = ctx.repo.owner();
+    let priority = fields::priority_field(org)?;
+    let start_date = plan
+        .items
+        .iter()
+        .any(|i| i.start_date.is_some())
+        .then(|| fields::start_date_field(org))
+        .transpose()?;
+    let total = plan.items.len();
+    let mut numbers: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut created = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for (n, item) in plan.items.iter().enumerate() {
+        let edge = |bead: &str| {
+            numbers
+                .get(bead)
+                .copied()
+                .with_context(|| format!("{}: {bead} was not created before it", item.bead))
+        };
+        let parent = item.parent.as_deref().map(edge).transpose()?;
+        let blocked_by: Vec<u64> = item
+            .blocked_by
+            .iter()
+            .map(|b| edge(b))
+            .collect::<Result<_>>()?;
+        let (number, url) = create_issue(
+            ctx,
+            &NewIssue {
+                title: &item.title,
+                body: &item.body,
+                issue_type: item.issue_type,
+                parent,
+                blocked_by: &blocked_by,
+                blocking: &[],
+            },
+        )
+        .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
+        numbers.insert(&item.bead, number);
+        let t = ctx.target(&number.to_string())?;
+        let mut warn = |what: String| warnings.push(format!("{} (#{number}): {what}", item.bead));
+        if let Err(err) = fields::option_name(item.priority)
+            .and_then(|p| fields::write_value(&ctx.repo, number, priority.id, p))
+        {
+            warn(format!("Priority not set: {err:#}"));
+        }
+        if let (Some(d), Some(field)) = (&item.start_date, &start_date) {
+            if let Err(err) = fields::write_value(&ctx.repo, number, field.id, d) {
+                warn(format!("Start date not set: {err:#}"));
+            }
+        }
+        if let Some(login) = &item.assignee {
+            if let Err(err) = t.edit(&["--add-assignee", login]) {
+                warn(format!("assignee {login} not set: {err:#}"));
+            }
+        }
+        for body in &item.comments {
+            let n = number.to_string();
+            if let Err(err) = gh::run_stdin(
+                &[
+                    "issue",
+                    "comment",
+                    &n,
+                    "-R",
+                    &ctx.repo.name_with_owner,
+                    "--body-file",
+                    "-",
+                ],
+                body.as_bytes(),
+            ) {
+                warn(format!("comment not added: {err:#}"));
+            }
+        }
+        if let import::State::Closed { reason } = item.state {
+            if let Err(err) = t.gh_issue("close", &["--reason", reason.as_flag()]) {
+                warn(format!("not closed: {err:#}"));
+            }
+        }
+        if let Some(b) = &board {
+            if let Err(err) = b.set_status(&url, item.status) {
+                warn(format!("card not set to {}: {err:#}", item.status));
+            }
+        }
+        if !ctx.json {
+            let closed = if matches!(item.state, import::State::Closed { .. }) {
+                "  ✓"
+            } else {
+                ""
+            };
+            println!(
+                "{:>5}/{total}  {} → #{number}  [{}] {}{closed}",
+                n + 1,
+                item.bead,
+                item.issue_type,
+                item.title
+            );
+        }
+        created.push(json!({
+            "bead": item.bead, "number": number, "url": url,
+            "state": item.state, "status": item.status,
+        }));
+    }
+    // Memories: key/value onto the memories issue, last write wins.
+    let mut memories = json!(null);
+    if !export.memories.is_empty() {
+        match memories_for_import(ctx, export) {
+            Ok((issue, added, updated)) => {
+                memories = json!({ "issue": issue, "added": added, "updated": updated });
+            }
+            Err(err) => warnings.push(format!("memories not imported: {err:#}")),
+        }
+    }
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+    ctx.emit(
+        &json!({ "created": created, "memories": memories, "warnings": warnings }),
+        || {
+            let closed = plan
+                .items
+                .iter()
+                .filter(|i| matches!(i.state, import::State::Closed { .. }))
+                .count();
+            let mem = match &memories {
+                serde_json::Value::Null => String::new(),
+                m => format!(
+                    "; memories: {} new, {} updated on #{}",
+                    m["added"], m["updated"], m["issue"]
+                ),
+            };
+            format!(
+                "\nimported {total} issues ({closed} closed){mem}; {} warning{}",
+                warnings.len(),
+                if warnings.len() == 1 { "" } else { "s" }
+            )
+        },
+    );
     Ok(0)
+}
+
+/// Upsert every `_type: memory` line into the memories issue.
+fn memories_for_import(ctx: &Ctx, export: &beads::Export) -> Result<(u64, usize, usize)> {
+    let (issue, mut map) = memories(ctx)?;
+    let (mut added, mut updated) = (0, 0);
+    for m in &export.memories {
+        if map.insert(m.key.clone(), m.value.clone()).is_some() {
+            updated += 1;
+        } else {
+            added += 1;
+        }
+    }
+    memory::save(&ctx.repo, issue, &map)?;
+    Ok((issue, added, updated))
 }
 
 fn cmd_blocked(ctx: &Ctx) -> Result<u8> {

@@ -1849,11 +1849,145 @@ fn import_dry_run_prints_the_plan_and_calls_nothing() {
         "a dry run is local: not even gh --version or auth: {}",
         h.calls()
     );
-    // The importer itself is not here yet: refuse rather than half-import.
+    // Without --dry-run the real run needs --yes; nothing is written first.
+    board_fixtures(&h);
     h.gbd()
         .args(["import", "--from-beads", fixture.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("can only --dry-run"));
+        .stderr(predicate::str::contains("Add --yes, or --dry-run"));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
+
+#[test]
+fn import_creates_issues_in_dependency_order_through_the_create_path() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"## old-key\\n\\nstill here\\n\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+
+    // Refuses without --yes, before any write.
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "this creates 3 issues in acme/widgets and writes 1 memories. Add --yes",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1/3  wx-1 → #101  [Epic] Widget API v2\n",
+        ))
+        .stdout(predicate::str::contains(
+            "2/3  wx-2 → #102  [Bug] Auth refresh drops the session  ✓\n",
+        ))
+        .stdout(predicate::str::contains(
+            "3/3  wx-1.1 → #103  [Task] Rename the endpoints\n",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 3 issues (1 closed); memories: 1 new, 0 updated on #3; 0 warnings",
+        ));
+    let calls = h.calls();
+    let at = |s: &str| {
+        calls
+            .find(s)
+            .unwrap_or_else(|| panic!("{s} not called:\n{calls}"))
+    };
+    // Creation order follows the edges; each create carries its edges.
+    assert!(
+        at("--title Widget API v2") < at("--title Auth refresh")
+            && at("--title Auth refresh") < at("--title Rename"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--title Rename the endpoints --body Child of the epic."),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--type Epic\n"),
+        "epic has no edges: {calls}"
+    );
+    assert!(
+        !calls.contains("--label"),
+        "nothing is ever a label: {calls}"
+    );
+    // Org fields: one lookup per field for the whole run, then plain writes.
+    assert_eq!(
+        calls.matches(FIELDS_GET).count(),
+        2,
+        "field ids are cached: {calls}"
+    );
+    assert!(
+        calls.contains(r#"STDIN: {"issue_field_values":[{"field_id":46822523,"value":"P1"}]}"#),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(r#"STDIN: {"issue_field_values":[{"field_id":46822523,"value":"P0"}]}"#),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(
+            r#"STDIN: {"issue_field_values":[{"field_id":7886557,"value":"2026-10-01"}]}"#
+        ),
+        "{calls}"
+    );
+    // Closed bead: assignee, close with the guessed reason, then Done.
+    assert!(at("--add-assignee dev1") < at("issue close 102"), "{calls}");
+    assert!(
+        at("issue close 102") < at("--single-select-option-id O_done"),
+        "{calls}"
+    );
+    // Cards: Deferred (defer_until), Done, Ready (its only blocker is closed).
+    for opt in ["O_def", "O_done", "O_ready"] {
+        assert_eq!(
+            calls
+                .matches(&format!("--single-select-option-id {opt}"))
+                .count(),
+            1,
+            "{opt}: {calls}"
+        );
+    }
+    assert!(!calls.contains("O_blocked"), "{calls}");
+    // Notes and comments arrive on stdin, notes first.
+    assert!(
+        at("STDIN: **Notes**\n\nKeep the old routes")
+            < at("STDIN: **dev2** · 2026-03-03\n\nAlso drop the v1 docs."),
+        "{calls}"
+    );
+    assert_eq!(calls.matches("issue comment 103").count(), 2, "{calls}");
+    // Memories merge into the existing body.
+    let saved = calls
+        .rsplit("issue edit 3 -R acme/widgets --body-file -\nSTDIN: ")
+        .next()
+        .unwrap();
+    assert!(
+        saved.contains("## deploy-runbook") && saved.contains("## old-key"),
+        "{saved}"
+    );
 }
