@@ -803,23 +803,78 @@ enum Code {
     Fence(char, usize),
 }
 
-/// Advance the span state across `literal`. Fences are whole lines and are
-/// seen at the line start, never here.
-fn note_code(literal: &str, code: &mut Code) {
-    let mut run = 0usize;
-    for c in literal.chars().chain(std::iter::once('\0')) {
+/// Where the paragraph at the start of `s` ends: the start of its first
+/// blank line, or the end of `s`.
+fn paragraph_end(s: &str) -> usize {
+    let mut at = 0;
+    for line in s.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            return at;
+        }
+        at += line.len();
+    }
+    s.len()
+}
+
+/// Whether a run of exactly `n` backticks occurs before the paragraph ends.
+fn has_closer(s: &str, n: usize) -> bool {
+    let mut run = 0;
+    for c in s[..paragraph_end(s)].chars().chain(std::iter::once('\0')) {
         if c == '`' {
+            run += 1;
+            continue;
+        }
+        if run == n {
+            return true;
+        }
+        run = 0;
+    }
+    false
+}
+
+/// Byte index of the `>` that closes an HTML tag whose `<` sits just before
+/// `s`, quotes respected; None when it does not close in the paragraph.
+fn tag_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in s[..paragraph_end(s)].char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if matches!(c, '"' | '\'') => quote = Some(c),
+            None if c == '>' => return Some(i),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Advance the span state across the first `len` bytes of `text`. The rest
+/// of `text` is only looked at to tell an opening run from a stray one: a
+/// run with no closer of the same length before the paragraph ends is
+/// prose, and so is an escaped backtick. Fences are whole lines, seen at
+/// the line start, never here.
+fn note_code(text: &str, len: usize, code: &mut Code) {
+    let (mut run, mut escaped) = (0usize, false);
+    for (i, c) in text[..len]
+        .char_indices()
+        .chain(std::iter::once((len, '\0')))
+    {
+        if c == '`' && !escaped {
             run += 1;
             continue;
         }
         if run > 0 {
             *code = match *code {
-                Code::Prose => Code::Span(run),
+                Code::Prose if has_closer(&text[i..], run) => Code::Span(run),
                 Code::Span(n) if n == run => Code::Prose,
                 same => same,
             };
+            run = 0;
         }
-        run = 0;
+        escaped = !escaped && c == '\\' && *code == Code::Prose;
     }
 }
 
@@ -834,9 +889,9 @@ fn is_indented(line: &str) -> bool {
 /// block (the import footer and command examples), a bare URL (a word
 /// containing `://`, words ending at whitespace or angle or square
 /// brackets, so parentheses inside a URL are part of it), a Markdown
-/// link destination (`](…)`), and a reference definition line
-/// (`[label]: …`); the link's visible text is still rewritten. Anything
-/// not in `known` stays as written.
+/// link destination (`](…)`), a reference definition (`[label]: …`), and
+/// an HTML tag or comment (`<a href="…">`); the link's visible text is
+/// still rewritten. Anything not in `known` stays as written.
 ///
 /// An indented code block is a line indented four spaces or a tab after a
 /// blank line (or at the start), through the next line indented less. A
@@ -848,6 +903,9 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     }
     fn boundary(c: char) -> bool {
         c.is_whitespace() || matches!(c, '[' | ']' | '<' | '>')
+    }
+    fn tag_start(c: char) -> bool {
+        c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?')
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -911,9 +969,18 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                 None => break,
             }
         }
+        // Inside an HTML tag: copy it through its `>`; one that never
+        // closes is prose.
+        if md == Code::Prose && out.ends_with('<') && rest.starts_with(tag_start) {
+            if let Some(i) = tag_end(rest) {
+                out.push_str(&rest[..=i]);
+                rest = &rest[i + 1..];
+                continue;
+            }
+        }
         // Only the rest of this line, so the next line starts at the top.
         let Some(start) = rest[..line_end].find(id_char) else {
-            note_code(&rest[..line_end], &mut md);
+            note_code(rest, line_end, &mut md);
             out.push_str(&rest[..line_end]);
             rest = &rest[line_end..];
             continue;
@@ -924,13 +991,27 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         if let Some(p) = literal.rfind("](") {
             if !literal[p..].contains(')') {
                 let head = &literal[..p + 2];
-                note_code(head, &mut md);
+                note_code(rest, head.len(), &mut md);
                 out.push_str(head);
                 rest = &rest[head.len()..];
                 continue;
             }
         }
-        note_code(literal, &mut md);
+        // An HTML tag that starts in this run (`<a href="/x/wx-2">`): copy
+        // through the `<`; the tag is then copied through its `>`.
+        if let Some(p) = literal.rfind('<') {
+            if md == Code::Prose
+                && !literal[p..].contains('>')
+                && rest[p + 1..].starts_with(tag_start)
+            {
+                let head = &literal[..=p];
+                note_code(rest, head.len(), &mut md);
+                out.push_str(head);
+                rest = &rest[head.len()..];
+                continue;
+            }
+        }
+        note_code(rest, start, &mut md);
         out.push_str(literal);
         rest = &rest[start..];
         let end = rest.find(|c: char| !id_char(c)).unwrap_or(rest.len());
@@ -1486,6 +1567,36 @@ mod tests {
             rewrite_ids("see wx-2\n[doc]: /issues/wx-2", &known),
             "see #102\n[doc]: /issues/wx-2",
             "a reference definition after the first line"
+        );
+        assert_eq!(
+            rewrite_ids("Use \\` literally; see wx-2", &known),
+            "Use \\` literally; see #102",
+            "an escaped backtick is prose"
+        );
+        assert_eq!(
+            rewrite_ids("a ` b wx-2", &known),
+            "a ` b #102",
+            "a backtick with no closer is prose"
+        );
+        assert_eq!(
+            rewrite_ids("` a \\` wx-2 ` wx-2", &known),
+            "` a \\` #102 ` #102",
+            "inside a span a backslash is literal, so the span closes at the escaped backtick"
+        );
+        assert_eq!(
+            rewrite_ids("<a href=\"/tracker/issues/wx-2\">wx-2</a>", &known),
+            "<a href=\"/tracker/issues/wx-2\">#102</a>",
+            "an HTML tag is copied through, its text is rewritten"
+        );
+        assert_eq!(
+            rewrite_ids("<!-- note wx-2 --> wx-2", &known),
+            "<!-- note wx-2 --> #102",
+            "an HTML comment is left alone"
+        );
+        assert_eq!(
+            rewrite_ids("a < b and wx-2 > c", &known),
+            "a < b and #102 > c",
+            "a lone less-than is prose"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
