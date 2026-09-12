@@ -81,7 +81,10 @@ One closed untyped issue with org field **gbd Role = Memory**. Not AGENTS.md.
 
 `gbd import --from-beads beads.jsonl --dry-run` shows the plan; `--yes`
 creates the issues. One shot, resumable through `beads-map.jsonl`, not
-a sync: after it, `bd` is retired for the repo.
+a sync: after it, `bd` is retired for the repo. Export right before the
+run (`bd dolt pull`, `bd dolt commit`, then `bd export
+--include-memories`) and write nothing to Beads until it finishes: the
+JSONL is a snapshot, and later Beads changes never come over.
 "#;
 
 pub const ISSUE_TYPES: [&str; 5] = ["Epic", "Feature", "Bug", "Task", "Chore"];
