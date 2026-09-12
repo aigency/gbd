@@ -84,7 +84,7 @@ jobs:
       # RELEASE_TOKEN can rewrite protected main, so it is handed to git
       # only inside the push step, never left in the checkout for the tool
       # installers or anything else in this job to read.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -162,13 +162,13 @@ jobs:
 
       - name: Install cargo-edit
         if: steps.compute.outputs.release == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-edit
 
       - name: Install git-cliff
         if: steps.compute.outputs.release == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: git-cliff
 
