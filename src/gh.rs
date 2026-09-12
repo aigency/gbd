@@ -27,14 +27,17 @@ pub fn run(args: &[&str]) -> Result<String> {
 /// answer means the request was rejected, so repeating it is safe. The
 /// primary hourly quota is not retried (it will not clear in time), and
 /// neither is anything else, 5xx included, since a create behind a 502
-/// may have gone through. Waits double from `GBD_BACKOFF_MS` (default
-/// 15 s) over five retries, or follow a `retry-after: N` in the message.
+/// may have gone through. gh does not relay the `Retry-After` header for
+/// these commands, so the wait is what GitHub documents for that case:
+/// at least a minute, doubling on each retry (`GBD_BACKOFF_MS` sets the
+/// first wait; five retries). A `retry-after: N` in the message, when gh
+/// does print one, is honoured instead.
 fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
     const RETRIES: u32 = 5;
     let base: u64 = std::env::var("GBD_BACKOFF_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(15_000);
+        .unwrap_or(60_000);
     let mut wait = base;
     for attempt in 1..=RETRIES {
         let output = spawn(args, stdin)?;
