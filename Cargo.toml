@@ -2,7 +2,7 @@
 name = "gbd"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 build = "build.rs"
 license = "MIT"
 description = "The Beads agent workflow on GitHub Issues and Projects"
@@ -29,15 +29,15 @@ too_many_lines = "allow"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "=4.5.39", features = ["derive"] }
-clap_complete = "=4.5.47"
+clap = { version = "=4.6.6", features = ["derive"] }
+clap_complete = "=4.6.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-assert_cmd = "=2.0.16"
-predicates = "=3.1.2"
-tempfile = "=3.14.0"
+assert_cmd = "=2.2.2"
+predicates = "=3.1.4"
+tempfile = "=3.27.0"
 
 [package.metadata.binstall]
 pkg-url = "https://github.com/aigency/gbd/releases/download/v{ version }/gbd-v{ version }-{ target }.tar.gz"
