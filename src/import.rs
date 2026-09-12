@@ -752,7 +752,7 @@ fn reference_definition_end(rest: &str) -> Option<usize> {
     if line.len() - trimmed.len() > 3 || !trimmed.starts_with('[') {
         return None;
     }
-    let close = trimmed.find(']')?;
+    let close = label_end(trimmed)?;
     if close < 2 || !trimmed[close + 1..].starts_with(':') {
         return None;
     }
@@ -802,24 +802,41 @@ fn reference_definition_end(rest: &str) -> Option<usize> {
 
 /// Block-quote markers at the start of a line: how many `>` prefixes (each
 /// after up to three spaces, with an optional space after it) there are,
-/// and what follows them.
-fn unquote(line: &str) -> (usize, &str) {
+/// up to `max`, and what follows them.
+fn unquote(line: &str, max: usize) -> (usize, &str) {
     let (mut depth, mut s) = (0, line);
-    loop {
+    while depth < max {
         let t = s.trim_start_matches(' ');
         if s.len() - t.len() > 3 || !t.starts_with('>') {
-            return (depth, s);
+            break;
         }
         depth += 1;
         s = t[1..].strip_prefix(' ').unwrap_or(&t[1..]);
     }
+    (depth, s)
+}
+
+/// Byte index of the `]` that closes the link label opening `s`, with
+/// backslash escapes honoured; None if the line ends first.
+fn label_end(s: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices().skip(1) {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            ']' => return Some(i),
+            '\n' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The fence a line opens, as (char, run length, block-quote depth): three
 /// or more backticks or tildes after up to three spaces, inside any block
 /// quote. A backtick fence's info string cannot contain a backtick.
 fn fence_open(line: &str) -> Option<(char, usize, usize)> {
-    let (depth, line) = unquote(line);
+    let (depth, line) = unquote(line, usize::MAX);
     let s = line.trim_start_matches(' ');
     if line.len() - s.len() > 3 {
         return None;
@@ -1001,13 +1018,15 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         if out.is_empty() || out.ends_with('\n') {
             let line = &rest[..line_end];
             // Block-quote markers are seen through by the line rules.
-            let (_, inner) = unquote(line);
+            let (_, inner) = unquote(line, usize::MAX);
             let blank = inner.trim().is_empty();
             // Inside a fence every line is code, and only a line of the
             // fence closes it, or the block quote it sits in ending.
             let mut verbatim = None;
             if let Code::Fence(c, n, depth) = md {
-                let (d, inner) = unquote(line);
+                // Only the fence's own markers come off: a deeper marker is
+                // code inside it.
+                let (d, inner) = unquote(line, depth);
                 if d < depth {
                     md = Code::Prose;
                 } else {
@@ -1763,6 +1782,16 @@ mod tests {
             rewrite_ids("[doc]: /issues/wx-2 wx-2", &known),
             "[doc]: /issues/#102 #102",
             "a second word that is not a title makes the whole line prose"
+        );
+        assert_eq!(
+            rewrite_ids("> ```\n> > ```\n> wx-2\n> ```\nwx-2", &known),
+            "> ```\n> > ```\n> wx-2\n> ```\n#102",
+            "a deeper quote marker inside a quoted fence is code"
+        );
+        assert_eq!(
+            rewrite_ids("[foo\\]]: /issues/wx-2\n\n[wx-2][foo\\]]", &known),
+            "[foo\\]]: /issues/wx-2\n\n[#102][foo\\]]",
+            "an escaped bracket inside a label"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
