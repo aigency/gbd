@@ -2371,6 +2371,9 @@ fn import_reconciles_comments_from_github_before_resuming() {
         "repos/acme/widgets/issues/103/comments --paginate --slurp",
         r#"[[{"body":"**Notes**\n\nKeep the old routes for a release.\n\n<!-- gbd-import wx-1.1/1 -->"}],[{"body":"a human said hi"}]]"#,
     )
+    // wx-2 is done in the file and closed in the export, but was reopened on
+    // GitHub since: wx-1.1 (blocked by it) must land on Blocked, not Ready.
+    .on("state-102", "issue view 102 -R acme/widgets --json state", "{\"state\":\"OPEN\"}")
     // wx-1's body was already rewritten (and touched by hand) before the kill.
     .on(
         "body-101",
@@ -2405,6 +2408,18 @@ fn import_reconciles_comments_from_github_before_resuming() {
         calls.matches("issue comment 103").count(),
         1,
         "only the second comment is posted: {calls}"
+    );
+    assert!(
+        calls.contains("issue view 102 -R acme/widgets --json state"),
+        "a finished blocker is read live: {calls}"
+    );
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "wx-1.1 is blocked by the reopened wx-2: {calls}"
+    );
+    assert!(
+        !calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
     );
     assert!(calls.contains("STDIN: **dev2** · 2026-03-03\n\nAlso drop the v1 docs.\n\n<!-- gbd-import wx-1.1/2 -->"), "marker on the posted comment: {calls}");
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();

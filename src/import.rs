@@ -691,28 +691,55 @@ impl Mapping {
 }
 
 /// `wx-12` → `#101` for every mention whose target is in `known`. A token
-/// is a maximal run of id characters; trailing dots are punctuation; a
-/// token wrapped in backticks (the import footer) or sitting inside a URL
-/// is left alone, and so is anything not in `known`.
+/// is a maximal run of id characters; trailing dots are punctuation. Left
+/// alone: a token wrapped in backticks (the import footer), a bare URL
+/// (a word containing `://`, words ending at whitespace or brackets), and
+/// a Markdown link destination (`](…)`); the link's visible text is still
+/// rewritten. Anything not in `known` stays as written.
 pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     fn id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
     }
+    fn boundary(c: char) -> bool {
+        c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '<' | '>')
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(id_char) {
-        out.push_str(&rest[..start]);
+    while !rest.is_empty() {
+        // Inside `](…)`: copy the destination through its closing paren.
+        if out.ends_with("](") {
+            match rest.find(')') {
+                Some(i) => {
+                    out.push_str(&rest[..=i]);
+                    rest = &rest[i + 1..];
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let Some(start) = rest.find(id_char) else {
+            break;
+        };
+        let literal = &rest[..start];
+        // A destination that starts with something other than an id char
+        // (`](/issues/wx-2)`): the `](` is inside this literal run.
+        if let Some(p) = literal.rfind("](") {
+            if !literal[p..].contains(')') {
+                let head = &literal[..p + 2];
+                out.push_str(head);
+                rest = &rest[head.len()..];
+                continue;
+            }
+        }
+        out.push_str(literal);
         rest = &rest[start..];
         let end = rest.find(|c: char| !id_char(c)).unwrap_or(rest.len());
         let token = &rest[..end];
         let core = token.trim_end_matches('.');
         let fenced = out.ends_with('`') && rest[end..].starts_with('`');
-        // Inside a URL the id is part of an address, not a mention.
         let in_url = {
-            let word_start = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-            let word_end = rest[end..]
-                .find(char::is_whitespace)
-                .map_or(rest.len(), |i| end + i);
+            let word_start = out.rfind(boundary).map_or(0, |i| i + 1);
+            let word_end = rest[end..].find(boundary).map_or(rest.len(), |i| end + i);
             out[word_start..].contains("://") || rest[..word_end].contains("://")
         };
         match known.get(core) {
@@ -1120,6 +1147,23 @@ mod tests {
         assert_eq!(
             rewrite_ids("(https://x.io/a?bead=wx-1.1) wx-1.1", &known),
             "(https://x.io/a?bead=wx-1.1) #103"
+        );
+        assert_eq!(
+            rewrite_ids(
+                "[wx-2](https://tracker/issues/wx-2) and [details](/issues/wx-2)",
+                &known
+            ),
+            "[#102](https://tracker/issues/wx-2) and [details](/issues/wx-2)",
+            "link text is rewritten, destinations never"
+        );
+        assert_eq!(
+            rewrite_ids("<https://x/wx-2> wx-2", &known),
+            "<https://x/wx-2> #102"
+        );
+        assert_eq!(
+            rewrite_ids("[wx-2](broken wx-2", &known),
+            "[#102](broken wx-2",
+            "an unclosed destination copies through"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }

@@ -1384,6 +1384,18 @@ impl Run<'_> {
     ) -> Result<()> {
         let mut done = done.clone();
         self.adopt_unrecorded(plan, &mut done)?;
+        // A finished blocker of something still to place may have been
+        // closed or reopened on GitHub since: its state is read live.
+        let pending: BTreeSet<&str> = plan
+            .items
+            .iter()
+            .filter(|i| {
+                !done
+                    .get(&i.bead)
+                    .is_some_and(|m| m.phase == import::Phase::Done)
+            })
+            .flat_map(|i| i.blocked_by.iter().map(String::as_str))
+            .collect();
         for (n, item) in plan.items.iter().enumerate() {
             let progress = |what: String| {
                 if !self.ctx.json {
@@ -1393,7 +1405,21 @@ impl Run<'_> {
             let mut t = match done.get(&item.bead) {
                 Some(m) if m.phase == import::Phase::Done => {
                     progress(format!("= #{}  (already imported)", m.number));
-                    if matches!(item.state, import::State::Open) {
+                    let open = if pending.contains(item.bead.as_str()) {
+                        match issue_is_open(self.ctx, m.number) {
+                            Ok(open) => open,
+                            Err(err) => {
+                                self.warnings.push(format!(
+                                    "{} (#{}): could not read its state, using the export's: {err:#}",
+                                    item.bead, m.number
+                                ));
+                                matches!(item.state, import::State::Open)
+                            }
+                        }
+                    } else {
+                        matches!(item.state, import::State::Open)
+                    };
+                    if open {
                         self.open_beads.insert(item.bead.clone());
                     }
                     continue;
@@ -1829,6 +1855,24 @@ impl Run<'_> {
             .collect();
         Ok(import::posted_comments(&bodies, &t.bead))
     }
+}
+
+/// Whether an issue is open right now.
+fn issue_is_open(ctx: &Ctx, number: u64) -> Result<bool> {
+    let n = number.to_string();
+    let view: Value = gh::run_json(&[
+        "issue",
+        "view",
+        &n,
+        "-R",
+        &ctx.repo.name_with_owner,
+        "--json",
+        "state",
+    ])?;
+    Ok(view
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("OPEN")))
 }
 
 /// The body an issue has right now.
