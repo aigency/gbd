@@ -48,7 +48,7 @@ Every release asset is signed with [minisign](https://jedisct1.github.io/minisig
 - By hand, the public key is `RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4`:
 
 ```bash
-minisign -V -P RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4 -m gbd-v1.1.0-aarch64-apple-darwin.tar.gz
+minisign -V -P RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4 -x gbd-v1.1.0-aarch64-apple-darwin.tar.gz.sig -m gbd-v1.1.0-aarch64-apple-darwin.tar.gz
 ```
 
 ```bash

@@ -24,6 +24,9 @@ REPO="aigency/gbd"
 RELEASES_API="https://api.github.com/repos/${REPO}/releases/latest"
 RELEASES_DOWNLOAD="https://github.com/${REPO}/releases/download"
 SOURCE_INSTALL_HINT="cargo install --locked gbd"
+# Releases published before signing existed. Only these may install with a
+# checksum and no signature; every later release must carry one.
+UNSIGNED_RELEASES=" v1.0.0 "
 # The release signing public key (minisign). Must match
 # [package.metadata.binstall.signing] in Cargo.toml; a test checks that.
 SIGNING_PUBKEY="RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4"
@@ -189,17 +192,24 @@ Or from source:
 }
 
 # Verify SHA256SUMS against the release signature. Hard failure on a bad
-# signature; a missing signature is reported, since releases before signing
-# was introduced have none; a missing `minisign` is a one-line note.
+# signature, and on a missing signature for any release that should have
+# one: a stripped signature must not downgrade to checksum-only. Only the
+# releases in UNSIGNED_RELEASES may proceed without. A missing `minisign`
+# is a one-line note.
 verify_signature() {
-    # $1=tmpdir
+    # $1=tmpdir $2=version
     if ! command -v minisign >/dev/null 2>&1; then
         printf 'note: install minisign to also verify the release signature\n'
         return 0
     fi
     if [ ! -s "$1/SHA256SUMS.minisig" ]; then
-        printf 'warning: this release has no SHA256SUMS.minisig; checksum only\n' >&2
-        return 0
+        case "${UNSIGNED_RELEASES}" in
+            *" $2 "*)
+                printf 'warning: %s predates release signing; checksum only\n' "$2" >&2
+                return 0
+                ;;
+        esac
+        err "release $2 should be signed but SHA256SUMS.minisig is missing; refusing to install"
     fi
     printf 'verifying release signature\n'
     (cd "$1" && minisign -V -q -P "${SIGNING_PUBKEY}" -x SHA256SUMS.minisig -m SHA256SUMS) \
@@ -266,7 +276,7 @@ main() {
     trap 'rm -rf "${tmpdir}"' EXIT INT TERM HUP
 
     download_assets "${tmpdir}" "${version}" "${tarball}"
-    verify_signature "${tmpdir}"
+    verify_signature "${tmpdir}" "${version}"
 
     if ! grep " ${tarball}$" "${tmpdir}/SHA256SUMS" > "${tmpdir}/SHA256SUMS.expected"; then
         err "SHA256SUMS does not contain an entry for ${tarball}"
