@@ -1160,10 +1160,10 @@ fn cmd_import(
             "this creates {} issues in {} and writes {} memories. Add --yes, or --dry-run to see the plan first",
             plan.items.len(),
             ctx.repo.name_with_owner,
-            plan.memories
+            plan.memories.len()
         );
     }
-    import_run(&ctx, &plan, &export)
+    import_run(&ctx, &plan)
 }
 
 /// Execute the plan top to bottom: one `gh issue create` per bead, its
@@ -1171,8 +1171,20 @@ fn cmd_import(
 /// date, assignee, comments, the close, and the card. The create is fatal
 /// (resuming is the mapping file's job); the rest warn and move on, since
 /// `board sync` and one edit repair them.
-fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<u8> {
-    let board = ctx.board()?;
+fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
+    // Without a board, In Progress and Deferred have nowhere to go and the
+    // beads would land in `ready` as plain open issues.
+    let Some(board) = ctx.board()? else {
+        bail!(
+            "gbd import needs a board so In Progress and Deferred survive the move (.gbd.yml project:). Run: gbd init"
+        );
+    };
+    if !ctx.json {
+        let diagnostics = import::render_diagnostics(plan);
+        if !diagnostics.is_empty() {
+            println!("{diagnostics}");
+        }
+    }
     let org = ctx.repo.owner();
     let priority = fields::priority_field(org)?;
     let start_date = plan
@@ -1184,6 +1196,7 @@ fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<
     let total = plan.items.len();
     let mut numbers: BTreeMap<&str, u64> = BTreeMap::new();
     let mut created = Vec::new();
+    let mut closed_ok = 0usize;
     let mut warnings: Vec<String> = Vec::new();
     for (n, item) in plan.items.iter().enumerate() {
         let edge = |bead: &str| {
@@ -1245,18 +1258,30 @@ fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<
                 warn(format!("comment not added: {err:#}"));
             }
         }
+        // What actually happened, not what was planned: a close that failed
+        // leaves the issue open, so the card is left alone rather than Done.
+        let mut state = item.state.clone();
+        let mut status = Some(item.status);
         if let import::State::Closed { reason } = item.state {
             if let Err(err) = t.gh_issue("close", &["--reason", reason.as_flag()]) {
-                warn(format!("not closed: {err:#}"));
+                warn(format!(
+                    "not closed: {err:#}. Close it by hand, then: gbd board sync"
+                ));
+                state = import::State::Open;
+                status = None;
             }
         }
-        if let Some(b) = &board {
-            if let Err(err) = b.set_status(&url, item.status) {
-                warn(format!("card not set to {}: {err:#}", item.status));
+        if let Some(s) = status {
+            if let Err(err) = board.set_status(&url, s) {
+                warn(format!("card not set to {s}: {err:#}. Run: gbd board sync"));
+                status = None;
             }
+        }
+        if matches!(state, import::State::Closed { .. }) {
+            closed_ok += 1;
         }
         if !ctx.json {
-            let closed = if matches!(item.state, import::State::Closed { .. }) {
+            let closed = if matches!(state, import::State::Closed { .. }) {
                 "  ✓"
             } else {
                 ""
@@ -1271,13 +1296,13 @@ fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<
         }
         created.push(json!({
             "bead": item.bead, "number": number, "url": url,
-            "state": item.state, "status": item.status,
+            "state": state, "status": status,
         }));
     }
     // Memories: key/value onto the memories issue, last write wins.
     let mut memories = json!(null);
-    if !export.memories.is_empty() {
-        match memories_for_import(ctx, export) {
+    if !plan.memories.is_empty() {
+        match memories_for_import(ctx, &plan.memories) {
             Ok((issue, added, updated)) => {
                 memories = json!({ "issue": issue, "added": added, "updated": updated });
             }
@@ -1287,14 +1312,14 @@ fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<
     for w in &warnings {
         eprintln!("warning: {w}");
     }
+    let dropped = plan.skipped.len();
     ctx.emit(
-        &json!({ "created": created, "memories": memories, "warnings": warnings }),
+        &json!({
+            "created": created, "memories": memories, "warnings": warnings,
+            "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
+        }),
         || {
-            let closed = plan
-                .items
-                .iter()
-                .filter(|i| matches!(i.state, import::State::Closed { .. }))
-                .count();
+            let closed = closed_ok;
             let mem = match &memories {
                 serde_json::Value::Null => String::new(),
                 m => format!(
@@ -1303,7 +1328,7 @@ fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<
                 ),
             };
             format!(
-                "\nimported {total} issues ({closed} closed){mem}; {} warning{}",
+                "\nimported {total} issues ({closed} closed){mem}; {} warning{}; {dropped} could not map (listed above)",
                 warnings.len(),
                 if warnings.len() == 1 { "" } else { "s" }
             )
@@ -1313,10 +1338,10 @@ fn import_run(ctx: &Ctx, plan: &import::Plan, export: &beads::Export) -> Result<
 }
 
 /// Upsert every `_type: memory` line into the memories issue.
-fn memories_for_import(ctx: &Ctx, export: &beads::Export) -> Result<(u64, usize, usize)> {
+fn memories_for_import(ctx: &Ctx, records: &[beads::Memory]) -> Result<(u64, usize, usize)> {
     let (issue, mut map) = memories(ctx)?;
     let (mut added, mut updated) = (0, 0);
-    for m in &export.memories {
+    for m in records {
         if map.insert(m.key.clone(), m.value.clone()).is_some() {
             updated += 1;
         } else {
