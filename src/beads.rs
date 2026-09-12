@@ -141,7 +141,8 @@ pub struct Bead {
     pub description: String,
     pub kind: Kind,
     pub status: Status,
-    /// 0 (highest) … 4, as Beads stores it.
+    /// 0 (highest) … 4. A value outside that range is reported and
+    /// clamped to the nearest end.
     pub priority: u8,
     pub assignee: Option<String>,
     pub owner: Option<String>,
@@ -231,7 +232,9 @@ struct RawIssue {
     description: String,
     issue_type: Kind,
     status: Status,
-    priority: u8,
+    /// Wide on purpose: an out-of-range value is a problem to report,
+    /// not a reason to reject the record.
+    priority: i64,
     assignee: Option<String>,
     owner: Option<String>,
     created_by: Option<String>,
@@ -325,9 +328,17 @@ fn resolve(raw: Vec<(usize, RawIssue)>, export: &mut Export) {
         if let Status::Other(s) = &r.status {
             note(format!("unknown status {s:?}"));
         }
-        if r.priority > 4 {
-            note(format!("priority {} is outside 0–4", r.priority));
-        }
+        let priority = match u8::try_from(r.priority) {
+            Ok(p) if p <= 4 => p,
+            _ => {
+                let clamped = if r.priority < 0 { 0 } else { 4 };
+                note(format!(
+                    "priority {} is outside 0–4; using {clamped}",
+                    r.priority
+                ));
+                clamped
+            }
+        };
         let mut blocked_by = Vec::new();
         let mut parent = None;
         let mut other_deps = Vec::new();
@@ -368,7 +379,7 @@ fn resolve(raw: Vec<(usize, RawIssue)>, export: &mut Export) {
             description: r.description,
             kind: r.issue_type,
             status: r.status,
-            priority: r.priority,
+            priority,
             assignee: r.assignee,
             owner: r.owner,
             created_by: r.created_by,
@@ -519,6 +530,25 @@ mod tests {
         assert_eq!(e.issues[0].title, "one");
         assert_eq!(e.problems.len(), 1);
         assert!(e.problems[0].to_string().contains("duplicate id"));
+    }
+
+    #[test]
+    fn priorities_outside_0_to_4_are_clamped_and_reported() {
+        let lines = "{\"id\":\"a-1\",\"title\":\"low\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":900,\"created_at\":\"t\"}\n\
+                     {\"id\":\"a-2\",\"title\":\"high\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":-3,\"created_at\":\"t\"}\n";
+        let e = parse(lines.as_bytes()).unwrap();
+        assert_eq!(e.get("a-1").unwrap().priority, 4);
+        assert_eq!(e.get("a-2").unwrap().priority, 0);
+        let what: Vec<String> = e.problems.iter().map(ToString::to_string).collect();
+        assert_eq!(what.len(), 2, "{what:?}");
+        assert!(
+            what[0].contains("a-1: priority 900 is outside 0–4; using 4"),
+            "{what:?}"
+        );
+        assert!(
+            what[1].contains("a-2: priority -3 is outside 0–4; using 0"),
+            "{what:?}"
+        );
     }
 
     #[test]
