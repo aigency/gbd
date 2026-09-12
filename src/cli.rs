@@ -1341,8 +1341,8 @@ struct Run<'a> {
     /// Beads that are open on GitHub after this run touched or skipped
     /// them. Cards are placed against this, not against the plan.
     open_beads: BTreeSet<String>,
-    /// Per bead touched this run: its issue, its URL, whether it was
-    /// resumed, and whether every step so far succeeded.
+    /// Per bead touched this run: its issue, how far the mapping file says
+    /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
 }
 
@@ -1351,8 +1351,10 @@ struct Touched {
     number: u64,
     url: String,
     resumed: bool,
-    /// Comments already on the issue when this run started.
+    /// Comments the mapping file says are on the issue.
     comments: usize,
+    /// The body was already edited for forward references.
+    rewritten: bool,
     clean: bool,
 }
 
@@ -1374,7 +1376,7 @@ impl Run<'_> {
                     println!("{:>5}/{total}  {} {what}", n + 1, item.bead);
                 }
             };
-            let (number, url, resumed, comments) = match done.get(&item.bead) {
+            let mut t = match done.get(&item.bead) {
                 Some(m) if m.phase == import::Phase::Done => {
                     progress(format!("= #{}  (already imported)", m.number));
                     if matches!(item.state, import::State::Open) {
@@ -1384,31 +1386,40 @@ impl Run<'_> {
                 }
                 Some(m) => {
                     progress(format!("= #{}  (finishing)", m.number));
-                    (m.number, m.url.clone(), true, m.comments)
+                    Touched {
+                        bead: item.bead.clone(),
+                        number: m.number,
+                        url: m.url.clone(),
+                        resumed: true,
+                        comments: m.comments,
+                        rewritten: m.rewritten,
+                        clean: true,
+                    }
                 }
                 None => {
                     let (number, url) = self.create(item, n, total)?;
-                    (number, url, false, 0)
+                    Touched {
+                        bead: item.bead.clone(),
+                        number,
+                        url,
+                        resumed: false,
+                        comments: 0,
+                        rewritten: false,
+                        clean: true,
+                    }
                 }
             };
-            let (state, clean) = self.place(item, number, &url);
-            self.touched.push(Touched {
-                bead: item.bead.clone(),
-                number,
-                url,
-                resumed,
-                comments,
-                clean,
-            });
+            let state = self.place(item, &mut t);
             let closed = if matches!(state, import::State::Closed { .. }) {
                 "  ✓"
             } else {
                 ""
             };
             progress(format!(
-                "→ #{number}  [{}] {}{closed}",
-                item.issue_type, item.title
+                "→ #{}  [{}] {}{closed}",
+                t.number, item.issue_type, item.title
             ));
+            self.touched.push(t);
         }
         self.rewrite_forward(plan);
         self.comments(plan)
@@ -1416,24 +1427,21 @@ impl Run<'_> {
 
     /// One mapping line. Its failure is fatal and says exactly what to
     /// add by hand, since the issue exists whether or not the file does.
-    fn record(
-        &mut self,
-        bead: &str,
-        number: u64,
-        url: &str,
-        phase: import::Phase,
-        comments: usize,
-    ) -> Result<()> {
+    fn record(&mut self, t: &Touched, phase: import::Phase) -> Result<()> {
         let m = import::Mapped {
-            bead: bead.to_string(),
-            number,
-            url: url.to_string(),
+            bead: t.bead.clone(),
+            number: t.number,
+            url: t.url.clone(),
             phase,
-            comments,
+            comments: t.comments,
+            rewritten: t.rewritten,
         };
         self.map.record(&m).with_context(|| {
             format!(
-                "{bead} is #{number} ({url}) but could not be recorded in {}. Add this line to the file before resuming:\n{}",
+                "{} is #{} ({}) but could not be recorded in {}. Add this line to the file before resuming:\n{}",
+                t.bead,
+                t.number,
+                t.url,
                 self.map.path().display(),
                 serde_json::to_string(&m).unwrap_or_default()
             )
@@ -1467,25 +1475,36 @@ impl Run<'_> {
             },
         )
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
-        self.record(&item.bead, number, &url, import::Phase::Created, 0)?;
+        let t = Touched {
+            bead: item.bead.clone(),
+            number,
+            url: url.clone(),
+            resumed: false,
+            comments: 0,
+            rewritten: false,
+            clean: true,
+        };
+        self.record(&t, import::Phase::Created)?;
         self.numbers.insert(item.bead.clone(), number);
         Ok((number, url))
     }
 
     /// Priority, Start date, assignee, the close, and the card: all
     /// idempotent, so a resumed bead simply gets them again. Returns the
-    /// state the issue actually ended in and whether every step succeeded.
-    fn place(&mut self, item: &import::Item, number: u64, url: &str) -> (import::State, bool) {
+    /// state the issue actually ended in; a failure clears `t.clean`.
+    fn place(&mut self, item: &import::Item, t: &mut Touched) -> import::State {
+        let number = t.number;
         let mut warnings = Vec::new();
         let warn = |warnings: &mut Vec<String>, what: String| {
             warnings.push(format!("{} (#{number}): {what}", item.bead));
         };
-        let t = match self.ctx.target(&number.to_string()) {
-            Ok(t) => t,
+        let target = match self.ctx.target(&number.to_string()) {
+            Ok(target) => target,
             Err(err) => {
                 warn(&mut warnings, format!("{err:#}"));
                 self.warnings.append(&mut warnings);
-                return (item.state.clone(), false);
+                t.clean = false;
+                return item.state.clone();
             }
         };
         if let Err(err) = fields::option_name(item.priority)
@@ -1499,7 +1518,7 @@ impl Run<'_> {
             }
         }
         if let Some(login) = &item.assignee {
-            if let Err(err) = t.edit(&["--add-assignee", login]) {
+            if let Err(err) = target.edit(&["--add-assignee", login]) {
                 warn(&mut warnings, format!("assignee {login} not set: {err:#}"));
             }
         }
@@ -1509,7 +1528,7 @@ impl Run<'_> {
         // state (a blocker whose close failed still blocks).
         let mut state = item.state.clone();
         if let import::State::Closed { reason } = item.state {
-            if let Err(err) = t.gh_issue("close", &["--reason", reason.as_flag()]) {
+            if let Err(err) = target.gh_issue("close", &["--reason", reason.as_flag()]) {
                 warn(
                     &mut warnings,
                     format!("not closed: {err:#}. Run gbd import again to retry"),
@@ -1535,7 +1554,7 @@ impl Run<'_> {
             (import::State::Open, _, planned) => Some(planned),
         };
         if let Some(s) = status {
-            if let Err(err) = self.board.set_status(url, s) {
+            if let Err(err) = self.board.set_status(&t.url, s) {
                 warn(
                     &mut warnings,
                     format!("card not set to {s}: {err:#}. Run gbd import again to retry"),
@@ -1543,24 +1562,26 @@ impl Run<'_> {
                 status = None;
             }
         }
-        let clean = warnings.is_empty();
+        if !warnings.is_empty() {
+            t.clean = false;
+        }
         self.warnings.append(&mut warnings);
         if matches!(state, import::State::Closed { .. }) {
             self.closed_ok += 1;
         }
         self.created.push(json!({
-            "bead": item.bead, "number": number, "url": url,
+            "bead": item.bead, "number": number, "url": t.url,
             "state": state, "status": status,
         }));
-        (state, clean)
+        state
     }
 
     /// A body written before the bead it mentions existed still says
-    /// `wx-9`. Now that every number is known, edit those bodies once.
-    /// Only beads this run created or resumed: a `done` bead had this pass
-    /// in the run that finished it (`done` is written after it), and its
-    /// body may have been edited by hand since. A failed edit keeps the
-    /// bead off `done`, so the next run tries again.
+    /// `wx-9`. Now that every number is known, edit those bodies once and
+    /// checkpoint it, so a later retry of the same bead never overwrites
+    /// edits made on GitHub in between. Only beads this run created or
+    /// resumed: a `done` bead had this pass in the run that finished it.
+    /// A failed edit keeps the bead off `done`.
     fn rewrite_forward(&mut self, plan: &import::Plan) {
         let pos: BTreeMap<&str, usize> = plan
             .items
@@ -1572,6 +1593,9 @@ impl Run<'_> {
             plan.items.iter().map(|it| (it.bead.as_str(), it)).collect();
         let mut touched = std::mem::take(&mut self.touched);
         for t in &mut touched {
+            if t.rewritten {
+                continue;
+            }
             let (Some(item), Some(&i)) = (by_bead.get(t.bead.as_str()), pos.get(t.bead.as_str()))
             else {
                 continue;
@@ -1598,7 +1622,14 @@ impl Run<'_> {
                 "-",
             ];
             match gh::run_stdin(&args, body.as_bytes()) {
-                Ok(_) => self.rewritten.push(t.number),
+                Ok(_) => {
+                    t.rewritten = true;
+                    self.rewritten.push(t.number);
+                    if let Err(err) = self.record(t, import::Phase::Created) {
+                        self.warnings.push(format!("{err:#}"));
+                        t.clean = false;
+                    }
+                }
                 Err(err) => {
                     self.warnings.push(format!(
                         "{} (#{}): body still mentions Beads ids; edit failed: {err:#}. Run gbd import again to retry",
@@ -1611,21 +1642,39 @@ impl Run<'_> {
         self.touched = touched;
     }
 
-    /// Comments are the one step that is not idempotent: each one is
-    /// checkpointed in the mapping file, a failure stops that bead's rest
-    /// so the next run retries from there, and `done` follows the last one
-    /// only when everything else on the bead succeeded too.
+    /// Comments are the one step that is not idempotent, so each carries a
+    /// hidden `<!-- gbd-import bead/k -->` marker. A resumed bead is first
+    /// reconciled against the comments GitHub already has, so a kill
+    /// between a post and its checkpoint never duplicates one; then each
+    /// post is checkpointed, a failure stops that bead's rest, and `done`
+    /// follows the last one only when everything else on the bead
+    /// succeeded too.
     fn comments(&mut self, plan: &import::Plan) -> Result<()> {
-        let touched = std::mem::take(&mut self.touched);
-        for t in &touched {
+        let mut touched = std::mem::take(&mut self.touched);
+        for t in &mut touched {
             let Some(item) = plan.items.iter().find(|i| i.bead == t.bead) else {
                 continue;
             };
-            let mut posted = t.comments;
-            let mut clean = t.clean;
-            for body in item.comments.iter().skip(posted) {
+            if t.resumed && t.comments < item.comments.len() {
+                match self.posted_on_github(t) {
+                    Ok(on_github) => t.comments = t.comments.max(on_github),
+                    Err(err) => {
+                        self.warnings.push(format!(
+                            "{} (#{}): could not read its comments, none posted: {err:#}. Run gbd import again to retry",
+                            t.bead, t.number
+                        ));
+                        t.clean = false;
+                        continue;
+                    }
+                }
+            }
+            for (k, body) in item.comments.iter().enumerate().skip(t.comments) {
                 let n = t.number.to_string();
-                let body = import::rewrite_ids(body, &self.numbers);
+                let body = format!(
+                    "{}\n\n{}",
+                    import::rewrite_ids(body, &self.numbers),
+                    import::comment_marker(&t.bead, k + 1)
+                );
                 let args = [
                     "issue",
                     "comment",
@@ -1640,22 +1689,37 @@ impl Run<'_> {
                         "{} (#{}): comment {} not added: {err:#}. Run gbd import again to retry",
                         t.bead,
                         t.number,
-                        posted + 1
+                        k + 1
                     ));
-                    clean = false;
+                    t.clean = false;
                     break;
                 }
-                posted += 1;
-                self.record(&t.bead, t.number, &t.url, import::Phase::Created, posted)?;
+                t.comments = k + 1;
+                self.record(t, import::Phase::Created)?;
             }
-            if clean {
-                self.record(&t.bead, t.number, &t.url, import::Phase::Done, posted)?;
+            if t.clean {
+                self.record(t, import::Phase::Done)?;
                 if t.resumed {
                     self.finished.push(t.bead.clone());
                 }
             }
         }
+        self.touched = touched;
         Ok(())
+    }
+
+    /// How many of a bead's comments are already on its issue, by marker.
+    fn posted_on_github(&self, t: &Touched) -> Result<usize> {
+        let path = format!(
+            "repos/{}/issues/{}/comments",
+            self.ctx.repo.name_with_owner, t.number
+        );
+        let raw: Vec<Value> = gh::run_json(&["api", &path, "--paginate"])?;
+        let bodies: Vec<&str> = raw
+            .iter()
+            .filter_map(|c| c.get("body").and_then(Value::as_str))
+            .collect();
+        Ok(import::posted_comments(&bodies, &t.bead))
     }
 }
 

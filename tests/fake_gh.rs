@@ -2339,3 +2339,66 @@ fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
         "{map}"
     );
 }
+
+#[test]
+fn import_reconciles_comments_from_github_before_resuming() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // Everything was created; wx-1 had its body rewritten; wx-1.1's first
+    // comment was posted but the kill came before its checkpoint.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        concat!(
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"created\",\"comments\":0,\"rewritten\":true}\n",
+            "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"created\",\"comments\":0}\n",
+        ),
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("values", "issue-field-values --input -", "{}")
+    .on(
+        "comments-103",
+        "repos/acme/widgets/issues/103/comments --paginate",
+        r#"[{"body":"**Notes**\n\nKeep the old routes for a release.\n\n<!-- gbd-import wx-1.1/1 -->"},{"body":"a human said hi"}]"#,
+    )
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "imported 2 issues (0 closed, 2 finished from an earlier run, 1 already imported)",
+        ));
+    let calls = h.calls();
+    assert!(!calls.contains("issue create"), "{calls}");
+    assert!(
+        !calls.contains("issue edit 101 -R acme/widgets --body-file"),
+        "already rewritten, never re-edited: {calls}"
+    );
+    assert_eq!(
+        calls.matches("issue comment 103").count(),
+        1,
+        "only the second comment is posted: {calls}"
+    );
+    assert!(calls.contains("STDIN: **dev2** · 2026-03-03\n\nAlso drop the v1 docs.\n\n<!-- gbd-import wx-1.1/2 -->"), "marker on the posted comment: {calls}");
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last: Vec<&str> = map.lines().rev().take(3).collect();
+    assert!(
+        last[0].contains("\"bead\":\"wx-1.1\"")
+            && last[0].contains("\"phase\":\"done\"")
+            && last[0].contains("\"comments\":2"),
+        "{map}"
+    );
+}

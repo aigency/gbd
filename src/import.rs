@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -548,6 +548,10 @@ pub struct Mapped {
     /// resume posts only the rest.
     #[serde(default)]
     pub comments: usize,
+    /// The body was already edited for forward references, so a retry
+    /// leaves it alone.
+    #[serde(default)]
+    pub rewritten: bool,
 }
 
 impl Mapped {
@@ -562,28 +566,90 @@ impl Mapped {
 /// The mapping file's records, last line per bead winning; absent means
 /// empty.
 pub fn read_mapping(path: &Path) -> Result<BTreeMap<String, Mapped>> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
     };
     let mut map = BTreeMap::new();
-    for (idx, line) in std::io::BufReader::new(file).lines().enumerate() {
-        let line = line?;
+    let complete = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let m: Mapped = serde_json::from_str(&line)
-            .with_context(|| format!("{}:{}: not a mapping line", path.display(), idx + 1))?;
-        map.insert(m.bead.clone(), m);
+        match serde_json::from_str::<Mapped>(line) {
+            Ok(m) => {
+                map.insert(m.bead.clone(), m);
+            }
+            // A last line without its newline is a write that was cut off
+            // (disk full, kill): it recorded nothing, so it is ignored, and
+            // `Mapping::open` drops it before appending.
+            Err(_) if idx + 1 == lines.len() && !complete => {
+                eprintln!(
+                    "warning: {}: ignoring an incomplete last line (an interrupted write)",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("{}:{}: not a mapping line", path.display(), idx + 1)
+                });
+            }
+        }
     }
     Ok(map)
+}
+
+/// `<!-- gbd-import wx-1/2 -->`: a hidden marker at the end of each
+/// imported comment, so a resume can tell which ones GitHub already has.
+pub fn comment_marker(bead: &str, k: usize) -> String {
+    format!("<!-- gbd-import {bead}/{k} -->")
+}
+
+/// The highest comment index found by marker among `bodies` for `bead`.
+pub fn posted_comments(bodies: &[&str], bead: &str) -> usize {
+    let prefix = format!("<!-- gbd-import {bead}/");
+    bodies
+        .iter()
+        .filter_map(|b| {
+            let start = b.rfind(&prefix)? + prefix.len();
+            let digits: String = b[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The first record that belongs to another repository than `repo`, if any.
 pub fn foreign_entry<'a>(map: &'a BTreeMap<String, Mapped>, repo: &str) -> Option<&'a Mapped> {
     map.values()
         .find(|m| !m.repo().is_some_and(|r| r.eq_ignore_ascii_case(repo)))
+}
+
+/// A file whose last line has no newline ends in a cut-off write. If that
+/// tail still parses it is a whole record and only needs its newline;
+/// otherwise it is dropped so the next record starts on a clean line.
+fn repair_tail(path: &Path) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    if text.is_empty() || text.ends_with('\n') {
+        return Ok(());
+    }
+    let cut = text.rfind('\n').map_or(0, |i| i + 1);
+    let tail = &text[cut..];
+    let fixed = if serde_json::from_str::<Mapped>(tail).is_ok() {
+        format!("{text}\n")
+    } else {
+        text[..cut].to_string()
+    };
+    std::fs::write(path, fixed).with_context(|| format!("repairing {}", path.display()))
 }
 
 /// Append-only, flushed per line: a run killed halfway loses nothing, and
@@ -595,6 +661,7 @@ pub struct Mapping {
 
 impl Mapping {
     pub fn open(path: &Path) -> Result<Self> {
+        repair_tail(path)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1046,6 +1113,7 @@ mod tests {
             url: format!("https://github.com/acme/widgets/issues/{number}"),
             phase,
             comments: 0,
+            rewritten: false,
         };
         let mut m = Mapping::open(&path).unwrap();
         m.record(&rec("a-1", 7, Phase::Created)).unwrap();
@@ -1075,6 +1143,55 @@ mod tests {
             format!("{err:#}").contains(":1: not a mapping line"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_cut_off_last_line_is_ignored_and_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.jsonl");
+        let good = r#"{"bead":"a-1","number":7,"url":"https://github.com/acme/widgets/issues/7","phase":"done"}"#;
+        std::fs::write(&path, format!("{good}\n{{\"bead\":\"a-2\",\"num")).unwrap();
+        let map = read_mapping(&path).unwrap();
+        assert_eq!(map.len(), 1, "the torn tail records nothing");
+        let mut m = Mapping::open(&path).unwrap();
+        m.record(&Mapped {
+            bead: "a-2".into(),
+            number: 8,
+            url: "https://github.com/acme/widgets/issues/8".into(),
+            phase: Phase::Created,
+            comments: 0,
+            rewritten: false,
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "the tail was dropped before appending: {text}"
+        );
+        assert_eq!(read_mapping(&path).unwrap().len(), 2);
+        // A whole last record that only lacks its newline is kept.
+        std::fs::write(&path, good).unwrap();
+        Mapping::open(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{good}\n"));
+        // A malformed line in the middle is still an error.
+        std::fs::write(&path, format!("{{\"bead\":1}}\n{good}\n")).unwrap();
+        assert!(read_mapping(&path).is_err());
+    }
+
+    #[test]
+    fn comment_markers_say_what_github_already_has() {
+        assert_eq!(comment_marker("wx-1.1", 2), "<!-- gbd-import wx-1.1/2 -->");
+        let bodies = [
+            "first\n\n<!-- gbd-import wx-1.1/1 -->",
+            "unrelated <!-- gbd-import wx-9/4 -->",
+            "second\n\n<!-- gbd-import wx-1.1/2 -->",
+            "a human comment",
+        ];
+        assert_eq!(posted_comments(&bodies, "wx-1.1"), 2);
+        assert_eq!(posted_comments(&bodies, "wx-9"), 4);
+        assert_eq!(posted_comments(&bodies, "wx-2"), 0);
+        assert_eq!(posted_comments(&[], "wx-1.1"), 0);
     }
 
     #[test]
