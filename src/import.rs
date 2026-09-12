@@ -545,6 +545,10 @@ pub struct Mapped {
     pub url: String,
     #[serde(default)]
     pub phase: Phase,
+    /// Comments already on the issue while the phase is `created`, so a
+    /// resume posts only the rest.
+    #[serde(default)]
+    pub comments: usize,
 }
 
 impl Mapped {
@@ -1042,6 +1046,7 @@ mod tests {
             number,
             url: format!("https://github.com/acme/widgets/issues/{number}"),
             phase,
+            comments: 0,
         };
         let mut m = Mapping::open(&path).unwrap();
         m.record(&rec("a-1", 7, Phase::Created)).unwrap();

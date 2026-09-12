@@ -1881,7 +1881,8 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
     .on("anyedit", "project item-edit --id PVTI_new", "")
     .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"## old-key\\n\\nstill here\\n\"}")
-    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
 
     // Refuses without --yes, before any write.
     h.gbd()
@@ -1981,6 +1982,19 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
         "{calls}"
     );
     assert_eq!(calls.matches("issue comment 103").count(), 2, "{calls}");
+    // wx-1 mentioned wx-2 before it existed: its body is edited once at the end.
+    let fixed = calls
+        .rsplit("issue edit 101 -R acme/widgets --body-file -\nSTDIN: ")
+        .next()
+        .unwrap();
+    assert!(
+        fixed.starts_with("Umbrella; the auth fix is #102."),
+        "{fixed}"
+    );
+    assert!(
+        !calls.contains("issue edit 103 -R acme/widgets --body-file"),
+        "a backward reference needs no edit: {calls}"
+    );
     // Memories merge into the existing body.
     let saved = calls
         .rsplit("issue edit 3 -R acme/widgets --body-file -\nSTDIN: ")
@@ -2033,7 +2047,8 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
     .on("anyedit", "project item-edit --id PVTI_new", "")
     .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
-    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
     h.gbd()
         .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
         .assert()
@@ -2089,7 +2104,7 @@ fn import_reports_what_exists_when_a_create_fails() {
     )
     .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
     .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
-    .on_fail("create-3", "--title Rename the endpoints", "HTTP 403: secondary rate limit")
+    .on_fail("create-3", "--title Rename the endpoints", "HTTP 500: Internal Server Error")
     .on("values", "issue-field-values --input -", "{}")
     .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
     .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
@@ -2153,7 +2168,8 @@ fn import_resumes_from_the_mapping_file() {
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
     .on("anyedit", "project item-edit --id PVTI_new", "")
     .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
-    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
 
     // The dry run says what will be skipped.
     h.gbd()
@@ -2212,28 +2228,31 @@ fn import_resumes_from_the_mapping_file() {
     );
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
     let lines: Vec<&str> = map.lines().collect();
-    assert_eq!(lines.len(), 8, "{map}");
+    assert_eq!(lines.len(), 10, "{map}");
     let phases: Vec<String> = lines[3..]
         .iter()
         .map(|l| {
             let v: serde_json::Value = serde_json::from_str(l).unwrap();
             format!(
-                "{} {}",
+                "{} {} {}",
                 v["bead"].as_str().unwrap(),
-                v["phase"].as_str().unwrap()
+                v["phase"].as_str().unwrap(),
+                v["comments"]
             )
         })
         .collect();
     assert_eq!(
         phases,
         [
-            "wx-2 commented",
-            "wx-2 done",
-            "wx-1.1 created",
-            "wx-1.1 commented",
-            "wx-1.1 done"
+            "wx-2 commented 0",
+            "wx-2 done 0",
+            "wx-1.1 created 0",
+            "wx-1.1 created 1",
+            "wx-1.1 created 2",
+            "wx-1.1 commented 2",
+            "wx-1.1 done 2"
         ],
-        "{map}"
+        "each comment is checkpointed: {map}"
     );
 }
 
