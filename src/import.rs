@@ -601,6 +601,15 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
             keys.join(" ")
         );
     }
+    out.push_str(&render_diagnostics(p));
+    out.push_str("\nNothing written (--dry-run).\n");
+    out
+}
+
+/// The parts of the report a real run must show too: cycles, what cannot
+/// map, and the parser's problems. Empty when there is nothing to say.
+pub fn render_diagnostics(p: &Plan) -> String {
+    let mut out = String::new();
     if !p.cycles.is_empty() {
         let _ = writeln!(
             out,
@@ -623,7 +632,6 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
             let _ = writeln!(out, "  {m}");
         }
     }
-    out.push_str("\nNothing written (--dry-run).\n");
     out
 }
 

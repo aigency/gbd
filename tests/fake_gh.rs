@@ -1991,3 +1991,71 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
         "{saved}"
     );
 }
+
+#[test]
+fn import_needs_a_board_before_it_creates_anything() {
+    let h = Harness::new(); // .gbd.yml without project:
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/1",
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "needs a board so In Progress and Deferred survive",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
+
+#[test]
+fn import_reports_what_it_could_not_map_and_a_failed_close() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on_fail("close", "issue close 102 -R acme/widgets --reason duplicate", "HTTP 502")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        // The plan's losses are shown before anything is created.
+        .stdout(predicate::str::contains(
+            "Cannot map (1):\n  wx-1.1: related edge to wx-2 has no GitHub relation\n",
+        ))
+        .stdout(predicate::str::contains(
+            "2/3  wx-2 → #102  [Bug] Auth refresh drops the session\n",
+        ))
+        .stdout(predicate::str::contains(
+            "1 warning; 1 could not map (listed above)",
+        ))
+        .stderr(predicate::str::contains("wx-2 (#102): not closed: "))
+        .stderr(predicate::str::contains(
+            "Close it by hand, then: gbd board sync",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("O_done"),
+        "an open issue is never marked Done: {calls}"
+    );
+    assert!(!calls.contains("✓"), "{calls}");
+}
