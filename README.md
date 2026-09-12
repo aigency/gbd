@@ -27,13 +27,15 @@ curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh
 ```
 
 ```bash
-# From source (Intel Mac, or any arch without a prebuilt):
-cargo install --locked --git https://github.com/aigency/gbd
+cargo binstall gbd
 ```
 
-`cargo binstall gbd` and `cargo install gbd` will work once the crate is published to crates.io; the `binstall` metadata in `Cargo.toml` already points at the release tarballs.
+```bash
+# From source, via crates.io (Intel Mac, or any arch without a prebuilt):
+cargo install --locked gbd
+```
 
-`install.sh` downloads the release tarball for your OS and architecture (linux x86_64/arm64, macOS arm64), verifies SHA256, and installs `~/.local/bin/gbd` (override with `GBD_INSTALL_DIR`). Put `~/.local/bin` on your `PATH`.
+Both download the release tarball for your OS and architecture (linux x86_64/arm64, macOS arm64). `install.sh` also verifies the tarball against the release's `SHA256SUMS` and installs `~/.local/bin/gbd` (override with `GBD_INSTALL_DIR`), so put `~/.local/bin` on your `PATH`; `cargo binstall` does no checksum verification of its own.
 
 `gbd --version` prints the crate version and the git commit it was built from, e.g. `gbd 1.0.0 (1a2b3c4)`, so you can tell a release from a local build.
 
