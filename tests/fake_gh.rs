@@ -2477,6 +2477,7 @@ fn import_adopts_an_issue_created_but_never_recorded() {
     )
     .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
     .on("values", "issue-field-values --input -", "{}")
+    .on("retype", "issue edit 102 -R acme/widgets --type Bug", "")
     .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
     .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
     .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
@@ -2498,6 +2499,10 @@ fn import_adopts_an_issue_created_but_never_recorded() {
     assert!(
         !calls.contains("--title Auth refresh"),
         "not created twice: {calls}"
+    );
+    assert!(
+        calls.contains("issue edit 102 -R acme/widgets --type Bug"),
+        "the type a dying create may not have set is reapplied: {calls}"
     );
     assert!(
         !calls.contains("issue list -R acme/widgets --search"),
@@ -2566,6 +2571,7 @@ fn import_adopts_an_issue_created_but_never_recorded() {
     .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
     .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
     .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("retype-7", "issue edit 7 -R acme/widgets --type Epic", "")
     .on("body-7", "issue view 7 -R acme/widgets --json body", "{\"body\":\"Umbrella; the auth fix is wx-2.\\n\\n---\\nImported from Beads `wx-1` (created 2026-03-01 by dev1).\"}")
     .on("edit-7", "issue edit 7 -R acme/widgets --body-file -", "")
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)

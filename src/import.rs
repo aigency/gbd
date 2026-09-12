@@ -714,6 +714,25 @@ fn is_reference_definition(line: &str) -> bool {
     }
 }
 
+/// Byte index of the `)` that closes a link destination starting at the
+/// beginning of `s`, with nested parentheses balanced.
+fn destination_end(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Where the scanner is with respect to Markdown code.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Code {
@@ -773,9 +792,10 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                 continue;
             }
         }
-        // Inside `](…)`: copy the destination through its closing paren.
+        // Inside `](…)`: copy the destination through its closing paren,
+        // parentheses inside it balanced.
         if out.ends_with("](") {
-            match rest.find(')') {
+            match destination_end(rest) {
                 Some(i) => {
                     out.push_str(&rest[..=i]);
                     rest = &rest[i + 1..];
@@ -1285,6 +1305,11 @@ mod tests {
             rewrite_ids("[wx-2]:no space", &known),
             "[#102]:no space",
             "without the space it is prose"
+        );
+        assert_eq!(
+            rewrite_ids("[doc](/archive(v1)/wx-2) wx-2", &known),
+            "[doc](/archive(v1)/wx-2) #102",
+            "parentheses inside a destination balance"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }

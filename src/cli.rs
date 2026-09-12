@@ -1299,6 +1299,7 @@ fn import_run(
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
         unsure_blockers: BTreeSet::new(),
+        unclean_adopted: BTreeSet::new(),
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1392,6 +1393,9 @@ struct Run<'a> {
     /// Finished blockers whose live state could not be read: anything
     /// placed against them stays unfinished, so the next run looks again.
     unsure_blockers: BTreeSet<String>,
+    /// Adopted beads whose type, parent, or blockers could not be
+    /// reapplied; they stay unfinished so the next run tries again.
+    unclean_adopted: BTreeSet<String>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1473,7 +1477,7 @@ impl Run<'_> {
                         resumed: true,
                         comments: m.comments,
                         rewritten: m.rewritten,
-                        clean: true,
+                        clean: !self.unclean_adopted.contains(&item.bead),
                     }
                 }
                 None => {
@@ -1536,6 +1540,27 @@ impl Run<'_> {
                         self.map.path().display()
                     );
                 }
+            }
+        }
+        // `gh issue create` sets the type, parent, and blockers after the
+        // create; the run that died may not have got that far. Reapply them
+        // (each is idempotent) and keep the bead unfinished if any fails.
+        let target = self.ctx.target(&number.to_string())?;
+        let mut redo: Vec<Vec<String>> = vec![vec!["--type".into(), item.issue_type.into()]];
+        if let Some(parent) = item.parent.as_deref().and_then(|p| self.numbers.get(p)) {
+            redo.push(vec!["--parent".into(), parent.to_string()]);
+        }
+        for blocker in item.blocked_by.iter().filter_map(|b| self.numbers.get(b)) {
+            redo.push(vec!["--add-blocked-by".into(), blocker.to_string()]);
+        }
+        for flags in &redo {
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            if let Err(err) = target.edit(&flags) {
+                self.warnings.push(format!(
+                    "{} (#{number}): {} not reapplied: {err:#}. Run gbd import again to retry",
+                    item.bead, flags[0]
+                ));
+                self.unclean_adopted.insert(item.bead.clone());
             }
         }
         if !self.ctx.json {
