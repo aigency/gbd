@@ -6,6 +6,7 @@ This repo tracks work with **gbd** (GitHub Issues + Projects). Do not use Beads 
 - Create: `gbd create "…" -t Task -p 1 --parent 88 --deps 12`
 - State: `gbd update <n> --status in_progress|deferred|ready` (board), `gbd priority <n> P1` (org field). Never labels.
 - Lore: `gbd remember "insight"` (not MEMORY.md)
+- Migrate from Beads: `gbd import --from-beads FILE --dry-run` (one shot, not a sync)
 
 Run `gbd prime` after compaction. Full skill: `.agents/skills/gbd/SKILL.md` (same file under `.claude/skills` and `.cursor/skills`).
 <!-- END GBD -->

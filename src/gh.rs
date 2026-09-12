@@ -19,7 +19,56 @@ fn base_command() -> Command {
 
 /// Run `gh` with the given args. Returns stdout (trimmed) on success.
 pub fn run(args: &[&str]) -> Result<String> {
-    finish(args, &spawn(args, None)?)
+    retrying(args, None)
+}
+
+/// Run, and when GitHub answers with a secondary rate limit (HTTP 403
+/// "rate limit"/"abuse" or HTTP 429), wait and try again: those answers
+/// mean the request was rejected, so repeating it is safe. Anything else,
+/// 5xx included, is returned as is, since a create behind a 502 may have
+/// gone through. Waits double from `GBD_BACKOFF_MS` (default 15 s) over
+/// five retries, or follow a `retry-after: N` in the message.
+fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
+    const RETRIES: u32 = 5;
+    let base: u64 = std::env::var("GBD_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15_000);
+    let mut wait = base;
+    for attempt in 1..=RETRIES {
+        let output = spawn(args, stdin)?;
+        match finish(args, &output) {
+            Err(err) if rate_limited(&err) => {
+                let ms = retry_after_ms(&err).unwrap_or(wait);
+                eprintln!(
+                    "gh: rate limited; retrying in {}s ({attempt} of {RETRIES})",
+                    ms.div_ceil(1000)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                wait = wait.saturating_mul(2);
+            }
+            other => return other,
+        }
+    }
+    finish(args, &spawn(args, stdin)?)
+}
+
+fn rate_limited(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("http 429")
+        || (msg.contains("http 403") && (msg.contains("rate limit") || msg.contains("abuse")))
+}
+
+/// `retry-after: 30` → 30 000 ms, when gh relays the header.
+fn retry_after_ms(err: &anyhow::Error) -> Option<u64> {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    let idx = msg.find("retry-after:")?;
+    let secs: String = msg[idx + "retry-after:".len()..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    secs.parse::<u64>().ok().map(|s| s.saturating_mul(1000))
 }
 
 fn finish(args: &[&str], output: &Output) -> Result<String> {
@@ -38,7 +87,7 @@ fn finish(args: &[&str], output: &Output) -> Result<String> {
 
 /// Run `gh` with `stdin` piped in (for `--body-file -` and friends).
 pub fn run_stdin(args: &[&str], stdin: &[u8]) -> Result<String> {
-    finish(args, &spawn(args, Some(stdin))?)
+    retrying(args, Some(stdin))
 }
 
 pub fn run_json<T: DeserializeOwned>(args: &[&str]) -> Result<T> {
@@ -97,7 +146,7 @@ pub fn api(method: &str, path: &str, body: Option<&Value>) -> Result<String> {
         args.push("-".into());
     }
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    finish(&str_args, &spawn(&str_args, stdin.as_deref())?)
+    retrying(&str_args, stdin.as_deref())
 }
 
 pub fn api_json<T: DeserializeOwned>(method: &str, path: &str, body: Option<&Value>) -> Result<T> {

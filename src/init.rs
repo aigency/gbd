@@ -23,6 +23,7 @@ This repo tracks work with **gbd** (GitHub Issues + Projects). Do not use Beads 
 - Create: `gbd create "…" -t Task -p 1 --parent 88 --deps 12`
 - State: `gbd update <n> --status in_progress|deferred|ready` (board), `gbd priority <n> P1` (org field). Never labels.
 - Lore: `gbd remember "insight"` (not MEMORY.md)
+- Migrate from Beads: `gbd import --from-beads FILE --dry-run` (one shot, not a sync)
 
 Run `gbd prime` after compaction. Full skill: `.agents/skills/gbd/SKILL.md` (same file under `.claude/skills` and `.cursor/skills`).
 <!-- END GBD -->
@@ -75,6 +76,12 @@ One command. Type, priority, parent, blocked-by together:
 
 `gbd remember "insight"` / `gbd recall <key>` / `gbd forget <key>` / `gbd memories`.
 One closed untyped issue with org field **gbd Role = Memory**. Not AGENTS.md.
+
+## Migrating from Beads
+
+`gbd import --from-beads beads.jsonl --dry-run` shows the plan; `--yes`
+creates the issues. One shot, resumable through `beads-map.jsonl`, not
+a sync: after it, `bd` is retired for the repo.
 "#;
 
 pub const ISSUE_TYPES: [&str; 5] = ["Epic", "Feature", "Bug", "Task", "Chore"];

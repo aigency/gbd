@@ -2349,6 +2349,46 @@ fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
             .unwrap()
             .contains("\"phase\":\"done\""),
         "{map}"
+fn a_secondary_rate_limit_is_retried_after_waiting() {
+    let h = Harness::new();
+    h.on_seq(
+        "search",
+        "search(query: $q",
+        &[
+            "HTTP 429: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+            &search_response(&format!("{NODE_10},{NODE_8}")),
+        ],
+    );
+    fs::write(h.gh_dir.path().join("search.code.1"), "1").unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("child B"))
+        .stderr(predicate::str::contains(
+            "gh: rate limited; retrying in 1s (1 of 5)",
+        ));
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        2,
+        "{}",
+        h.calls()
+    );
+
+    // A plain failure is not retried: a create behind a 502 may have gone through.
+    let h = Harness::new();
+    h.on_fail("search", "search(query: $q", "HTTP 502: Bad Gateway");
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        1,
+        "{}",
+        h.calls()
     );
 }
 

@@ -149,6 +149,7 @@ Memories live in one closed, untyped issue with org field **gbd Role = Memory**.
 | --- | --- |
 | `init [--no-project] [--no-memory] [--no-skills]` | See [Quick start](#quick-start). |
 | `doctor` (`info`) | One row per prerequisite with a copy-paste fix. Exit 1 only when gbd cannot work. |
+| `import --from-beads FILE [--dry-run \| --yes] [--mapping FILE]` | Move a Beads tracker onto GitHub, once. See [Migrating from Beads](#migrating-from-beads). |
 | `where`, `ping`, `config get\|set`, `onboard`, `open <id>`, `completion <shell>`, `upgrade` | Utilities. |
 
 ## Data model
@@ -180,6 +181,38 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 **Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back. `update --status ready`, `reopen`, and `undefer` land on Blocked instead when a blocker is still open. Only Ready and Blocked ever swap; In Progress, Deferred, and Done are someone's decision. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
 
 Without `project:` in `.gbd.yml`, gbd still works: an assignee means in progress, and `defer --until` means deferred.
+
+## Migrating from Beads
+
+`gbd import` moves an existing Beads tracker onto GitHub Issues and the board, once. It is not a sync: run it, keep the mapping file, retire `bd` for that repo.
+
+```bash
+bd export --include-memories -o beads.jsonl      # in the Beads repo
+gbd import --from-beads beads.jsonl --dry-run    # the plan; nothing written, gh not called
+gbd import --from-beads beads.jsonl --yes        # in the target repo, board configured
+```
+
+The dry run prints counts by type, board column, state, and priority; the creation order (parents and blockers before what depends on them); dependency cycles; everything that cannot map and why; the parser's problems; the memory keys. The real run prints the same diagnostics first, then one line per bead, then a summary.
+
+| Beads | GitHub |
+| --- | --- |
+| type `epic` / `feature` / `bug` / `task` / `chore` | issue type; `decision` and anything unknown → Task, reported |
+| priority 0–4 | Priority P0–P4 |
+| `blocks` | dependency (`--blocked-by`), created after its blocker |
+| `parent-child` | sub-issue (`--parent`), created after its parent |
+| open | board Ready, or Blocked when a blocker is still open |
+| `in_progress` | board In Progress, assignee kept |
+| `deferred`, or any `defer_until` | board Deferred, Start date |
+| closed | closed with a reason read from the free-text `close_reason` (duplicate / not planned / else completed), board Done |
+| `notes`, comments | comments, with author and date |
+| description, design, acceptance criteria | the body, as sections |
+| labels, owner, dates, estimate, external ref, the original close reason | an import footer at the end of the body, so nothing is lost and nothing becomes a label |
+| `_type: memory` lines | the memories issue, upserted by key |
+| `related`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, edges to beads outside the export, agents, gates, templates | dropped, each one listed with the reason |
+
+**The mapping file.** `beads-map.jsonl` (`--mapping` to choose another) records every created issue as it happens, flushed per line, with a phase (`created`, `commented`, `done`). Keep it: it resolves `bd-xxxx` references in old docs and commit messages, and mentions of a mapped id inside imported bodies and comments are rewritten to `#n` (a reference to a bead created later in the same run stays as it was). Re-running with the same file resumes: done beads are skipped, partially imported ones are finished, nothing is created twice, so Ctrl-C at any point is safe. The file is tied to the repository it was written for and refused elsewhere.
+
+**Rate limits and time.** Each bead is several `gh` calls (create, Priority, comments, close, card). GitHub's secondary limit on content-creating requests is a few hundred per hour, so a corpus of thousands takes hours. gbd backs off and retries when GitHub says to wait, looks Priority and Start date up once per run, and the mapping file lets you interrupt and continue whenever you like.
 
 ## Organization setup
 
