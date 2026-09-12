@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local GBD state (never committed). Repo config is `.gbd.yml` and stays tracked.
+/.gbd/
+
+# Claude Code local state — subagent worktrees, session caches, etc.
+# Never repository content; always per-machine ephemera.
+# Exception: .claude/skills/ holds shared skills and IS repository content.
+/.claude/*
+!/.claude/skills/
+
+# Beads / Dolt leftovers (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# ntm (tmux multiplexer for AI agents) local logs, pids, spawn state
+.ntm/

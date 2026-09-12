@@ -1,0 +1,43 @@
+#!/bin/sh
+# Fake `gh` for integration tests. Never touches the network.
+#
+# FAKE_GH_DIR holds fixtures: for each NAME.args whose content is a
+# substring of the invocation ("$*"), print NAME.out and exit with NAME.code
+# (default 0). First match in sorted filename order wins. If NAME.out.1,
+# NAME.out.2, … exist, successive matches return them in order (for
+# read-modify-read flows). Every invocation is appended to
+# $FAKE_GH_DIR/calls.log; stdin (any bare `-` argument: --input -, --body-file -)
+# is logged on the following line as "STDIN: ...".
+set -u
+dir="${FAKE_GH_DIR:?FAKE_GH_DIR must be set}"
+call="$*"
+printf '%s\n' "$call" >> "$dir/calls.log"
+case " $call " in
+  *" - "*) printf 'STDIN: %s\n' "$(cat)" >> "$dir/calls.log" ;;
+esac
+case "$call" in
+  "--version") echo "gh version ${FAKE_GH_VERSION:-2.100.0} (fake)"; exit 0 ;;
+  "auth status") exit 0 ;;
+esac
+for args in "$dir"/*.args; do
+  [ -e "$args" ] || break
+  want=$(cat "$args")
+  case "$call" in
+    *"$want"*)
+      base="${args%.args}"
+      n=1
+      [ -e "$base.count" ] && n=$(cat "$base.count")
+      echo $((n + 1)) > "$base.count"
+      if [ -e "$base.out.$n" ]; then
+        cat "$base.out.$n"
+      elif [ -e "$base.out" ]; then
+        cat "$base.out"
+      fi
+      code=0
+      [ -e "$base.code" ] && code=$(cat "$base.code")
+      exit "$code"
+      ;;
+  esac
+done
+echo "fake gh: no fixture for: $call" >&2
+exit 1

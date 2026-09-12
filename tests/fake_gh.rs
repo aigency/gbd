@@ -1,0 +1,1285 @@
+//! End-to-end tests through a fake `gh` on PATH (`tests/fake_gh/gh`).
+//!
+//! These pin the contract between gbd and gh: which subcommands get
+//! called, with which flags, and that gbd actually reads what gh prints.
+//! Nothing here touches the network.
+
+use assert_cmd::prelude::*;
+use predicates::prelude::*;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::TempDir;
+
+struct Harness {
+    /// Fixture dir for the fake gh; also where calls.log lands.
+    gh_dir: TempDir,
+    /// A repo root with `.gbd.yml` so repo resolution never shells out.
+    cwd: TempDir,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let gh_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        fs::write(
+            cwd.path().join(".gbd.yml"),
+            "repo: acme/widgets\nmemory_issue: 3\n",
+        )
+        .unwrap();
+        Self { gh_dir, cwd }
+    }
+
+    /// Register a fixture: when the gh invocation contains `args`, print `out`.
+    fn on(&self, name: &str, args: &str, out: &str) -> &Self {
+        fs::write(self.gh_dir.path().join(format!("{name}.args")), args).unwrap();
+        fs::write(self.gh_dir.path().join(format!("{name}.out")), out).unwrap();
+        self
+    }
+
+    /// Successive matches return `outs[0]`, `outs[1]`, … in order.
+    fn on_seq(&self, name: &str, args: &str, outs: &[&str]) -> &Self {
+        fs::write(self.gh_dir.path().join(format!("{name}.args")), args).unwrap();
+        for (i, out) in outs.iter().enumerate() {
+            fs::write(
+                self.gh_dir.path().join(format!("{name}.out.{}", i + 1)),
+                out,
+            )
+            .unwrap();
+        }
+        self
+    }
+
+    fn on_fail(&self, name: &str, args: &str, stderr_out: &str) -> &Self {
+        self.on(name, args, stderr_out);
+        fs::write(self.gh_dir.path().join(format!("{name}.code")), "1").unwrap();
+        self
+    }
+
+    fn gbd(&self) -> Command {
+        let fake_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_gh");
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::cargo_bin("gbd").unwrap();
+        cmd.current_dir(self.cwd.path())
+            .env("PATH", path)
+            .env("FAKE_GH_DIR", self.gh_dir.path());
+        cmd
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(self.gh_dir.path().join("calls.log")).unwrap_or_default()
+    }
+}
+
+fn fixture(name: &str) -> String {
+    let p: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    fs::read_to_string(p).unwrap()
+}
+
+fn search_response(nodes: &str) -> String {
+    format!(
+        r#"{{"data":{{"search":{{"issueCount":1,"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{nodes}]}}}}}}"#
+    )
+}
+
+const NODE_10: &str = r#"{"id":"I10","number":10,"title":"child B","url":"u","state":"OPEN",
+  "issueType":{"name":"Task"},"assignees":{"nodes":[]},"parent":{"number":8},
+  "issueDependenciesSummary":{"blockedBy":0,"blocking":0},"blockedBy":{"nodes":[]},"blocking":{"nodes":[]},
+  "issueFieldValues":{"nodes":[{"name":"P1","field":{"name":"Priority"}}]}}"#;
+
+const NODE_8: &str = r#"{"id":"I8","number":8,"title":"parent","url":"u","state":"OPEN",
+  "issueType":{"name":"Epic"},"assignees":{"nodes":[]},"parent":null,
+  "issueDependenciesSummary":{"blockedBy":0,"blocking":0},"blockedBy":{"nodes":[]},"blocking":{"nodes":[]},
+  "issueFieldValues":{"nodes":[]}}"#;
+
+#[test]
+fn list_reads_gh_stdout_and_renders_a_tree() {
+    // Regression: v0.2.0 inherited stdout, so gh printed to the terminal and
+    // gbd parsed "" ("EOF while parsing a value at line 1 column 0").
+    let h = Harness::new();
+    h.on(
+        "search",
+        "search(query: $q",
+        &search_response(&format!("{NODE_10},{NODE_8}")),
+    );
+    h.gbd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "○ #8 ● P2 [epic] parent\n└── ○ #10 ● P1 child B\n",
+        ))
+        .stdout(predicate::str::contains(r#"{"number"#).not());
+    let calls = h.calls();
+    assert!(
+        calls.contains("-F q=repo:acme/widgets is:issue is:open"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("issue list"),
+        "list is one GraphQL search, not gh issue list: {calls}"
+    );
+}
+
+#[test]
+fn list_filters_become_search_qualifiers() {
+    let h = Harness::new();
+    h.on("search", "search(query: $q", &search_response(NODE_10));
+    h.gbd()
+        .args([
+            "list",
+            "--state",
+            "all",
+            "--type",
+            "Bug",
+            "--assignee",
+            "@me",
+            "--parent",
+            "8",
+            "--flat",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("○ #10 ● P1 child B"));
+    let calls = h.calls();
+    assert!(
+        calls.contains(
+            "-F q=repo:acme/widgets is:issue type:Bug assignee:@me parent-issue:acme/widgets#8"
+        ),
+        "{calls}"
+    );
+}
+
+#[test]
+fn ready_is_one_graphql_call_with_the_real_field_shape() {
+    let h = Harness::new();
+    h.on("snapshot", "api graphql", &fixture("snapshot.json"));
+    h.gbd()
+        .arg("ready")
+        .assert()
+        .success()
+        // #5 is P0 on the org field and unassigned; #4 is P0 but assigned.
+        .stdout(predicate::str::starts_with(
+            "○ #5 ● P0 Enable GitHub Issues",
+        ))
+        .stdout(predicate::str::contains("#4 ").not());
+    let calls = h.calls();
+    assert_eq!(
+        calls.matches("api graphql").count(),
+        1,
+        "ready must page once for a single-page repo: {calls}"
+    );
+    assert!(calls.contains("-F owner=acme"), "{calls}");
+    assert!(calls.contains("IssueFieldDateValue"), "{calls}");
+    assert!(
+        calls.contains(" value\n") || calls.contains("value "),
+        "date fields are `value` on IssueFieldDateValue: {calls}"
+    );
+    assert!(
+        !calls.contains(" date\n"),
+        "no `date` field exists: {calls}"
+    );
+    assert!(
+        !calls.contains("labels("),
+        "labels are not part of ready: {calls}"
+    );
+    assert!(
+        !calls.contains("projectItems"),
+        "no project configured, so no read:project scope needed: {calls}"
+    );
+    assert!(
+        !calls.contains("issue-field-values"),
+        "no REST N+1 after the snapshot: {calls}"
+    );
+}
+
+#[test]
+fn ready_json_reports_field_priority() {
+    let h = Harness::new();
+    h.on("snapshot", "api graphql", &fixture("snapshot.json"));
+    let out = h.gbd().args(["ready", "--json"]).output().unwrap();
+    assert!(out.status.success());
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(items[0]["number"], 5);
+    assert_eq!(items[0]["priority"], 0, "P0 from the org Priority field");
+    assert_eq!(items[0]["parent"], 4);
+    assert!(
+        items.iter().all(|i| i["number"] != 4),
+        "assigned issue excluded"
+    );
+}
+
+#[test]
+fn ready_reads_project_status_when_configured() {
+    let h = Harness::new();
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: 7\n",
+    )
+    .unwrap();
+    // Same repo, but #5 is In Progress on project 7 and #6 is Deferred.
+    let mut snap: serde_json::Value = serde_json::from_str(&fixture("snapshot.json")).unwrap();
+    for node in snap["data"]["repository"]["issues"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let status = match node["number"].as_u64().unwrap() {
+            5 => "In Progress",
+            6 => "Deferred",
+            _ => "Ready",
+        };
+        node["projectItems"] = serde_json::json!({ "pageInfo": { "hasNextPage": false }, "nodes": [
+            { "project": { "number": 7, "owner": { "login": "acme" } }, "fieldValueByName": { "name": status } }
+        ] });
+    }
+    h.on("snapshot", "api graphql", &snap.to_string());
+    let out = h.gbd().args(["ready", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let nums: Vec<u64> = items
+        .iter()
+        .map(|i| i["number"].as_u64().unwrap())
+        .collect();
+    assert!(!nums.contains(&5), "In Progress on the board: {nums:?}");
+    assert!(!nums.contains(&6), "Deferred on the board: {nums:?}");
+    assert!(nums.contains(&8), "Ready on the board: {nums:?}");
+    assert!(
+        h.calls().contains("projectItems"),
+        "status is read from the board"
+    );
+}
+
+#[test]
+fn ready_surfaces_graphql_errors_instead_of_falling_back() {
+    let h = Harness::new();
+    h.on_fail(
+        "snapshot",
+        "api graphql",
+        r#"{"errors":[{"message":"Field 'nope' doesn't exist on type 'Issue'"}]}"#,
+    );
+    h.gbd()
+        .arg("ready")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("doesn't exist"));
+    assert!(
+        !h.calls().contains("issue list"),
+        "no silent REST fallback: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn create_writes_priority_to_the_org_field_not_a_label() {
+    let h = Harness::new();
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/42",
+    )
+    .on(
+        "fields",
+        "orgs/acme/issue-fields",
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]}]"#,
+    )
+    .on("set", "issues/42/issue-field-values", "{}");
+    h.gbd()
+        .args([
+            "create",
+            "Fix auth refresh",
+            "-t",
+            "Bug",
+            "-p",
+            "1",
+            "--deps",
+            "12,13",
+            "--parent",
+            "8",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("acme/widgets#42"))
+        .stdout(predicate::str::contains("Priority P1"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--type Bug --parent 8 --blocked-by 12,13"),
+        "one gh create call carries type, parent, deps: {calls}"
+    );
+    assert!(
+        !calls.contains("--label"),
+        "priority is never a label: {calls}"
+    );
+    assert!(calls.contains("POST"), "{calls}");
+    assert!(
+        calls.contains("issues/42/issue-field-values --input -"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(r#"STDIN: {"issue_field_values":[{"field_id":46822523,"value":"P1"}]}"#),
+        "field id + option name on stdin: {calls}"
+    );
+}
+
+#[test]
+fn priority_accepts_p_prefix_and_rejects_words() {
+    let h = Harness::new();
+    h.on(
+        "fields",
+        "orgs/acme/issue-fields",
+        r#"[{"id":9,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]}]"#,
+    )
+    .on("set", "issues/12/issue-field-values", "{}");
+    h.gbd()
+        .args(["priority", "12", "P3"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 Priority P3"));
+    h.gbd()
+        .args(["priority", "12", "High"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("P0-P4"));
+}
+
+#[test]
+fn show_is_one_graphql_call_rendered_like_beads() {
+    let h = Harness::new();
+    let detail = format!(
+        r#"{{"data":{{"repository":{{"issue":{{
+            "id":"I8","number":8,"title":"parent","url":"https://github.com/acme/widgets/issues/8","state":"OPEN",
+            "issueType":{{"name":"Epic"}},"assignees":{{"nodes":[{{"login":"octocat"}}]}},"parent":null,
+            "issueDependenciesSummary":{{"blockedBy":0,"blocking":0}},
+            "issueFieldValues":{{"nodes":[{{"name":"P0","field":{{"name":"Priority"}}}}]}},
+            "body":"Hierarchy check.","author":{{"login":"octocat"}},
+            "createdAt":"2026-09-11T22:07:56Z","updatedAt":"2026-09-11T22:08:18Z","closedAt":null,"stateReason":null,
+            "comments":{{"totalCount":1}},
+            "subIssues":{{"nodes":[{NODE_10}]}},
+            "blockedBy":{{"nodes":[]}},"blocking":{{"nodes":[]}}
+        }}}}}}}}"#
+    );
+    h.on("detail", "issue(number: $number)", &detail);
+    h.gbd()
+        .args(["show", "8"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "◐ #8 [EPIC] · parent   [● P0 · OPEN · in progress]",
+        ))
+        .stdout(predicate::str::contains(
+            "Author: octocat · Assignee: octocat · Type: Epic",
+        ))
+        .stdout(predicate::str::contains(
+            "DESCRIPTION\n\n  Hierarchy check.",
+        ))
+        .stdout(predicate::str::contains(
+            "CHILDREN (1)\n  ○ #10 ● P1 child B",
+        ))
+        .stdout(predicate::str::contains("1 comment: gbd comments 8"));
+    let calls = h.calls();
+    assert_eq!(calls.matches("api graphql").count(), 1, "{calls}");
+    assert!(!calls.contains("issue view"), "{calls}");
+    assert!(
+        !calls.contains("issue-field-values"),
+        "fields come from the same query: {calls}"
+    );
+}
+
+fn board_fixtures(h: &Harness) {
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: 7\n",
+    )
+    .unwrap();
+    h.on("pview", "project view 7 --owner acme --format json",
+         r#"{"id":"PVT_1","number":7,"title":"widgets board","url":"https://github.com/orgs/acme/projects/7"}"#)
+     .on("pfields", "project field-list 7 --owner acme --format json",
+         r#"{"fields":[{"id":"F_status","name":"Status","type":"ProjectV2SingleSelectField","options":[
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
+            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
+     .on("padd", "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/12 --format json",
+         r#"{"id":"PVTI_12"}"#)
+     .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "");
+}
+
+#[test]
+fn claim_assigns_me_and_moves_the_board_item_to_in_progress() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on_seq(
+        "assignees",
+        "issue view 12 -R acme/widgets --json assignees",
+        &[
+            r#"{"assignees":[]}"#,
+            r#"{"assignees":[{"login":"octocat"}]}"#,
+        ],
+    )
+    .on("me", "api user --jq .login", "octocat")
+    .on(
+        "assign",
+        "issue edit 12 -R acme/widgets --add-assignee @me",
+        "",
+    );
+    h.gbd()
+        .args(["update", "12", "--claim"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated #12 (claimed)"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("issue edit 12 -R acme/widgets --add-assignee @me"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--single-select-option-id O_wip"),
+        "board → In Progress: {calls}"
+    );
+    assert!(!calls.contains("--add-label"), "{calls}");
+}
+
+#[test]
+fn claim_refuses_an_assigned_issue() {
+    let h = Harness::new();
+    h.on(
+        "assignees",
+        "issue view 12 -R acme/widgets --json assignees",
+        r#"{"assignees":[{"login":"someone"}]}"#,
+    );
+    h.gbd()
+        .args(["update", "12", "--claim"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already assigned to someone"));
+    assert!(!h.calls().contains("--add-assignee"), "{}", h.calls());
+}
+
+#[test]
+fn close_moves_the_board_item_to_done() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "close",
+        "issue close 12 -R acme/widgets --reason completed",
+        "",
+    );
+    h.gbd()
+        .args(["close", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("closed #12 (completed)"));
+    assert!(
+        h.calls().contains("--single-select-option-id O_done"),
+        "{}",
+        h.calls()
+    );
+}
+
+#[test]
+fn update_status_deferred_needs_a_board_or_a_date() {
+    let h = Harness::new();
+    h.gbd()
+        .args(["update", "12", "--status", "deferred"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gbd defer 12 --until tomorrow"));
+}
+
+#[test]
+fn update_with_nothing_to_do_fails_fast() {
+    let h = Harness::new();
+    h.gbd()
+        .args(["update", "12"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nothing to update"));
+    assert!(
+        h.calls().trim().is_empty() || !h.calls().contains("issue edit"),
+        "{}",
+        h.calls()
+    );
+}
+
+#[test]
+fn remember_sends_the_body_on_stdin_not_a_temp_file() {
+    let h = Harness::new();
+    h.on(
+        "view",
+        "issue view 3 -R acme/widgets --json body",
+        r#"{"body":"<!-- gbd-memories v1 -->\n\n## auth-jwt\nauth module uses JWT\n"}"#,
+    )
+    .on("edit", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["remember", "always run tests with the race flag"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "remembered [always-run-tests-with-the-race-flag]",
+        ));
+    let calls = h.calls();
+    assert!(calls.contains("--body-file -"), "{calls}");
+    assert!(
+        calls.contains("STDIN: <!-- gbd-memories v1 -->"),
+        "body travels on stdin: {calls}"
+    );
+    assert!(calls.contains("## auth-jwt"), "existing keys kept: {calls}");
+    assert!(
+        calls.contains("## always-run-tests-with-the-race-flag"),
+        "{calls}"
+    );
+    assert!(!calls.contains("gbd-mem-"), "no temp file path: {calls}");
+}
+
+#[test]
+fn board_lists_the_projects_own_items_including_done() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "items",
+        "items(first: 100",
+        r#"{"data":{"node":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"fieldValueByName":{"name":"Ready"},"content":{"__typename":"Issue","number":10,"title":"child B","repository":{"nameWithOwner":"acme/widgets"}}},
+            {"fieldValueByName":{"name":"Done"},"content":{"__typename":"Issue","number":3,"title":"shipped","repository":{"nameWithOwner":"acme/widgets"}}},
+            {"fieldValueByName":{"name":"In Progress"},"content":{"__typename":"DraftIssue","title":"a draft"}},
+            {"fieldValueByName":{"name":"Ready"},"content":{"__typename":"Issue","number":10,"title":"other repo","repository":{"nameWithOwner":"acme/other"}}}
+        ]}}}}"#,
+    )
+    .on("snapshot", "issues(states: [OPEN]", &search_snapshot_with(NODE_10));
+    h.gbd()
+        .arg("board")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "widgets board  #7  https://github.com/orgs/acme/projects/7",
+        ))
+        .stdout(predicate::str::contains(
+            "Ready (2)\n  ○ #10 ● P1 child B\n  · acme/other#10 other repo",
+        ))
+        .stdout(predicate::str::contains(
+            "In Progress (1)\n  · a draft (draft)",
+        ))
+        .stdout(predicate::str::contains("Done (1)\n  ✓ #3 shipped"));
+    // Ready before In Progress before Done, regardless of alphabetical order.
+    let out = h.gbd().arg("board").output().unwrap().stdout;
+    let out = String::from_utf8(out).unwrap();
+    let (r, p, d) = (
+        out.find("Ready (").unwrap(),
+        out.find("In Progress (").unwrap(),
+        out.find("Done (").unwrap(),
+    );
+    assert!(r < p && p < d, "{out}");
+}
+
+fn search_snapshot_with(nodes: &str) -> String {
+    format!(
+        r#"{{"data":{{"repository":{{"issues":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{nodes}]}}}}}}}}"#
+    )
+}
+
+#[test]
+fn status_counts_come_from_the_snapshot() {
+    let h = Harness::new();
+    h.on(
+        "01-snapshot",
+        "issues(states: [OPEN]",
+        &fixture("snapshot.json"),
+    )
+    .on(
+        "02-count",
+        "first: 1) { issueCount }",
+        r#"{"data":{"search":{"issueCount":4}}}"#,
+    )
+    .on("03-me", "api user --jq .login", "octocat");
+    let out = h.gbd().args(["status", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // snapshot.json: 6 open issues, #4 assigned to octocat, none blocked.
+    assert_eq!(v["open"], 6);
+    assert_eq!(v["blocked"], 0);
+    assert_eq!(
+        v["in_progress"], 1,
+        "assigned counts as in progress without a board"
+    );
+    assert_eq!(v["assigned_to_me"], 1);
+    assert_eq!(v["deferred"], 0);
+    assert_eq!(v["closed_last_7d"], 4);
+    assert!(v["ready"].as_u64().unwrap() >= 1);
+    let calls = h.calls();
+    assert_eq!(
+        calls.matches("api graphql").count(),
+        2,
+        "one snapshot + one count: {calls}"
+    );
+}
+
+#[test]
+fn board_sync_adds_open_issues_that_have_no_status() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #10 already Ready; #9 is on the board with no Status; the rest are absent.
+    // Two pages: #10 (Ready) on page one, #9 (no Status) and a foreign #5 on page two.
+    h.on(
+        "01-items-page2",
+        "-F cursor=p2",
+        r#"{"data":{"node":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"fieldValueByName":null,"content":{"__typename":"Issue","number":9,"title":"child A","repository":{"nameWithOwner":"acme/widgets"}}},
+            {"fieldValueByName":{"name":"Ready"},"content":{"__typename":"Issue","number":5,"title":"x","repository":{"nameWithOwner":"acme/other"}}}
+        ]}}}}"#,
+    )
+    .on(
+        "02-items-page1",
+        "items(first: 100",
+        r#"{"data":{"node":{"items":{"pageInfo":{"hasNextPage":true,"endCursor":"p2"},"nodes":[
+            {"fieldValueByName":{"name":"Ready"},"content":{"__typename":"Issue","number":10,"title":"child B","repository":{"nameWithOwner":"acme/widgets"}}}
+        ]}}}}"#,
+    )
+    .on(
+        "snapshot",
+        "issues(states: [OPEN]",
+        &fixture("snapshot.json"),
+    )
+    .on(
+        "anyadd",
+        "project item-add 7 --owner acme --url",
+        r#"{"id":"PVTI_new"}"#,
+    )
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .args(["board", "sync"])
+        .assert()
+        .success()
+        // #4 is assigned in snapshot.json: the pre-board in-progress signal.
+        // BTreeMap order puts "In Progress" before "Ready".
+        .stdout(predicate::str::contains(
+            "added #4 as In Progress, #5 #6 #8 #9 as Ready (1 already had a Status)",
+        ));
+    let calls = h.calls();
+    assert_eq!(calls.matches("project item-add").count(), 5, "{calls}");
+    assert!(
+        !calls.contains("issues/10 --format"),
+        "#10 already Ready, untouched: {calls}"
+    );
+    assert!(
+        calls.contains("issues/9 --format"),
+        "#9 had no Status, gets Ready: {calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_ready").count(),
+        4,
+        "{calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_wip").count(),
+        1,
+        "{calls}"
+    );
+}
+
+#[test]
+fn malformed_config_fails_before_any_mutation() {
+    let h = Harness::new();
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: abc\nproject: 7\n",
+    )
+    .unwrap();
+    h.on("close", "issue close 12", "");
+    h.gbd()
+        .args(["close", "12"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("memory_issue"));
+    assert!(
+        !h.calls().contains("issue close"),
+        "no mutation on a broken config: {}",
+        h.calls()
+    );
+    // doctor reports it instead of crashing.
+    h.gbd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("FAIL  .gbd.yml"));
+}
+
+#[test]
+fn status_change_with_a_board_moves_the_card_only() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.gbd()
+        .args(["update", "12", "--status", "in_progress"])
+        .assert()
+        .success();
+    let calls = h.calls();
+    assert!(calls.contains("--single-select-option-id O_wip"), "{calls}");
+    assert!(
+        !calls.contains("--add-assignee"),
+        "board is authoritative; no assignee edit: {calls}"
+    );
+    h.gbd()
+        .args(["update", "12", "--status", "ready"])
+        .assert()
+        .success();
+    let calls = h.calls();
+    assert!(
+        calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+    assert!(!calls.contains("--remove-assignee"), "{calls}");
+}
+
+#[test]
+fn status_change_without_a_board_uses_the_assignee() {
+    let h = Harness::new();
+    h.on(
+        "assign",
+        "issue edit 12 -R acme/widgets --add-assignee @me",
+        "",
+    );
+    h.gbd()
+        .args(["update", "12", "--status", "in_progress"])
+        .assert()
+        .success();
+    assert!(h.calls().contains("--add-assignee @me"), "{}", h.calls());
+}
+
+#[test]
+fn claim_backs_out_when_someone_else_won_the_race() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on_seq(
+        "assignees",
+        "issue view 12 -R acme/widgets --json assignees",
+        &[
+            r#"{"assignees":[]}"#,
+            r#"{"assignees":[{"login":"otheragent"},{"login":"octocat"}]}"#,
+        ],
+    )
+    .on("me", "api user --jq .login", "octocat")
+    .on(
+        "assign",
+        "issue edit 12 -R acme/widgets --add-assignee @me",
+        "",
+    )
+    .on(
+        "unassign",
+        "issue edit 12 -R acme/widgets --remove-assignee @me",
+        "",
+    );
+    h.gbd()
+        .args(["update", "12", "--claim"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("lost the race to otheragent"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--remove-assignee @me"),
+        "relinquish the losing claim: {calls}"
+    );
+    assert!(
+        !calls.contains("item-edit"),
+        "board untouched on a lost claim: {calls}"
+    );
+}
+
+#[test]
+fn malformed_project_number_is_a_config_error() {
+    let h = Harness::new();
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: abc\n",
+    )
+    .unwrap();
+    h.on("close", "issue close 12", "");
+    h.gbd()
+        .args(["close", "12"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("project"));
+    assert!(!h.calls().contains("issue close"), "{}", h.calls());
+}
+
+#[test]
+fn claim_runs_before_any_other_edit() {
+    let h = Harness::new();
+    h.on(
+        "assignees",
+        "issue view 12 -R acme/widgets --json assignees",
+        r#"{"assignees":[{"login":"someone"}]}"#,
+    )
+    .on("edit", "issue edit 12 -R acme/widgets --title", "");
+    h.gbd()
+        .args(["update", "12", "--claim", "--title", "stolen"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already assigned to someone"));
+    assert!(
+        !h.calls().contains("--title"),
+        "a refused claim must not edit the issue: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn claim_fails_before_assigning_when_the_board_is_unavailable() {
+    let h = Harness::new();
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: 7\n",
+    )
+    .unwrap();
+    // No `project view` fixture: the fake gh fails like a token without the scope.
+    h.on(
+        "assignees",
+        "issue view 12 -R acme/widgets --json assignees",
+        r#"{"assignees":[]}"#,
+    )
+    .on(
+        "assign",
+        "issue edit 12 -R acme/widgets --add-assignee @me",
+        "",
+    );
+    h.gbd().args(["update", "12", "--claim"]).assert().failure();
+    assert!(
+        !h.calls().contains("--add-assignee"),
+        "board is validated before anything is written: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn claim_rolls_back_the_assignee_when_the_card_move_fails() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on_fail(
+        "pedit",
+        "project item-edit",
+        "GraphQL: Resource not accessible",
+    )
+    .on_seq(
+        "assignees",
+        "issue view 12 -R acme/widgets --json assignees",
+        &[
+            r#"{"assignees":[]}"#,
+            r#"{"assignees":[{"login":"octocat"}]}"#,
+        ],
+    )
+    .on("me", "api user --jq .login", "octocat")
+    .on(
+        "assign",
+        "issue edit 12 -R acme/widgets --add-assignee @me",
+        "",
+    )
+    .on(
+        "unassign",
+        "issue edit 12 -R acme/widgets --remove-assignee @me",
+        "",
+    );
+    h.gbd()
+        .args(["update", "12", "--claim"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("claim rolled back"));
+    let calls = h.calls();
+    assert!(calls.contains("--add-assignee @me"), "{calls}");
+    assert!(
+        calls.contains("--remove-assignee @me"),
+        "assignee removed after the board failure: {calls}"
+    );
+}
+
+const FIELDS_GET: &str = "--method GET -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 orgs/acme/issue-fields";
+const TYPES_GET: &str = "--method GET -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 orgs/acme/issue-types";
+
+#[test]
+fn init_creates_the_missing_org_vocabulary() {
+    let h = Harness::new();
+    // Org has Priority (P0–P4) and gbd Role, but no Start date and only
+    // GitHub's three default types.
+    h.on(
+        "01-fields",
+        FIELDS_GET,
+        r#"[{"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]}]"#,
+    )
+    .on("02-types", TYPES_GET, r#"[{"name":"Task","is_enabled":true},{"name":"Bug","is_enabled":true},{"name":"Feature","is_enabled":true}]"#)
+    .on("03-create-field", "--method POST -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 orgs/acme/issue-fields", "{}")
+    .on("04-create-type", "--method POST -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 orgs/acme/issue-types", "{}");
+    h.gbd()
+        .args(["init", "--no-memory", "--no-project", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "issue field Priority: P0, P1, P2, P3, P4",
+        ))
+        .stdout(predicate::str::contains(
+            "issue types: Epic, Feature, Bug, Task, Chore — created Epic, Chore",
+        ));
+    let calls = h.calls();
+    assert!(
+        calls.contains(r#"STDIN: {"data_type":"date","description":"Date when work on issue will begin","name":"Start date"}"#),
+        "Start date created: {calls}"
+    );
+    assert!(
+        calls.contains(r#""name":"Epic""#) && calls.contains(r#""name":"Chore""#),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains(r#""name":"Task""#),
+        "existing types are not re-created: {calls}"
+    );
+    assert!(
+        !calls.contains("--add-label") && !calls.contains("label create"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn doctor_reports_missing_types_and_fields_as_warnings() {
+    let h = Harness::new();
+    h.on(
+        "01-fields",
+        FIELDS_GET,
+        r#"[{"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"Urgent"},{"id":2,"name":"High"},{"id":3,"name":"Medium"},{"id":4,"name":"Low"}]}]"#,
+    )
+    .on("02-types", TYPES_GET, r#"[{"name":"Task","is_enabled":true},{"name":"Epic","is_enabled":false}]"#);
+    h.gbd()
+        .args(["doctor", "--no-skills"])
+        .assert()
+        .success() // warnings only; nothing hard-fails
+        .stdout(predicate::str::contains(
+            "!     priority  issue field Priority options are Urgent, High, Medium, Low, not P0–P4",
+        ))
+        .stdout(predicate::str::contains(
+            "!     role  no gbd Role issue field",
+        ))
+        .stdout(predicate::str::contains(
+            "!     start-date  no Start date issue field",
+        ))
+        .stdout(predicate::str::contains(
+            "!     types  missing issue types Epic, Feature, Bug, Chore",
+        ));
+}
+
+#[test]
+fn defer_many_with_a_relative_until_and_a_reason() {
+    let h = Harness::new();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("set", "issue-field-values --input -", "{}")
+    .on(
+        "comment",
+        "comment",
+        "https://github.com/acme/widgets/issues/9#issuecomment-1",
+    );
+    h.gbd()
+        .args([
+            "defer",
+            "9",
+            "10",
+            "--until",
+            "tomorrow",
+            "--reason",
+            "waiting on API access",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::is_match(r"#9 deferred until \d{4}-\d{2}-\d{2}\n#10 deferred until")
+                .unwrap(),
+        );
+    let calls = h.calls();
+    assert_eq!(
+        calls.matches("issues/9/issue-field-values").count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls.matches("issues/10/issue-field-values").count(),
+        1,
+        "{calls}"
+    );
+    assert!(
+        calls.contains(r#"STDIN: {"issue_field_values":[{"field_id":7886557,"value":"20"#),
+        "a date, not a label: {calls}"
+    );
+    assert_eq!(calls.matches("issue comment").count(), 2, "{calls}");
+    assert!(calls.contains("--body Deferred until 20"), "{calls}");
+    assert!(calls.contains(": waiting on API access"), "{calls}");
+    assert!(!calls.contains("--add-label"), "{calls}");
+}
+
+#[test]
+fn defer_without_a_board_needs_until() {
+    let h = Harness::new();
+    h.gbd()
+        .args(["defer", "9"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--until"));
+    assert!(
+        h.calls().trim().is_empty() || !h.calls().contains("issue-field-values"),
+        "{}",
+        h.calls()
+    );
+}
+
+#[test]
+fn defer_with_a_board_and_no_until_only_moves_the_card() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.gbd()
+        .args(["defer", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 deferred\n"));
+    let calls = h.calls();
+    assert!(calls.contains("--single-select-option-id O_def"), "{calls}");
+    assert!(
+        !calls.contains("issue-field-values"),
+        "no date given, none written: {calls}"
+    );
+}
+
+#[test]
+fn undefer_deletes_the_field_value_and_moves_the_card_to_ready() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on(
+        "clear",
+        "--method DELETE -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/12/issue-field-values/7886557",
+        "",
+    );
+    h.gbd()
+        .args(["undefer", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 undeferred"));
+    let calls = h.calls();
+    assert!(calls.contains("--method DELETE"), "{calls}");
+    assert!(
+        !calls.contains(r#""delete":true"#),
+        "the POST form is rejected by GitHub: {calls}"
+    );
+    assert!(
+        calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn init_adopts_a_board_already_linked_to_the_repo() {
+    let h = Harness::new();
+    // .gbd.yml has no project:. A "widgets board" is already linked to the repo.
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\n",
+    )
+    .unwrap();
+    h.on(
+        "01-fields",
+        FIELDS_GET,
+        r#"[{"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
+            {"id":3,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on(
+        "03-linked",
+        "projectsV2(first: 100",
+        r#"{"data":{"repository":{"projectsV2":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"number":4,"title":"Content Planning","closed":false},
+            {"number":8,"title":"widgets board","closed":false}]}}}}"#,
+    )
+    .on("04-pview", "project view 8 --owner acme --format json",
+        r#"{"id":"PVT_8","number":8,"title":"widgets board","url":"https://github.com/orgs/acme/projects/8"}"#)
+    .on("05-pfields", "project field-list 8 --owner acme --format json",
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
+            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#);
+    h.gbd()
+        .args(["init", "--no-memory", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("board: #8 widgets board"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("project create"),
+        "must adopt, not create a second board: {calls}"
+    );
+    assert!(!calls.contains("project link"), "{calls}");
+    let cfg = fs::read_to_string(h.cwd.path().join(".gbd.yml")).unwrap();
+    assert!(cfg.contains("project: 8\n"), "{cfg}");
+    // Second run: same result, still no create.
+    h.gbd()
+        .args(["init", "--no-memory", "--no-skills"])
+        .assert()
+        .success();
+    assert!(!h.calls().contains("project create"), "{}", h.calls());
+}
+
+#[test]
+fn claim_with_status_is_rejected_before_any_call() {
+    let h = Harness::new();
+    h.gbd()
+        .args([
+            "update", "12", "--claim", "--status", "ready", "--title", "x",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("drop --status"));
+    assert!(
+        !h.calls().contains("issue "),
+        "no issue call at all: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn close_loads_the_board_before_closing() {
+    let h = Harness::new();
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: 7\n",
+    )
+    .unwrap();
+    // No `project view` fixture: the board cannot be loaded.
+    h.on("close", "issue close 12", "");
+    h.gbd().args(["close", "12"]).assert().failure();
+    assert!(
+        !h.calls().contains("issue close"),
+        "issue must not be closed when the board is unavailable: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn a_start_date_field_of_the_wrong_type_is_rejected() {
+    let h = Harness::new();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":5,"name":"Start date","data_type":"text"},
+            {"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]}]"#,
+    )
+    .on("set", "issue-field-values --input -", "{}")
+    .on("types", TYPES_GET, "[]");
+    h.gbd()
+        .args(["defer", "9", "--until", "tomorrow"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "of type text, but gbd needs a date field",
+        ));
+    assert!(!h.calls().contains("issue-field-values"), "{}", h.calls());
+    h.gbd()
+        .args(["doctor", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "of type text, but gbd needs a date field",
+        ));
+}
+
+#[test]
+fn init_pages_linked_projects_before_deciding_to_create() {
+    let h = Harness::new();
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\n",
+    )
+    .unwrap();
+    h.on(
+        "01-fields",
+        FIELDS_GET,
+        r#"[{"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
+            {"id":3,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    // Page two (matched first because the call carries the cursor) holds the board.
+    .on(
+        "03-linked-page2",
+        "-F cursor=abc",
+        r#"{"data":{"repository":{"projectsV2":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"number":8,"title":"widgets board","closed":false}]}}}}"#,
+    )
+    .on(
+        "04-linked-page1",
+        "projectsV2(first: 100",
+        r#"{"data":{"repository":{"projectsV2":{"pageInfo":{"hasNextPage":true,"endCursor":"abc"},"nodes":[
+            {"number":4,"title":"Content Planning","closed":false}]}}}}"#,
+    )
+    .on("05-pview", "project view 8 --owner acme --format json",
+        r#"{"id":"PVT_8","number":8,"title":"widgets board","url":"https://github.com/orgs/acme/projects/8"}"#)
+    .on("06-pfields", "project field-list 8 --owner acme --format json",
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},
+            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#);
+    h.gbd()
+        .args(["init", "--no-memory", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("board: #8 widgets board"));
+    let calls = h.calls();
+    assert_eq!(
+        calls.matches("projectsV2(first: 100").count(),
+        2,
+        "two pages fetched: {calls}"
+    );
+    assert!(!calls.contains("project create"), "{calls}");
+}
+
+#[test]
+fn an_old_gh_is_refused_before_any_other_call() {
+    let h = Harness::new();
+    h.on("list", "search(query: $q", "{}");
+    h.gbd()
+        .env("FAKE_GH_VERSION", "2.93.2")
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "gh 2.93.2 is too old; gbd needs 2.94.0 or newer",
+        ));
+    assert!(!h.calls().contains("api graphql"), "{}", h.calls());
+    h.gbd()
+        .env("FAKE_GH_VERSION", "2.93.2")
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("FAIL  gh  gh 2.93.2 is too old"));
+    h.gbd()
+        .env("FAKE_GH_VERSION", "2.94.0")
+        .arg("ping")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gh: 2.94.0"));
+}

@@ -1,0 +1,85 @@
+# git-cliff configuration for gbd
+#
+# Buckets commit messages into Keep-a-Changelog sections.
+# Existing history is mixed-style (some conventional commits, some free-form);
+# parsers are loose enough to handle that. New commits onward should follow
+# Conventional Commits so cliff categorizes automatically.
+#
+# Reference: https://git-cliff.org/docs/configuration
+
+[changelog]
+# Keep-a-Changelog header.
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+"""
+
+# Body template — one section per release, grouped by `### <Group>`.
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}\
+{% endfor %}
+{% endfor %}\n
+"""
+
+footer = ""
+trim = true
+
+[git]
+# Parse commits as conventional commits when possible, but don't error if not.
+conventional_commits = false
+filter_unconventional = false
+split_commits = false
+
+# Commit-message preprocessors — light cleanup before bucketing.
+commit_preprocessors = []
+
+# Order matters: first matching parser wins.
+commit_parsers = [
+    # Skip housekeeping and merge commits entirely.
+    { message = "^chore(\\([^)]+\\))?: close ", skip = true },
+    { message = "^Merge pull request", skip = true },
+    { message = "^Merge branch ", skip = true },
+    # Skip `chore(release):` (and other chore) so the bump commit never
+    # reappears in the next changelog.
+    { message = "^chore(\\([^)]+\\))?:", skip = true },
+
+    # Conventional-commit prefixes → Keep-a-Changelog buckets.
+    { message = "^feat(\\([^)]+\\))?:", group = "Added" },
+    { message = "^fix(\\([^)]+\\))?:", group = "Fixed" },
+    { message = "^docs(\\([^)]+\\))?:", group = "Documentation" },
+
+    # Squash-style mid-PR commits — group as Changed.
+    { message = "^PR #\\d+", group = "Changed" },
+
+    # Anything else falls through to Other.
+    { message = ".*", group = "Other" },
+]
+
+# Don't filter anything — we want to see the full history in the seed.
+filter_commits = false
+
+# Tag pattern for release detection. We use `vX.Y.Z`.
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+
+# Ignore tags that don't match SemVer (rc, alpha, etc.) for the main changelog.
+skip_tags = ""
+ignore_tags = ""
+
+# Sort newest-first within each section.
+topo_order = false
+sort_commits = "newest"

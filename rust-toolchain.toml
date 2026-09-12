@@ -1,0 +1,5 @@
+# Pin so local `cargo clippy` and CI agree on which lints exist. Bump
+# deliberately; a newer stable can promote lints and turn CI red.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

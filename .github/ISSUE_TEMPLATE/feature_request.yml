@@ -1,0 +1,16 @@
+name: Feature request
+description: Something gbd should do
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The workflow, not the feature. If Beads has a command for it, name it.
+    validations:
+      required: true
+  - type: textarea
+    id: github
+    attributes:
+      label: Which GitHub primitive would carry it?
+      description: gbd only builds on things GitHub has (issue types, issue fields, dependencies, sub-issues, Projects). If nothing fits, say so; that is useful to know.
