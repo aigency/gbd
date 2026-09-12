@@ -2352,7 +2352,7 @@ fn import_reconciles_comments_from_github_before_resuming() {
     fs::write(
         h.cwd.path().join("beads-map.jsonl"),
         concat!(
-            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"created\",\"comments\":0,\"rewritten\":true}\n",
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"created\",\"comments\":0}\n",
             "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
             "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"created\",\"comments\":0}\n",
         ),
@@ -2368,8 +2368,14 @@ fn import_reconciles_comments_from_github_before_resuming() {
     .on("values", "issue-field-values --input -", "{}")
     .on(
         "comments-103",
-        "repos/acme/widgets/issues/103/comments --paginate",
-        r#"[{"body":"**Notes**\n\nKeep the old routes for a release.\n\n<!-- gbd-import wx-1.1/1 -->"},{"body":"a human said hi"}]"#,
+        "repos/acme/widgets/issues/103/comments --paginate --slurp",
+        r#"[[{"body":"**Notes**\n\nKeep the old routes for a release.\n\n<!-- gbd-import wx-1.1/1 -->"}],[{"body":"a human said hi"}]]"#,
+    )
+    // wx-1's body was already rewritten (and touched by hand) before the kill.
+    .on(
+        "body-101",
+        "issue view 101 -R acme/widgets --json body",
+        "{\"body\":\"Umbrella; the auth fix is #102, says a human.\\n\\n---\\nImported from Beads `wx-1` (created 2026-03-01 by dev1).\"}",
     )
     .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
@@ -2387,7 +2393,13 @@ fn import_reconciles_comments_from_github_before_resuming() {
     assert!(!calls.contains("issue create"), "{calls}");
     assert!(
         !calls.contains("issue edit 101 -R acme/widgets --body-file"),
-        "already rewritten, never re-edited: {calls}"
+        "nothing left to rewrite, so no edit: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert!(
+        map.lines()
+            .any(|l| l.contains("\"bead\":\"wx-1\"") && l.contains("\"rewritten\":true")),
+        "the finished rewrite is checkpointed: {map}"
     );
     assert_eq!(
         calls.matches("issue comment 103").count(),
@@ -2473,10 +2485,16 @@ fn import_adopts_an_issue_created_but_never_recorded() {
         "{map}"
     );
 
-    // With an empty file the same find is a refusal: an earlier import ran without it.
+    // With an empty file and the second bead on GitHub too, it is a refusal:
+    // an earlier import ran without this file.
     let h = Harness::new();
     board_fixtures(&h);
     h.on(
+        "found-wx2",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-2\" in:body",
+        r#"[{"number":8,"url":"https://github.com/acme/widgets/issues/8","body":"y\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+    )
+    .on(
         "found-wx1",
         "issue list -R acme/widgets --search \"Imported from Beads wx-1\" in:body",
         r#"[{"number":7,"url":"https://github.com/acme/widgets/issues/7","body":"x\n\n---\nImported from Beads `wx-1` (created 2026-03-01 by dev1)."}]"#,
@@ -2492,10 +2510,55 @@ fn import_adopts_an_issue_created_but_never_recorded() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "wx-1 already exists as #7 (https://github.com/acme/widgets/issues/7) but",
+            "wx-1 already exists as #7 (https://github.com/acme/widgets/issues/7) and so does wx-2, but",
         ))
         .stderr(predicate::str::contains(
             "is empty: an earlier import ran without this file",
         ));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    // With an empty file and only the first bead on GitHub, the first record
+    // was lost: adopt it and carry on.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "found-wx1",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-1\" in:body",
+        r#"[{"number":7,"url":"https://github.com/acme/widgets/issues/7","body":"Umbrella; the auth fix is wx-2.\n\n---\nImported from Beads `wx-1` (created 2026-03-01 by dev1)."}]"#,
+    )
+    .on("fields", FIELDS_GET, r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#)
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("body-7", "issue view 7 -R acme/widgets --json body", "{\"body\":\"Umbrella; the auth fix is wx-2.\\n\\n---\\nImported from Beads `wx-1` (created 2026-03-01 by dev1).\"}")
+    .on("edit-7", "issue edit 7 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wx-1 = #7  (found on GitHub, unrecorded; recorded now)",
+        ));
+    let calls = h.calls();
+    assert!(!calls.contains("--title Widget API v2"), "{calls}");
+    assert!(
+        calls.contains("--type Task --parent 7 --blocked-by 102"),
+        "{calls}"
+    );
+    // Its live body is rewritten in place, so the forward reference is fixed.
+    let fixed = calls
+        .rsplit("issue edit 7 -R acme/widgets --body-file -\nSTDIN: ")
+        .next()
+        .unwrap();
+    assert!(
+        fixed.starts_with("Umbrella; the auth fix is #102."),
+        "{fixed}"
+    );
 }

@@ -1444,12 +1444,21 @@ impl Run<'_> {
         let Some((number, url)) = find_imported(self.ctx, &item.bead)? else {
             return Ok(());
         };
+        // An empty file with the first bead on GitHub is either a run killed
+        // right after its first create (nothing to restore) or a whole earlier
+        // import that ran without this file. The second bead tells them
+        // apart: an earlier import made that one too.
         if done.is_empty() {
-            bail!(
-                "{} already exists as #{number} ({url}) but {} is empty: an earlier import ran without this file. Restore it, or pass --mapping with its path",
-                item.bead,
-                self.map.path().display()
-            );
+            if let Some(second) = plan.items.get(1) {
+                if find_imported(self.ctx, &second.bead)?.is_some() {
+                    bail!(
+                        "{} already exists as #{number} ({url}) and so does {}, but {} is empty: an earlier import ran without this file. Restore it, or pass --mapping with its path",
+                        item.bead,
+                        second.bead,
+                        self.map.path().display()
+                    );
+                }
+            }
         }
         if !self.ctx.json {
             println!(
@@ -1667,7 +1676,34 @@ impl Run<'_> {
             if later.is_empty() || import::rewrite_ids(&item.body, &later) == item.body {
                 continue;
             }
-            let body = import::rewrite_ids(&item.body, &self.numbers);
+            // A resumed bead's body is whatever is on GitHub now: it may
+            // already carry the rewrite (killed before the checkpoint), or
+            // edits made by hand. Rewrite that text in place.
+            let base = if t.resumed {
+                match current_body(self.ctx, t.number) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        self.warnings.push(format!(
+                            "{} (#{}): could not read its body: {err:#}. Run gbd import again to retry",
+                            t.bead, t.number
+                        ));
+                        t.clean = false;
+                        continue;
+                    }
+                }
+            } else {
+                item.body.clone()
+            };
+            let body = import::rewrite_ids(&base, &self.numbers);
+            if body == base {
+                // Nothing left to rewrite: checkpoint what an earlier run did.
+                t.rewritten = true;
+                if let Err(err) = self.record(t, import::Phase::Created) {
+                    self.warnings.push(format!("{err:#}"));
+                    t.clean = false;
+                }
+                continue;
+            }
             let n = t.number.to_string();
             let args = [
                 "issue",
@@ -1771,13 +1807,35 @@ impl Run<'_> {
             "repos/{}/issues/{}/comments",
             self.ctx.repo.name_with_owner, t.number
         );
-        let raw: Vec<Value> = gh::run_json(&["api", &path, "--paginate"])?;
-        let bodies: Vec<&str> = raw
+        // `--paginate` alone prints one JSON array per page; `--slurp` wraps
+        // the pages in one outer array.
+        let pages: Vec<Vec<Value>> = gh::run_json(&["api", &path, "--paginate", "--slurp"])?;
+        let bodies: Vec<&str> = pages
             .iter()
+            .flatten()
             .filter_map(|c| c.get("body").and_then(Value::as_str))
             .collect();
         Ok(import::posted_comments(&bodies, &t.bead))
     }
+}
+
+/// The body an issue has right now.
+fn current_body(ctx: &Ctx, number: u64) -> Result<String> {
+    let n = number.to_string();
+    let view: Value = gh::run_json(&[
+        "issue",
+        "view",
+        &n,
+        "-R",
+        &ctx.repo.name_with_owner,
+        "--json",
+        "body",
+    ])?;
+    Ok(view
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 /// The issue an earlier import made for `bead`, found by the footer its
