@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- fix(release): sign on ubuntu-24.04, where minisign is packaged (#6)
 - fix(release): push the release commit with RELEASE_TOKEN (#5)
 
 ### Other
