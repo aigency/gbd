@@ -1,3 +1,4 @@
 # gbd config. Commit this file.
 repo: aigency/gbd
+memory_issue: 2
 project: 8
