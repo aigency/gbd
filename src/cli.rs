@@ -1697,6 +1697,9 @@ impl Run<'_> {
                     format!("not closed: {err:#}. Run gbd import again to retry"),
                 );
                 state = import::State::Open;
+                // Its dependents are placed against a state that will
+                // change when the close succeeds: keep them resumable.
+                self.unsure_blockers.insert(item.bead.clone());
             }
         }
         if matches!(state, import::State::Open) {

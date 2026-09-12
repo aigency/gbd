@@ -694,9 +694,26 @@ impl Mapping {
 /// is a maximal run of id characters; trailing dots are punctuation. Left
 /// alone: anything inside a code span or a fenced block (the import footer
 /// and command examples), a bare URL (a word containing `://`, words
-/// ending at whitespace or brackets), and a Markdown link destination
-/// (`](…)`); the link's visible text is still rewritten. Anything not in
-/// `known` stays as written.
+/// ending at whitespace or brackets), a Markdown link destination
+/// (`](…)`), and a reference definition line (`[label]: …`); the link's
+/// visible text is still rewritten. Anything not in `known` stays as
+/// written.
+/// `[label]: destination`, up to three leading spaces, as `CommonMark`
+/// defines a link reference definition's first line.
+fn is_reference_definition(line: &str) -> bool {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 || !trimmed.starts_with('[') {
+        return false;
+    }
+    let Some(close) = trimmed.find(']') else {
+        return false;
+    };
+    close > 1 && trimmed[close + 1..].starts_with(':') && {
+        let after = &trimmed[close + 2..];
+        after.starts_with(' ') || after.starts_with('\t')
+    }
+}
+
 /// Where the scanner is with respect to Markdown code.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Code {
@@ -746,6 +763,16 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     let mut rest = text;
     let mut md = Code::Prose;
     while !rest.is_empty() {
+        // A reference definition line is all destination.
+        if (out.is_empty() || out.ends_with('\n')) && md == Code::Prose {
+            let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+            let line = &rest[..line_end];
+            if is_reference_definition(line) {
+                out.push_str(line);
+                rest = &rest[line_end..];
+                continue;
+            }
+        }
         // Inside `](…)`: copy the destination through its closing paren.
         if out.ends_with("](") {
             match rest.find(')') {
@@ -1248,6 +1275,16 @@ mod tests {
             rewrite_ids("a~b wx-2", &known),
             "a~b #102",
             "a lone tilde is prose"
+        );
+        assert_eq!(
+            rewrite_ids("[doc]: /issues/wx-2\nsee [wx-2][doc] and wx-2", &known),
+            "[doc]: /issues/wx-2\nsee [#102][doc] and #102",
+            "a reference definition line is a destination"
+        );
+        assert_eq!(
+            rewrite_ids("[wx-2]:no space", &known),
+            "[#102]:no space",
+            "without the space it is prose"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }

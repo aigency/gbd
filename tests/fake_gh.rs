@@ -2065,7 +2065,7 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
         ))
         .stdout(predicate::str::contains("imported 3 issues (0 closed)"))
         .stdout(predicate::str::contains(
-            "1 warning; 1 could not map (listed above)",
+            "2 warnings; 1 could not map (listed above)",
         ))
         .stderr(predicate::str::contains("wx-2 (#102): not closed: "))
         .stderr(predicate::str::contains("Run gbd import again to retry"));
@@ -2084,8 +2084,17 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
         !calls.contains("--single-select-option-id O_ready"),
         "{calls}"
     );
-    // The blocker never reaches `done`, so the next run retries its close.
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    // Its dependent is placed against it and stays resumable too.
+    let last_wx11 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-1.1\""))
+        .unwrap();
+    assert!(
+        last_wx11.contains("\"phase\":\"created\""),
+        "the dependent waits for the close to succeed: {map}"
+    );
+    // The blocker never reaches `done`, so the next run retries its close.
     let last_wx2 = map
         .lines()
         .rfind(|l| l.contains("\"bead\":\"wx-2\""))
