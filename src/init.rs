@@ -325,8 +325,8 @@ fn first_line(err: &anyhow::Error) -> String {
 
 /// Use the configured board; else adopt a `<repo> board` already linked to
 /// the repo; else create one. Either way the Status field ends up with
-/// Ready / In Progress / Deferred / Done. Re-running never makes a second
-/// board.
+/// Ready / In Progress / Blocked / Deferred / Done. Re-running never makes
+/// a second board.
 fn ensure_board(repo: &Repo, cfg: &mut Config) -> Result<Board> {
     let title = format!("{} board", repo.name());
     let number = match cfg.project_number() {

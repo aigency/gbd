@@ -10,13 +10,18 @@ use crate::repo::Repo;
 
 pub const STATUS_READY: &str = "Ready";
 pub const STATUS_IN_PROGRESS: &str = "In Progress";
+/// Maintained by gbd from GitHub's open-blocker count, never set by hand:
+/// project views cannot filter on `is:blocked`, so the board carries it.
+pub const STATUS_BLOCKED: &str = "Blocked";
 pub const STATUS_DEFERRED: &str = "Deferred";
 pub const STATUS_DONE: &str = "Done";
 
-/// The four options `gbd init` puts on the Status field, with colors.
-pub const STATUSES: [(&str, &str); 4] = [
+/// The five options `gbd init` puts on the Status field, in column order,
+/// with colors.
+pub const STATUSES: [(&str, &str); 5] = [
     (STATUS_READY, "GREEN"),
     (STATUS_IN_PROGRESS, "YELLOW"),
+    (STATUS_BLOCKED, "RED"),
     (STATUS_DEFERRED, "GRAY"),
     (STATUS_DONE, "PURPLE"),
 ];
@@ -263,48 +268,81 @@ impl Board {
         Ok(())
     }
 
-    /// Make sure Ready / In Progress / Deferred / Done exist on Status.
+    /// Make sure every option in [`STATUSES`] exists on Status.
     ///
-    /// `updateProjectV2Field` replaces the option list wholesale, so existing
-    /// option names are carried over. On a board `gbd init` just created,
-    /// GitHub's default `Todo` is renamed to `Ready`; on an existing board it
-    /// is kept, so no item silently loses its status.
+    /// `updateProjectV2Field` replaces the option list wholesale. Existing
+    /// options are carried over *with their ids*: GitHub keeps an option's
+    /// identity, and so every card's value, only when the id is sent. A
+    /// missing option is slotted in after the nearest earlier gbd status the
+    /// board has (Blocked lands between In Progress and Deferred on a
+    /// pre-1.2 board). On a board `gbd init` just created, GitHub's default
+    /// `Todo` is renamed to `Ready`; on an existing board it is kept, so no
+    /// item silently loses its status.
     pub fn ensure_statuses(&mut self, fresh: bool) -> Result<bool> {
-        let mut names: Vec<(String, &str)> = self
+        struct Opt {
+            /// None for an option that does not exist yet.
+            id: Option<String>,
+            name: String,
+            color: &'static str,
+        }
+        let mut options: Vec<Opt> = self
             .status_options
             .iter()
-            .map(|o| {
-                let color = STATUSES
+            .map(|o| Opt {
+                id: Some(o.id.clone()),
+                name: o.name.clone(),
+                color: STATUSES
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case(&o.name))
-                    .map_or("GRAY", |(_, c)| *c);
-                (o.name.clone(), color)
+                    .map_or("GRAY", |(_, c)| *c),
             })
             .collect();
         if fresh && !self.has_status(STATUS_READY) {
-            if let Some(todo) = names
+            if let Some(todo) = options
                 .iter_mut()
-                .find(|(n, _)| n.eq_ignore_ascii_case("Todo"))
+                .find(|o| o.name.eq_ignore_ascii_case("Todo"))
             {
-                *todo = (STATUS_READY.to_string(), "GREEN");
+                todo.name = STATUS_READY.to_string();
+                todo.color = "GREEN";
             }
         }
         let mut changed = false;
-        for (want, color) in STATUSES {
-            if !names.iter().any(|(n, _)| n.eq_ignore_ascii_case(want)) {
-                names.push((want.to_string(), color));
-                changed = true;
+        for (pos, (want, color)) in STATUSES.iter().enumerate() {
+            if options.iter().any(|o| o.name.eq_ignore_ascii_case(want)) {
+                continue;
             }
+            let at = STATUSES[..pos]
+                .iter()
+                .rev()
+                .find_map(|(prev, _)| {
+                    options
+                        .iter()
+                        .position(|o| o.name.eq_ignore_ascii_case(prev))
+                })
+                .map_or(options.len(), |i| i + 1);
+            options.insert(
+                at,
+                Opt {
+                    id: None,
+                    name: (*want).to_string(),
+                    color,
+                },
+            );
+            changed = true;
         }
         if !changed && (!fresh || self.has_status(STATUS_READY)) {
             return Ok(false);
         }
-        let options = names
+        let options = options
             .iter()
-            .map(|(n, c)| {
+            .map(|o| {
+                let id =
+                    o.id.as_deref()
+                        .map_or(String::new(), |id| format!(r#"id: "{id}", "#));
                 format!(
-                    r#"{{name: "{}", color: {c}, description: ""}}"#,
-                    n.replace('"', "\\\"")
+                    r#"{{{id}name: "{}", color: {}, description: ""}}"#,
+                    o.name.replace('"', "\\\""),
+                    o.color
                 )
             })
             .collect::<Vec<_>>()
@@ -440,6 +478,9 @@ pub fn status_for(word: &str) -> Result<&'static str> {
             "in_progress" | "inprogress" | "claimed" => STATUS_IN_PROGRESS,
             "deferred" | "defer" => STATUS_DEFERRED,
             "done" | "closed" => STATUS_DONE,
+            "blocked" => bail!(
+                "blocked is not set by hand; it follows from open blockers (gbd dep add <n> <blocker>)"
+            ),
             other => bail!("unknown status {other:?}; use ready, in_progress, deferred, or done"),
         },
     )
