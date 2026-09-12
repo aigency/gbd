@@ -92,7 +92,8 @@ pub struct Item {
     pub status: &'static str,
     /// Org field Start date, `YYYY-MM-DD`.
     pub start_date: Option<String>,
-    /// Beads labels, carried as plain labels (never state).
+    /// Beads labels. Never written as labels: they go into the body's
+    /// import footer so nothing is lost.
     pub labels: Vec<String>,
     pub body: String,
     pub comments: Vec<String>,
@@ -172,6 +173,9 @@ fn body_of(b: &Bead) -> String {
         body.push(')');
     }
     body.push('.');
+    if !b.labels.is_empty() {
+        let _ = write!(body, " Beads labels: {}.", b.labels.join(", "));
+    }
     body
 }
 
@@ -485,7 +489,7 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
     );
     let _ = writeln!(
         out,
-        "{:<11} {comments} comments, {} distinct labels carried as plain labels",
+        "{:<11} {comments} comments, {} distinct Beads labels kept in the body footer (never labels)",
         "Also:",
         labels.len()
     );
@@ -601,10 +605,17 @@ mod tests {
         assert_eq!(epic.labels, vec!["area:api"]);
         assert!(epic.body.starts_with("Umbrella for the API rework."));
         assert!(
-            epic.body
-                .ends_with("---\nImported from Beads `wx-1` (created 2026-03-01 by dev1)."),
+            epic.body.ends_with(
+                "---\nImported from Beads `wx-1` (created 2026-03-01 by dev1). Beads labels: area:api."
+            ),
             "{}",
             epic.body
+        );
+        assert!(
+            item(&p, "wx-3")
+                .body
+                .ends_with("(created 2026-03-03 by dev2)."),
+            "no labels, no tail"
         );
         assert_eq!(
             epic.comments,
