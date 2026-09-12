@@ -4,6 +4,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::gh;
 use crate::repo::Repo;
@@ -268,22 +269,49 @@ impl Board {
         Ok(())
     }
 
+    /// `option id → (color, description)` for Status. `gh project
+    /// field-list` returns ids and names only.
+    fn option_details(&self) -> Result<HashMap<String, (String, String)>> {
+        const QUERY: &str = r"query($id: ID!) {
+  node(id: $id) { ... on ProjectV2SingleSelectField { options { id name color description } } }
+}";
+        let data = gh::graphql(QUERY, &[("id", &self.status_field_id)]).map_err(scope_error)?;
+        let options = data
+            .pointer("/data/node/options")
+            .and_then(Value::as_array)
+            .context("reading Status options")?;
+        Ok(options
+            .iter()
+            .filter_map(|o| {
+                let id = o.get("id")?.as_str()?.to_string();
+                let color = o.get("color")?.as_str()?.to_string();
+                let description = o
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Some((id, (color, description)))
+            })
+            .collect())
+    }
+
     /// Make sure every option in [`STATUSES`] exists on Status.
     ///
     /// `updateProjectV2Field` replaces the option list wholesale. Existing
-    /// options are carried over *with their ids*: GitHub keeps an option's
-    /// identity, and so every card's value, only when the id is sent. A
-    /// missing option is slotted in after the nearest earlier gbd status the
-    /// board has (Blocked lands between In Progress and Deferred on a
-    /// pre-1.2 board). On a board `gbd init` just created, GitHub's default
-    /// `Todo` is renamed to `Ready`; on an existing board it is kept, so no
-    /// item silently loses its status.
+    /// options are carried over with their ids, colors, and descriptions:
+    /// GitHub keeps an option's identity, and so every card's value, only
+    /// when the id is sent. A missing option is slotted in after the nearest
+    /// earlier gbd status the board has (Blocked lands between In Progress
+    /// and Deferred on a pre-1.2 board). On a board `gbd init` just created,
+    /// GitHub's default `Todo` is renamed to `Ready`; on an existing board
+    /// it is kept, so no item silently loses its status.
     pub fn ensure_statuses(&mut self, fresh: bool) -> Result<bool> {
         struct Opt {
             /// None for an option that does not exist yet.
             id: Option<String>,
             name: String,
-            color: &'static str,
+            /// None: keep the board's color.
+            color: Option<&'static str>,
         }
         let mut options: Vec<Opt> = self
             .status_options
@@ -291,22 +319,20 @@ impl Board {
             .map(|o| Opt {
                 id: Some(o.id.clone()),
                 name: o.name.clone(),
-                color: STATUSES
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(&o.name))
-                    .map_or("GRAY", |(_, c)| *c),
+                color: None,
             })
             .collect();
+        let mut changed = false;
         if fresh && !self.has_status(STATUS_READY) {
             if let Some(todo) = options
                 .iter_mut()
                 .find(|o| o.name.eq_ignore_ascii_case("Todo"))
             {
                 todo.name = STATUS_READY.to_string();
-                todo.color = "GREEN";
+                todo.color = Some("GREEN");
+                changed = true;
             }
         }
-        let mut changed = false;
         for (pos, (want, color)) in STATUSES.iter().enumerate() {
             if options.iter().any(|o| o.name.eq_ignore_ascii_case(want)) {
                 continue;
@@ -325,24 +351,30 @@ impl Board {
                 Opt {
                     id: None,
                     name: (*want).to_string(),
-                    color,
+                    color: Some(color),
                 },
             );
             changed = true;
         }
-        if !changed && (!fresh || self.has_status(STATUS_READY)) {
+        if !changed {
             return Ok(false);
         }
+        let current = self.option_details()?;
+        // JSON string literals are valid GraphQL string literals.
+        let lit = |s: &str| serde_json::to_string(s).unwrap_or_default();
         let options = options
             .iter()
             .map(|o| {
+                let kept = o.id.as_deref().and_then(|id| current.get(id));
+                let color = o.color.or(kept.map(|(c, _)| c.as_str())).unwrap_or("GRAY");
+                let description = kept.map_or("", |(_, d)| d.as_str());
                 let id =
                     o.id.as_deref()
                         .map_or(String::new(), |id| format!(r#"id: "{id}", "#));
                 format!(
-                    r#"{{{id}name: "{}", color: {}, description: ""}}"#,
-                    o.name.replace('"', "\\\""),
-                    o.color
+                    "{{{id}name: {}, color: {color}, description: {}}}",
+                    lit(&o.name),
+                    lit(description)
                 )
             })
             .collect::<Vec<_>>()

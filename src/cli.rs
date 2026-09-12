@@ -627,17 +627,13 @@ fn dispatch(cli: Cli) -> Result<u8> {
             let t = ctx.target(&id)?;
             let board = ctx.board()?;
             // Card first, then the issue; if the reopen fails, put the card back.
-            let status = t.set_board_status(board.as_ref(), project::STATUS_READY)?;
+            let status = release_card(&ctx, &t, board.as_ref())?;
             if let Err(err) = t.gh_issue("reopen", &[]) {
                 let _ = t.set_board_status(board.as_ref(), project::STATUS_DONE);
                 return Err(err);
             }
-            // It may have open blockers itself, and it blocks again.
+            // Open again, it blocks again.
             let moved = reconcile_cards(&ctx, &t, board.as_ref());
-            let status = moved
-                .iter()
-                .find(|(n, _)| *n == t.number)
-                .map_or(status, |(_, s)| Some((*s).to_string()));
             ctx.emit(
                 &json!({ "number": t.number, "state": "open", "status": status, "moved": moves_json(&moved) }),
                 || with_moves(format!("reopened {}", t.label), &moved),
@@ -953,31 +949,46 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
         },
         None => None,
     };
+    let mut moved = Vec::new();
     let status = match ctx.board() {
         Ok(None) => None,
         Ok(Some(board)) => {
-            // --deps: Blocked while GitHub counts an open blocker (a closed
-            // one blocks nothing). One fetch, only when deps were given.
-            let initial = if deps.is_none() {
-                project::STATUS_READY
+            // Edges move cards: the new issue starts Blocked while GitHub
+            // counts an open blocker (a closed one blocks nothing), and what
+            // it blocks leaves Ready. One fetch, only when an edge was given.
+            let detail = if deps.is_none() && blocking.is_none() {
+                None
             } else {
                 match t.fetch(ctx.scope()) {
-                    Ok(d) => ready_or_blocked(&d.issue),
+                    Ok(d) => Some(d),
                     Err(err) => {
                         warnings.push(format!(
-                            "could not read blockers, card set to Blocked (gbd board sync corrects it): {err:#}"
+                            "could not read dependencies (gbd board sync places the cards): {err:#}"
                         ));
-                        project::STATUS_BLOCKED
+                        None
                     }
                 }
             };
-            match t.set_board_status(Some(&board), initial) {
+            let initial = match &detail {
+                Some(d) => ready_or_blocked(&d.issue),
+                None if deps.is_some() => project::STATUS_BLOCKED,
+                None => project::STATUS_READY,
+            };
+            let status = match t.set_board_status(Some(&board), initial) {
                 Ok(s) => s,
                 Err(err) => {
                     warnings.push(format!("not added to board: {err:#}"));
                     None
                 }
+            };
+            if let Some(d) = &detail {
+                if let Err(err) = reconcile_each(&board, &d.blocking, &mut moved) {
+                    warnings.push(format!(
+                        "blocked cards not moved (gbd board sync places them): {err:#}"
+                    ));
+                }
             }
+            status
         }
         Err(err) => {
             warnings.push(format!("board unavailable: {err:#}"));
@@ -993,6 +1004,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
             "number": number, "id": id, "url": url, "title": args.title,
             "type": args.r#type, "priority": priority, "status": status,
             "parent": parent, "blocked_by": deps, "blocking": blocking,
+            "moved": moves_json(&moved),
         }),
         || {
             if args.quiet {
@@ -1010,7 +1022,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
             } else {
                 format!("  ({})", extra.join(", "))
             };
-            format!("{id}  {url}{extra}")
+            with_moves(format!("{id}  {url}{extra}"), &moved)
         },
     );
     Ok(0)
@@ -1209,6 +1221,17 @@ fn ready_or_blocked(i: &Issue) -> &'static str {
     }
 }
 
+/// Back into the pool after a reopen, an undefer, or `--status ready`:
+/// Ready, or Blocked while GitHub counts an open blocker. One fetch, only
+/// with a board.
+fn release_card(ctx: &Ctx, t: &Target, board: Option<&Board>) -> Result<Option<String>> {
+    let Some(board) = board else {
+        return Ok(None);
+    };
+    let d = t.fetch(ctx.scope())?;
+    t.set_board_status(Some(board), ready_or_blocked(&d.issue))
+}
+
 /// Blocked ⇄ Ready for one card, from GitHub's open-blocker count. Only
 /// those two statuses move: In Progress, Deferred, and Done were someone's
 /// decision, and an issue that is not on the board is `board sync`'s job.
@@ -1234,17 +1257,31 @@ fn reconcile_cards(ctx: &Ctx, t: &Target, board: Option<&Board>) -> Moves {
     };
     let mut moved = Vec::new();
     let outcome = t.fetch(ctx.scope()).and_then(|d| {
-        for i in std::iter::once(&d.issue).chain(&d.blocking) {
-            if let Some(status) = reconcile_card(board, i)? {
-                moved.push((i.number, status));
-            }
-        }
-        Ok(())
+        reconcile_each(
+            board,
+            std::iter::once(&d.issue).chain(&d.blocking),
+            &mut moved,
+        )
     });
     if let Err(err) = outcome {
         eprintln!("warning: board not reconciled: {err:#}. Run: gbd board sync");
     }
     moved
+}
+
+/// `reconcile_card` over `issues`, recording each move in `moved`. Stops at
+/// the first error; the moves made so far stay recorded.
+fn reconcile_each<'a>(
+    board: &Board,
+    issues: impl IntoIterator<Item = &'a Issue>,
+    moved: &mut Moves,
+) -> Result<()> {
+    for i in issues {
+        if let Some(status) = reconcile_card(board, i)? {
+            moved.push((i.number, status));
+        }
+    }
+    Ok(())
 }
 
 fn moves_json(moved: &[(u64, &str)]) -> Vec<Value> {
@@ -1318,7 +1355,7 @@ fn cmd_update(ctx: &Ctx, id: &str, a: &UpdateArgs) -> Result<u8> {
     let mut moved = Vec::new();
     if let Some(s) = wanted {
         (status, moved) = set_status(ctx, &t, s)?;
-        changed.push(format!("status {s}"));
+        changed.push(format!("status {}", status.as_deref().unwrap_or(s)));
     }
     if changed.is_empty() {
         bail!("nothing to update; see gbd update --help");
@@ -1375,7 +1412,7 @@ fn cmd_undefer(ctx: &Ctx, ids: &[String]) -> Result<u8> {
     for id in ids {
         let t = ctx.target(id)?;
         fields::clear_field(&t.repo, t.number, fields::START_DATE_FIELD)?;
-        let status = t.set_board_status(board.as_ref(), project::STATUS_READY)?;
+        let status = release_card(ctx, &t, board.as_ref())?;
         results.push(json!({ "number": t.number, "deferred": false, "status": status }));
     }
     ctx.emit(&results, || {
@@ -1404,6 +1441,9 @@ fn set_status(ctx: &Ctx, t: &Target, status: &str) -> Result<(Option<String>, Mo
         }
         (project::STATUS_READY, true) => {
             let _ = t.edit(&["--remove-assignee", "@me"]);
+        }
+        (project::STATUS_READY, false) => {
+            return Ok((release_card(ctx, t, board.as_ref())?, Vec::new()));
         }
         (project::STATUS_DEFERRED, true) => {
             bail!("deferred needs a board (.gbd.yml project:) or a date: gbd defer {} --until tomorrow", t.number);

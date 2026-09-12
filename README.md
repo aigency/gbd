@@ -97,7 +97,7 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 
 | Command | Does |
 | --- | --- |
-| `create "Title" -t Bug -p 1 --parent 88 --deps 12,13 --blocking 40` | One `gh issue create` carrying type, parent, and both edge lists; Priority and board Status set right after. `q` is the same and prints only `repo#n`. |
+| `create "Title" -t Bug -p 1 --parent 88 --deps 12,13 --blocking 40` | One `gh issue create` carrying type, parent, and both edge lists; Priority and board Status set right after (`--deps` on open issues → Blocked; `--blocking` moves those cards to Blocked). `q` is the same and prints only `repo#n`. |
 | `show <id>` | The issue with fields, parent, children, blocked-by, and blocking, rendered like `bd show`. |
 | `list [--state open\|closed\|all] [--type T] [--assignee A] [--parent N] [--search Q] [--flat]` | A tree with children under parents: `○ #12 ● P1 [bug] Title`. |
 | `search "<GitHub search syntax>"` | Same output as `list`. |
@@ -109,7 +109,7 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 | `duplicate <id> <of>` | Close as duplicate with a comment. |
 | `delete <id> --yes` | Prefer `close --reason not_planned`. |
 | `defer <id…> [--until WHEN] [--reason WHY]` | Beads `defer`. `WHEN`: `YYYY-MM-DD`, `today`, `tomorrow`, `+1h`, `+3d`, `+2w`, `next monday`, or a weekday. Board → Deferred; `--reason` becomes a comment. With a board `--until` is optional. |
-| `undefer <id…>` | Clear Start date, board → Ready. |
+| `undefer <id…>` | Clear Start date, board → Ready (Blocked if it still has open blockers). |
 | `priority <id> P2` | Org **Priority** field. Accepts `P0`–`P4` or `0`–`4`. |
 | `comment <id> "…"` / `note` / `comments <id>` | Comments are Beads notes. |
 | `label <id> --add x --remove y` | Plain labels only; never state. |
@@ -177,7 +177,7 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 
 `gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Ready / In Progress / Blocked / Deferred / Done**, links the repo, and writes `project: N` to `.gbd.yml`. On a board from an earlier gbd, re-running `init` adds the missing option in place. From then on `create` adds new issues as Ready (Blocked when `--deps` names an open issue), and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` skips In Progress and Deferred. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
 
-**Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back. Only Ready and Blocked ever swap; In Progress, Deferred, and Done are someone's decision. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
+**Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back. `update --status ready`, `reopen`, and `undefer` land on Blocked instead when a blocker is still open. Only Ready and Blocked ever swap; In Progress, Deferred, and Done are someone's decision. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
 
 Without `project:` in `.gbd.yml`, gbd still works: an assignee means in progress, and `defer --until` means deferred.
 

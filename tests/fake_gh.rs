@@ -730,10 +730,16 @@ fn status_change_with_a_board_moves_the_card_only() {
         !calls.contains("--add-assignee"),
         "board is authoritative; no assignee edit: {calls}"
     );
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("In Progress"), "")),
+    );
     h.gbd()
         .args(["update", "12", "--status", "ready"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("updated #12 (status Ready)"));
     let calls = h.calls();
     assert!(
         calls.contains("--single-select-option-id O_ready"),
@@ -1073,6 +1079,11 @@ fn undefer_deletes_the_field_value_and_moves_the_card_to_ready() {
         "clear",
         "--method DELETE -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/acme/widgets/issues/12/issue-field-values/7886557",
         "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Deferred"), "")),
     );
     h.gbd()
         .args(["undefer", "12"])
@@ -1122,7 +1133,13 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
         r#"{"fields":[{"id":"F_status","name":"Status","options":[
             {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
             {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
-    .on("06-options", "updateProjectV2Field", r#"{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_status"}}}}"#);
+    .on("06-options", "updateProjectV2Field", r#"{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_status"}}}}"#)
+    .on("07-details", "options { id name color description }",
+        r#"{"data":{"node":{"options":[
+            {"id":"O_ready","name":"Ready","color":"GREEN","description":""},
+            {"id":"O_wip","name":"In Progress","color":"BLUE","description":"hands on"},
+            {"id":"O_def","name":"Deferred","color":"GRAY","description":null},
+            {"id":"O_done","name":"Done","color":"PURPLE","description":""}]}}}"#);
     // The board predates Blocked: the first read shows four options.
     fs::write(
         h.gh_dir.path().join("05-pfields.out.1"),
@@ -1142,13 +1159,14 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
         "must adopt, not create a second board: {calls}"
     );
     assert!(!calls.contains("project link"), "{calls}");
-    // Existing options go back with their ids: without them GitHub treats
-    // the list as new options and clears every card's Status.
+    // Existing options go back with their ids (without them GitHub treats
+    // the list as new options and clears every card's Status) and with the
+    // board's own colors and descriptions, not gbd's defaults.
     assert!(
         calls.contains(
-            r#"{id: "O_wip", name: "In Progress", color: YELLOW, description: ""}, {name: "Blocked", color: RED, description: ""}, {id: "O_def", name: "Deferred", color: GRAY, description: ""}"#
+            r#"{id: "O_wip", name: "In Progress", color: BLUE, description: "hands on"}, {name: "Blocked", color: RED, description: ""}, {id: "O_def", name: "Deferred", color: GRAY, description: ""}"#
         ),
-        "Blocked slotted in between In Progress and Deferred, existing options kept by id: {calls}"
+        "Blocked slotted in between In Progress and Deferred, existing options kept: {calls}"
     );
     let cfg = fs::read_to_string(h.cwd.path().join(".gbd.yml")).unwrap();
     assert!(cfg.contains("project: 8\n"), "{cfg}");
@@ -1651,4 +1669,114 @@ fn doctor_flags_a_board_that_predates_blocked() {
         .stdout(predicate::str::contains(
             "!     board  #7 missing Status options Blocked. Run: gbd init",
         ));
+}
+
+#[test]
+fn create_with_blocking_moves_the_cards_it_blocks() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #42 has no blockers itself (Ready); #12, which it now blocks, was Ready.
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/42",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(
+            42,
+            "OPEN",
+            0,
+            None,
+            &card_node(12, "OPEN", 1, Some("Ready"), ""),
+        )),
+    )
+    .on(
+        "padd42",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/42 --format json",
+        r#"{"id":"PVTI_42"}"#,
+    )
+    .on("pedit42", "project item-edit --id PVTI_42", "");
+    h.gbd()
+        .args(["create", "Ship first", "-t", "Task", "--blocking", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(Status Ready); #12 → Blocked"));
+    let calls = h.calls();
+    assert!(
+        calls.contains(
+            "--id PVTI_42 --project-id PVT_1 --field-id F_status --single-select-option-id O_ready"
+        ),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id O_blocked"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn status_ready_lands_on_blocked_while_a_blocker_is_open() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 1, Some("Deferred"), "")),
+    );
+    h.gbd()
+        .args(["update", "12", "--status", "ready"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated #12 (status Blocked)"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(!calls.contains("O_ready"), "{calls}");
+}
+
+#[test]
+fn reopen_lands_on_blocked_and_reblocks_what_it_holds() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #12 still has an open blocker; #14, which it blocks, went Ready when
+    // #12 was closed.
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(
+            12,
+            "CLOSED",
+            1,
+            Some("Done"),
+            &card_node(14, "OPEN", 1, Some("Ready"), ""),
+        )),
+    )
+    .on("reopen", "issue reopen 12 -R acme/widgets", "")
+    .on(
+        "padd14",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/14 --format json",
+        r#"{"id":"PVTI_14"}"#,
+    )
+    .on("pedit14", "project item-edit --id PVTI_14", "");
+    h.gbd()
+        .args(["reopen", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reopened #12; #14 → Blocked"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--id PVTI_14 --project-id PVT_1 --field-id F_status --single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    let card = calls.find("PVTI_12").expect(&calls);
+    let reopen = calls.find("issue reopen").expect(&calls);
+    assert!(card < reopen, "card first, then the issue: {calls}");
 }
