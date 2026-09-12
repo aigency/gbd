@@ -1165,15 +1165,7 @@ fn cmd_import(
     let export = beads::load(from_beads)?;
     let mut plan = import::plan(&export);
     let done = import::read_mapping(mapping)?;
-    let with_phase = |phase: fn(import::Phase) -> bool| -> Vec<String> {
-        plan.items
-            .iter()
-            .filter(|i| done.get(&i.bead).is_some_and(|m| phase(m.phase)))
-            .map(|i| i.bead.clone())
-            .collect()
-    };
-    plan.already_imported = with_phase(|p| p == import::Phase::Done);
-    plan.partially_imported = with_phase(|p| p != import::Phase::Done);
+    import::note_imported(&mut plan, &done);
     let source = from_beads.display().to_string();
     if dry_run {
         // Local: no gh, no auth, no repo lookup.
@@ -1201,7 +1193,13 @@ fn cmd_import(
             plan.memories.len()
         );
     }
-    import_run(&ctx, &plan, mapping, &done)
+    // The state a run starts from is read under the file's lock, held until
+    // the run ends: two resumes at once would otherwise both start from the
+    // same state and create everything twice.
+    let map = import::Mapping::open(mapping)?;
+    let done = import::read_mapping(mapping)?;
+    import::note_imported(&mut plan, &done);
+    import_run(&ctx, &plan, map, &done)
 }
 
 /// Execute the plan top to bottom: one `gh issue create` per bead, its
@@ -1214,7 +1212,7 @@ fn cmd_import(
 fn import_run(
     ctx: &Ctx,
     plan: &import::Plan,
-    mapping: &Path,
+    map: import::Mapping,
     done: &BTreeMap<String, import::Mapped>,
 ) -> Result<u8> {
     // Nothing left to create or finish (an export of memories alone, or a
@@ -1290,7 +1288,7 @@ fn import_run(
         board: &board,
         priority: &priority,
         start_date: start_date.as_ref(),
-        map: import::Mapping::open(mapping)?,
+        map,
         numbers: done.iter().map(|(b, m)| (b.clone(), m.number)).collect(),
         warnings: Vec::new(),
         created: Vec::new(),

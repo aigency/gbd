@@ -624,6 +624,20 @@ pub fn posted_comments(bodies: &[&str], bead: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Mark on the plan which beads the mapping file says are done or partly
+/// done, so the report and the refusal can say so.
+pub fn note_imported(plan: &mut Plan, done: &BTreeMap<String, Mapped>) {
+    let with_phase = |phase: fn(Phase) -> bool| -> Vec<String> {
+        plan.items
+            .iter()
+            .filter(|i| done.get(&i.bead).is_some_and(|m| phase(m.phase)))
+            .map(|i| i.bead.clone())
+            .collect()
+    };
+    plan.already_imported = with_phase(|p| p == Phase::Done);
+    plan.partially_imported = with_phase(|p| p != Phase::Done);
+}
+
 /// The first record that belongs to another repository than `repo`, if any.
 pub fn foreign_entry<'a>(map: &'a BTreeMap<String, Mapped>, repo: &str) -> Option<&'a Mapped> {
     map.values()
@@ -632,46 +646,65 @@ pub fn foreign_entry<'a>(map: &'a BTreeMap<String, Mapped>, repo: &str) -> Optio
 
 /// A file whose last line has no newline ends in a cut-off write. If that
 /// tail still parses it is a whole record and only needs its newline;
-/// otherwise it is dropped so the next record starts on a clean line.
-fn repair_tail(path: &Path) -> Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-    };
+/// otherwise it is dropped so the next record starts on a clean line. Done
+/// in place on the locked handle: a truncate is one call, so a kill during
+/// it leaves the old file or the new one, and no rename moves the lock off
+/// the file.
+fn repair_tail(file: &mut std::fs::File, path: &Path) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("opening {}", path.display()))?;
     if text.is_empty() || text.ends_with('\n') {
         return Ok(());
     }
     let cut = text.rfind('\n').map_or(0, |i| i + 1);
-    let tail = &text[cut..];
-    let fixed = if serde_json::from_str::<Mapped>(tail).is_ok() {
-        format!("{text}\n")
+    let repaired = if serde_json::from_str::<Mapped>(&text[cut..]).is_ok() {
+        writeln!(file).and_then(|()| file.flush())
     } else {
-        text[..cut].to_string()
+        file.set_len(cut as u64)
     };
-    // Written beside the file and renamed over it, so a kill or a full disk
-    // during the repair leaves either the old file or the new one, never a
-    // truncated one.
-    let tmp = path.with_extension("jsonl.repair");
-    std::fs::write(&tmp, fixed).with_context(|| format!("repairing {}", path.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("repairing {}", path.display()))
+    repaired.with_context(|| format!("repairing {}", path.display()))
 }
 
 /// Append-only, flushed per line: a run killed halfway loses nothing, and
-/// the next run resumes from it.
+/// the next run resumes from it. Locked for as long as the value lives.
+#[derive(Debug)]
 pub struct Mapping {
     path: PathBuf,
     file: std::fs::File,
 }
 
 impl Mapping {
+    /// Opens the file, creating it, and takes its lock for the life of the
+    /// value: a second import on the same file fails at once instead of
+    /// starting from the same state and creating everything twice. The
+    /// lock goes with the process, so a killed run leaves nothing behind.
     pub fn open(path: &Path) -> Result<Self> {
-        repair_tail(path)?;
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .with_context(|| format!("opening {} for writing", path.display()))?;
+        // The lock is held for a whole run, so a busy file stays busy; the
+        // brief retry covers only a descriptor momentarily duplicated into
+        // a child another thread is spawning (the fork-to-exec window).
+        let mut tries = 0;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                    "{} is in use by another gbd import; wait for it to finish",
+                    path.display()
+                ),
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+        repair_tail(&mut file, path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -690,8 +723,9 @@ impl Mapping {
     }
 }
 
-/// `[label]: destination`, up to three leading spaces, as `CommonMark`
-/// defines a link reference definition's first line.
+/// `[label]:` then a destination, after up to three spaces, as `CommonMark`
+/// defines a link reference definition's first line; the whitespace after
+/// the colon is optional.
 fn is_reference_definition(line: &str) -> bool {
     let trimmed = line.trim_start_matches(' ');
     if line.len() - trimmed.len() > 3 || !trimmed.starts_with('[') {
@@ -700,10 +734,28 @@ fn is_reference_definition(line: &str) -> bool {
     let Some(close) = trimmed.find(']') else {
         return false;
     };
-    close > 1 && trimmed[close + 1..].starts_with(':') && {
-        let after = &trimmed[close + 2..];
-        after.starts_with(' ') || after.starts_with('\t')
+    close > 1 && trimmed[close + 1..].starts_with(':') && !trimmed[close + 2..].trim().is_empty()
+}
+
+/// The fence a line opens, as (char, run length): three or more backticks
+/// or tildes after up to three spaces. A backtick fence's info string
+/// cannot contain a backtick.
+fn fence_open(line: &str) -> Option<(char, usize)> {
+    let s = line.trim_start_matches(' ');
+    if line.len() - s.len() > 3 {
+        return None;
     }
+    let c = s.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let n = s.chars().take_while(|&x| x == c).count();
+    (n >= 3 && (c == '~' || !s[n..].contains('`'))).then_some((c, n))
+}
+
+/// Whether a line closes a fence of `n` of `c`: a run at least as long
+/// after up to three spaces, with nothing but whitespace after it.
+fn fence_close(line: &str, c: char, n: usize) -> bool {
+    let s = line.trim_start_matches(' ');
+    let run = s.chars().take_while(|&x| x == c).count();
+    line.len() - s.len() <= 3 && run >= n && s[run..].trim().is_empty()
 }
 
 /// Byte index of the `)` that closes a link destination starting at the
@@ -736,34 +788,29 @@ enum Code {
     /// Inside a span opened by a run of this many backticks; only a run of
     /// the same length closes it, so a literal backtick inside is fine.
     Span(usize),
-    /// Inside a fence opened by a run of this many backticks or tildes (the
-    /// char says which); a run of the same char at least as long closes it.
+    /// Inside a fenced block opened by a line of this many backticks or
+    /// tildes (the char says which); only a line of at least as many closes
+    /// it, so a run of the fence char inside the block is fine.
     Fence(char, usize),
 }
 
-/// Advance the code state across `literal`.
+/// Advance the span state across `literal`. Fences are whole lines and are
+/// seen at the line start, never here.
 fn note_code(literal: &str, code: &mut Code) {
-    let (mut run, mut run_char) = (0usize, '`');
+    let mut run = 0usize;
     for c in literal.chars().chain(std::iter::once('\0')) {
-        if matches!(c, '`' | '~') && (run == 0 || c == run_char) {
+        if c == '`' {
             run += 1;
-            run_char = c;
             continue;
         }
         if run > 0 {
             *code = match *code {
-                Code::Prose if run >= 3 => Code::Fence(run_char, run),
-                Code::Prose if run_char == '`' => Code::Span(run),
-                Code::Span(n) if run_char == '`' && n == run => Code::Prose,
-                Code::Fence(f, n) if run_char == f && run >= n => Code::Prose,
+                Code::Prose => Code::Span(run),
+                Code::Span(n) if n == run => Code::Prose,
                 same => same,
             };
         }
         run = 0;
-        if matches!(c, '`' | '~') {
-            run = 1;
-            run_char = c;
-        }
     }
 }
 
@@ -776,7 +823,8 @@ fn is_indented(line: &str) -> bool {
 /// is a maximal run of id characters; trailing dots are punctuation. Left
 /// alone: anything inside a code span, a fenced block, or an indented code
 /// block (the import footer and command examples), a bare URL (a word
-/// containing `://`, words ending at whitespace or brackets), a Markdown
+/// containing `://`, words ending at whitespace or angle or square
+/// brackets, so parentheses inside a URL are part of it), a Markdown
 /// link destination (`](…)`), and a reference definition line
 /// (`[label]: …`); the link's visible text is still rewritten. Anything
 /// not in `known` stays as written.
@@ -790,7 +838,7 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
     }
     fn boundary(c: char) -> bool {
-        c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '<' | '>')
+        c.is_whitespace() || matches!(c, '[' | ']' | '<' | '>')
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -806,16 +854,33 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         if out.is_empty() || out.ends_with('\n') {
             let line = &rest[..line_end];
             let blank = line.trim().is_empty();
-            let mut verbatim = false;
-            if md == Code::Prose {
+            // Inside a fence every line is code, and only a line of the
+            // fence closes it.
+            let verbatim = if let Code::Fence(c, n) = md {
+                if fence_close(line, c, n) {
+                    md = Code::Prose;
+                }
+                true
+            } else {
+                if blank {
+                    // A blank line ends the paragraph, and any span in it.
+                    md = Code::Prose;
+                }
                 if indented && !blank && !is_indented(line) {
                     indented = false;
                 }
                 if !indented && prev_blank && !blank && is_indented(line) {
                     indented = true;
                 }
-                verbatim = indented || is_reference_definition(line);
-            }
+                if indented || is_reference_definition(line) {
+                    true
+                } else if let Some((c, n)) = fence_open(line) {
+                    md = Code::Fence(c, n);
+                    true
+                } else {
+                    false
+                }
+            };
             prev_blank = blank;
             if verbatim {
                 out.push_str(line);
@@ -1337,9 +1402,39 @@ mod tests {
             "a reference definition line is a destination"
         );
         assert_eq!(
-            rewrite_ids("[wx-2]:no space", &known),
-            "[#102]:no space",
-            "without the space it is prose"
+            rewrite_ids("[doc]:/issues/wx-2\n\n[wx-2][doc]", &known),
+            "[doc]:/issues/wx-2\n\n[#102][doc]",
+            "the space after the colon is optional"
+        );
+        assert_eq!(
+            rewrite_ids("[wx-2]:", &known),
+            "[#102]:",
+            "without a destination it is prose"
+        );
+        assert_eq!(
+            rewrite_ids("```\necho '```' wx-2\n```\nwx-2", &known),
+            "```\necho '```' wx-2\n```\n#102",
+            "a run inside a fenced line does not close the fence"
+        );
+        assert_eq!(
+            rewrite_ids("```\n``` not a close wx-2\n```\nwx-2", &known),
+            "```\n``` not a close wx-2\n```\n#102",
+            "a closing fence has nothing after it"
+        );
+        assert_eq!(
+            rewrite_ids("```wx-2\nx\n```\nwx-2", &known),
+            "```wx-2\nx\n```\n#102",
+            "the info string is not prose"
+        );
+        assert_eq!(
+            rewrite_ids("```wx-2``` wx-2", &known),
+            "```wx-2``` #102",
+            "a run of three in a line is a span, not a fence"
+        );
+        assert_eq!(
+            rewrite_ids("https://tracker.example/archive(v1)/wx-2 wx-2", &known),
+            "https://tracker.example/archive(v1)/wx-2 #102",
+            "parentheses inside a bare URL are part of it"
         );
         assert_eq!(
             rewrite_ids("[doc](/archive(v1)/wx-2) wx-2", &known),
@@ -1423,6 +1518,20 @@ mod tests {
     }
 
     #[test]
+    fn the_mapping_file_is_locked_while_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.jsonl");
+        let held = Mapping::open(&path).unwrap();
+        let err = Mapping::open(&path).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is in use by another gbd import"),
+            "{err:#}"
+        );
+        drop(held);
+        Mapping::open(&path).unwrap();
+    }
+
+    #[test]
     fn a_cut_off_last_line_is_ignored_and_repaired() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("map.jsonl");
@@ -1447,6 +1556,7 @@ mod tests {
             "the tail was dropped before appending: {text}"
         );
         assert_eq!(read_mapping(&path).unwrap().len(), 2);
+        drop(m);
         // A whole last record that only lacks its newline is kept.
         std::fs::write(&path, good).unwrap();
         Mapping::open(&path).unwrap();

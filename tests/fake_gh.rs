@@ -2751,3 +2751,26 @@ fn import_stops_when_an_adopted_issue_cannot_be_completed() {
         "the adoption is not recorded: {map}"
     );
 }
+
+#[test]
+fn import_refuses_a_mapping_file_another_import_holds() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // Another import (or a retry of one that only looks hung) has the file.
+    let other = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(h.cwd.path().join("beads-map.jsonl"))
+        .unwrap();
+    other.try_lock().unwrap();
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "beads-map.jsonl is in use by another gbd import; wait for it to finish",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+    drop(other);
+}
