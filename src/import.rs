@@ -173,8 +173,20 @@ fn body_of(b: &Bead) -> String {
         body.push(')');
     }
     body.push('.');
+    // Fields GitHub has no home for stay readable here instead of vanishing.
     if !b.labels.is_empty() {
         let _ = write!(body, " Beads labels: {}.", b.labels.join(", "));
+    }
+    let extras = [
+        ("Owner", b.owner.clone()),
+        ("Due", b.due_at.as_deref().and_then(date_of)),
+        ("Estimate", b.estimated_minutes.map(|m| format!("{m} min"))),
+        ("Ref", b.external_ref.clone()),
+    ];
+    for (label, value) in extras {
+        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+            let _ = write!(body, " {label}: {}.", v.trim());
+        }
     }
     body
 }
@@ -315,7 +327,8 @@ impl<'a> Tarjan<'a> {
 
 /// Place what Kahn could not: components in topological order (a bead
 /// behind a cycle comes after the cycle, whatever its timestamp), members
-/// of a cycle by creation time then id. Also returns the cycles.
+/// of a cycle by creation time then id. Also returns the cycles, a bead
+/// that blocks or parents itself included.
 fn residual(export: &Export, ids: &[String]) -> (Vec<String>, Vec<Vec<String>>) {
     let set: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
     let by_id: HashMap<&str, &Bead> = export.issues.iter().map(|b| (b.id.as_str(), b)).collect();
@@ -348,9 +361,16 @@ fn residual(export: &Export, ids: &[String]) -> (Vec<String>, Vec<Vec<String>>) 
     for c in &mut components {
         c.sort_by_key(|id| (by_id[id.as_str()].created_at.clone(), id.clone()));
     }
+    // A bead that depends on itself is a one-node cycle.
+    let self_edge = |c: &Vec<String>| {
+        c.len() == 1
+            && out
+                .get(c[0].as_str())
+                .is_some_and(|d| d.contains(&c[0].as_str()))
+    };
     let mut cycles: Vec<Vec<String>> = components
         .iter()
-        .filter(|c| c.len() > 1)
+        .filter(|c| c.len() > 1 || self_edge(c))
         .map(|c| {
             let mut c = c.clone();
             c.sort();
@@ -621,7 +641,7 @@ mod tests {
         assert!(epic.body.starts_with("Umbrella for the API rework."));
         assert!(
             epic.body.ends_with(
-                "---\nImported from Beads `wx-1` (created 2026-03-01 by dev1). Beads labels: area:api."
+                "---\nImported from Beads `wx-1` (created 2026-03-01 by dev1). Beads labels: area:api. Owner: dev1."
             ),
             "{}",
             epic.body
@@ -630,7 +650,14 @@ mod tests {
             item(&p, "wx-3")
                 .body
                 .ends_with("(created 2026-03-03 by dev2)."),
-            "no labels, no tail"
+            "nothing extra, no tail"
+        );
+        assert!(
+            item(&p, "wx-4")
+                .body
+                .ends_with("(created 2026-02-20 by dev2). Owner: dev2. Estimate: 30 min."),
+            "{}",
+            item(&p, "wx-4").body
         );
         assert_eq!(
             epic.comments,
@@ -741,6 +768,23 @@ mod tests {
             "{:?}",
             p.skipped
         );
+    }
+
+    #[test]
+    fn a_self_dependency_is_a_one_bead_cycle() {
+        let line = "{\"id\":\"s-1\",\"title\":\"loops\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"t\",\"dependencies\":[{\"issue_id\":\"s-1\",\"depends_on_id\":\"s-1\",\"type\":\"blocks\"}]}\n";
+        let e = beads::parse(line.as_bytes()).unwrap();
+        let p = plan(&e);
+        assert_eq!(p.cycles, vec![vec!["s-1".to_string()]]);
+        assert!(item(&p, "s-1").blocked_by.is_empty());
+        assert!(
+            p.skipped
+                .iter()
+                .any(|s| s.what == "blocked-by s-1 dropped: part of a dependency cycle"),
+            "{:?}",
+            p.skipped
+        );
+        assert!(render(&p, "x", 5).contains("Dependency cycles (1)"));
     }
 
     #[test]
