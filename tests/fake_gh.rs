@@ -2050,15 +2050,77 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
             "1 warning; 1 could not map (listed above)",
         ))
         .stderr(predicate::str::contains("wx-2 (#102): not closed: "))
-        .stderr(predicate::str::contains(
-            "Close it by hand, then: gbd board sync",
-        ));
+        .stderr(predicate::str::contains("Run gbd import again to retry"));
     let calls = h.calls();
     assert!(
         !calls.contains("O_done"),
         "an open issue is never marked Done: {calls}"
     );
     assert!(!calls.contains("✓"), "{calls}");
+    // wx-1.1 is blocked by wx-2, which is still open: Blocked, not the planned Ready.
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+    // The blocker stays at `commented`, so the next run retries its close.
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last_wx2 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-2\""))
+        .unwrap();
+    assert!(last_wx2.contains("\"phase\":\"commented\""), "{map}");
+}
+
+#[test]
+fn import_reports_what_exists_when_a_create_fails() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on_fail("create-3", "--title Rename the endpoints", "HTTP 403: secondary rate limit")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "stopped: wx-1.1: stopped after 2 of 3",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 of 3 issues before that (1 closed)",
+        ))
+        .stdout(predicate::str::contains(
+            "mapping: beads-map.jsonl (run gbd import again to resume)",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("issue view 3"),
+        "memories are not written on a failed run: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert_eq!(
+        map.lines()
+            .filter(|l| l.contains("\"phase\":\"done\""))
+            .count(),
+        2,
+        "{map}"
+    );
 }
 
 #[test]
@@ -2066,10 +2128,13 @@ fn import_resumes_from_the_mapping_file() {
     let h = Harness::new();
     board_fixtures(&h);
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
-    // A previous run got through wx-1 and died.
+    // A previous run finished wx-1, created wx-2, and died before its
+    // follow-up steps.
     fs::write(
         h.cwd.path().join("beads-map.jsonl"),
-        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\"}\n",
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"created\"}\n\
+         {\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n\
+         {\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"created\"}\n",
     )
     .unwrap();
     h.on(
@@ -2102,6 +2167,9 @@ fn import_resumes_from_the_mapping_file() {
         .success()
         .stdout(predicate::str::contains(
             "Already imported (1), skipped: wx-1",
+        ))
+        .stdout(predicate::str::contains(
+            "Partially imported (1), to be finished: wx-2",
         ));
 
     h.gbd()
@@ -2111,14 +2179,32 @@ fn import_resumes_from_the_mapping_file() {
         .stdout(predicate::str::contains(
             "1/3  wx-1 = #101  (already imported)\n",
         ))
+        .stdout(predicate::str::contains("2/3  wx-2 = #102  (finishing)\n"))
         .stdout(predicate::str::contains(
-            "imported 2 issues (1 closed, 1 already imported)",
+            "2/3  wx-2 → #102  [Bug] Auth refresh drops the session  ✓\n",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 finished from an earlier run, 1 already imported)",
         ))
         .stdout(predicate::str::contains("mapping: beads-map.jsonl"));
     let calls = h.calls();
     assert!(
-        !calls.contains("--title Widget API v2"),
-        "wx-1 is not created twice: {calls}"
+        !calls.contains("--title Widget API v2") && !calls.contains("--title Auth refresh"),
+        "nothing is created twice: {calls}"
+    );
+    // wx-2 gets its follow-up steps replayed: priority, assignee, close, card.
+    assert!(
+        calls.contains("issues/102/issue-field-values --input -"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--add-assignee dev1") && calls.contains("issue close 102"),
+        "{calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_done").count(),
+        1,
+        "{calls}"
     );
     assert!(
         calls.contains("--type Task --parent 101 --blocked-by 102"),
@@ -2126,13 +2212,50 @@ fn import_resumes_from_the_mapping_file() {
     );
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
     let lines: Vec<&str> = map.lines().collect();
-    assert_eq!(lines.len(), 3, "{map}");
-    assert!(
-        lines[1].contains("\"bead\":\"wx-2\"") && lines[1].contains("\"number\":102"),
+    assert_eq!(lines.len(), 8, "{map}");
+    let phases: Vec<String> = lines[3..]
+        .iter()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            format!(
+                "{} {}",
+                v["bead"].as_str().unwrap(),
+                v["phase"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "wx-2 commented",
+            "wx-2 done",
+            "wx-1.1 created",
+            "wx-1.1 commented",
+            "wx-1.1 done"
+        ],
         "{map}"
     );
-    assert!(
-        lines[2].contains("\"bead\":\"wx-1.1\"") && lines[2].contains("\"number\":103"),
-        "{map}"
+}
+
+#[test]
+fn import_refuses_a_mapping_file_from_another_repo() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":5,\"url\":\"https://github.com/acme/other/issues/5\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/1",
     );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("beads-map.jsonl was written for acme/other (wx-1 → https://github.com/acme/other/issues/5), not acme/widgets"));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
 }

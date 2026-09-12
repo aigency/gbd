@@ -120,9 +120,13 @@ pub struct Plan {
     pub skipped: Vec<Skip>,
     /// Parse-time problems, rendered.
     pub problems: Vec<String>,
-    /// Beads the mapping file already has; the run skips them.
+    /// Beads the mapping file has as done; the run skips them.
     #[serde(default)]
     pub already_imported: Vec<String>,
+    /// Beads a previous run created but did not finish; the run finishes
+    /// them without creating anything.
+    #[serde(default)]
+    pub partially_imported: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,22 +514,51 @@ pub fn plan(export: &Export) -> Plan {
         skipped,
         problems: export.problems.iter().map(ToString::to_string).collect(),
         already_imported: Vec::new(),
+        partially_imported: Vec::new(),
     }
 }
 
 // ---------------------------------------------------------------------------
 // The mapping file
 
-/// One line of the mapping file: which issue a bead became.
+/// How far a bead got. Each step appends a new line; the last line for a
+/// bead wins, so a run killed anywhere resumes at the right step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// The issue exists; nothing else has been written to it.
+    Created,
+    /// Comments are on it; Priority, dates, assignee, close, and the card
+    /// are idempotent and get replayed.
+    Commented,
+    /// Everything is on it.
+    #[default]
+    Done,
+}
+
+/// One line of the mapping file: which issue a bead became, and how far
+/// the import got with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mapped {
     pub bead: String,
     pub number: u64,
     pub url: String,
+    #[serde(default)]
+    pub phase: Phase,
 }
 
-/// `bead → number` from an existing mapping file; absent means empty.
-pub fn read_mapping(path: &Path) -> Result<BTreeMap<String, u64>> {
+impl Mapped {
+    /// `owner/repo` from the issue URL.
+    pub fn repo(&self) -> Option<&str> {
+        let rest = self.url.strip_prefix("https://github.com/")?;
+        let (repo, tail) = rest.split_once("/issues/")?;
+        (repo.matches('/').count() == 1 && !tail.is_empty()).then_some(repo)
+    }
+}
+
+/// The mapping file's records, last line per bead winning; absent means
+/// empty.
+pub fn read_mapping(path: &Path) -> Result<BTreeMap<String, Mapped>> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -539,9 +572,15 @@ pub fn read_mapping(path: &Path) -> Result<BTreeMap<String, u64>> {
         }
         let m: Mapped = serde_json::from_str(&line)
             .with_context(|| format!("{}:{}: not a mapping line", path.display(), idx + 1))?;
-        map.insert(m.bead, m.number);
+        map.insert(m.bead.clone(), m);
     }
     Ok(map)
+}
+
+/// The first record that belongs to another repository than `repo`, if any.
+pub fn foreign_entry<'a>(map: &'a BTreeMap<String, Mapped>, repo: &str) -> Option<&'a Mapped> {
+    map.values()
+        .find(|m| !m.repo().is_some_and(|r| r.eq_ignore_ascii_case(repo)))
 }
 
 /// Append-only, flushed per line: a run killed halfway loses nothing, and
@@ -731,6 +770,14 @@ pub fn render_diagnostics(p: &Plan) -> String {
             "\nAlready imported ({}), skipped: {}",
             p.already_imported.len(),
             p.already_imported.join(" ")
+        );
+    }
+    if !p.partially_imported.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nPartially imported ({}), to be finished: {}",
+            p.partially_imported.len(),
+            p.partially_imported.join(" ")
         );
     }
     if !p.problems.is_empty() {
@@ -990,32 +1037,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("map.jsonl");
         assert!(read_mapping(&path).unwrap().is_empty(), "absent is empty");
+        let rec = |bead: &str, number: u64, phase: Phase| Mapped {
+            bead: bead.into(),
+            number,
+            url: format!("https://github.com/acme/widgets/issues/{number}"),
+            phase,
+        };
         let mut m = Mapping::open(&path).unwrap();
-        m.record(&Mapped {
-            bead: "a-1".into(),
-            number: 7,
-            url: "u".into(),
-        })
-        .unwrap();
-        m.record(&Mapped {
-            bead: "a-2".into(),
-            number: 8,
-            url: "v".into(),
-        })
-        .unwrap();
+        m.record(&rec("a-1", 7, Phase::Created)).unwrap();
+        m.record(&rec("a-1", 7, Phase::Done)).unwrap();
+        m.record(&rec("a-2", 8, Phase::Created)).unwrap();
         drop(m);
         let mut again = Mapping::open(&path).unwrap();
-        again
-            .record(&Mapped {
-                bead: "a-3".into(),
-                number: 9,
-                url: "w".into(),
-            })
-            .unwrap();
+        again.record(&rec("a-3", 9, Phase::Done)).unwrap();
         let map = read_mapping(&path).unwrap();
         assert_eq!(map.len(), 3);
-        assert_eq!(map["a-3"], 9);
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+        assert_eq!(map["a-1"].phase, Phase::Done, "last line wins");
+        assert_eq!(map["a-2"].phase, Phase::Created);
+        assert_eq!(map["a-3"].number, 9);
+        assert_eq!(map["a-3"].repo(), Some("acme/widgets"));
+        assert!(foreign_entry(&map, "acme/widgets").is_none());
+        assert_eq!(
+            foreign_entry(&map, "acme/other").map(|m| m.bead.as_str()),
+            Some("a-1")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 4);
+        // A line without a phase (added by hand) counts as done.
+        std::fs::write(&path, "{\"bead\":\"h-1\",\"number\":3,\"url\":\"https://github.com/acme/widgets/issues/3\"}\n").unwrap();
+        assert_eq!(read_mapping(&path).unwrap()["h-1"].phase, Phase::Done);
         std::fs::write(&path, "{\"bead\":1}\n").unwrap();
         let err = read_mapping(&path).unwrap_err();
         assert!(

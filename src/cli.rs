@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -1155,12 +1155,15 @@ fn cmd_import(
     let export = beads::load(from_beads)?;
     let mut plan = import::plan(&export);
     let done = import::read_mapping(mapping)?;
-    plan.already_imported = plan
-        .items
-        .iter()
-        .filter(|i| done.contains_key(&i.bead))
-        .map(|i| i.bead.clone())
-        .collect();
+    let with_phase = |phase: fn(import::Phase) -> bool| -> Vec<String> {
+        plan.items
+            .iter()
+            .filter(|i| done.get(&i.bead).is_some_and(|m| phase(m.phase)))
+            .map(|i| i.bead.clone())
+            .collect()
+    };
+    plan.already_imported = with_phase(|p| p == import::Phase::Done);
+    plan.partially_imported = with_phase(|p| p != import::Phase::Done);
     let source = from_beads.display().to_string();
     if dry_run {
         // Local: no gh, no auth, no repo lookup.
@@ -1168,6 +1171,18 @@ fn cmd_import(
         return Ok(0);
     }
     let ctx = Ctx::open(explicit, json)?;
+    // A mapping file from another repo would silently skip beads and wire
+    // edges to unrelated issues.
+    if let Some(m) = import::foreign_entry(&done, &ctx.repo.name_with_owner) {
+        bail!(
+            "{} was written for {} ({} → {}), not {}. Point --mapping at a fresh file",
+            mapping.display(),
+            m.repo().unwrap_or("an unknown repo"),
+            m.bead,
+            m.url,
+            ctx.repo.name_with_owner
+        );
+    }
     if !yes {
         bail!(
             "this creates {} issues in {} and writes {} memories. Add --yes, or --dry-run to see the plan first",
@@ -1176,21 +1191,22 @@ fn cmd_import(
             plan.memories.len()
         );
     }
-    import_run(&ctx, &plan, mapping, done)
+    import_run(&ctx, &plan, mapping, &done)
 }
 
 /// Execute the plan top to bottom: one `gh issue create` per bead, its
-/// edges pointing at issues made earlier in this run, then Priority, Start
-/// date, assignee, comments, the close, and the card. The create is fatal
-/// (resuming is the mapping file's job); the rest warn and move on, since
-/// `board sync` and one edit repair them.
+/// edges pointing at issues made earlier (this run or a previous one, via
+/// the mapping file), then Priority, Start date, assignee, comments, the
+/// close, and the card. The mapping file records each bead as `created`,
+/// `commented`, and `done`, so a run killed anywhere resumes at the right
+/// step without duplicating anything. The create is fatal; every later
+/// step warns and moves on, since `board sync` and one edit repair them.
 fn import_run(
     ctx: &Ctx,
     plan: &import::Plan,
     mapping: &Path,
-    done: BTreeMap<String, u64>,
+    done: &BTreeMap<String, import::Mapped>,
 ) -> Result<u8> {
-    let mut map = import::Mapping::open(mapping)?;
     // Without a board, In Progress and Deferred have nowhere to go and the
     // beads would land in `ready` as plain open issues.
     let Some(board) = ctx.board()? else {
@@ -1212,26 +1228,177 @@ fn import_run(
         .any(|i| i.start_date.is_some())
         .then(|| fields::start_date_field(org))
         .transpose()?;
+    let mut run = Run {
+        ctx,
+        board: &board,
+        priority: &priority,
+        start_date: start_date.as_ref(),
+        map: import::Mapping::open(mapping)?,
+        numbers: done.iter().map(|(b, m)| (b.clone(), m.number)).collect(),
+        warnings: Vec::new(),
+        created: Vec::new(),
+        closed_ok: 0,
+        finished: 0,
+        open_beads: BTreeSet::new(),
+    };
     let total = plan.items.len();
-    // Bead → issue number, seeded from the mapping file: edges resolve
-    // against it and mentions in bodies are rewritten from it.
-    let mut numbers = done;
-    let mut created = Vec::new();
-    let mut closed_ok = 0usize;
-    let mut warnings: Vec<String> = Vec::new();
-    for (n, item) in plan.items.iter().enumerate() {
-        if let Some(number) = numbers.get(&item.bead) {
-            if !ctx.json {
-                println!(
-                    "{:>5}/{total}  {} = #{number}  (already imported)",
-                    n + 1,
-                    item.bead
-                );
+    let outcome = run.execute(plan, done, total);
+    // Memories: key/value onto the memories issue, last write wins. Only on
+    // a run that got through the issues.
+    let mut memories = json!(null);
+    if outcome.is_ok() && !plan.memories.is_empty() {
+        match memories_for_import(ctx, &plan.memories) {
+            Ok((issue, added, updated)) => {
+                memories = json!({ "issue": issue, "added": added, "updated": updated });
             }
-            continue;
+            Err(err) => run.warnings.push(format!("memories not imported: {err:#}")),
         }
+    }
+    for w in &run.warnings {
+        eprintln!("warning: {w}");
+    }
+    // The report goes out even when a create failed: what exists, what
+    // went wrong, and where to resume from.
+    let error = outcome.as_ref().err().map(|e| format!("{e:#}"));
+    let dropped = plan.skipped.len();
+    let resumed = plan.already_imported.len();
+    ctx.emit(
+        &json!({
+            "created": run.created, "already_imported": plan.already_imported,
+            "finished": plan.partially_imported, "mapping": run.map.path(),
+            "memories": memories, "warnings": run.warnings, "error": error,
+            "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
+        }),
+        || {
+            let mem = match &memories {
+                serde_json::Value::Null => String::new(),
+                m => format!(
+                    "; memories: {} new, {} updated on #{}",
+                    m["added"], m["updated"], m["issue"]
+                ),
+            };
+            let mut tail = format!("{} closed", run.closed_ok);
+            if run.finished > 0 {
+                let _ = write!(tail, ", {} finished from an earlier run", run.finished);
+            }
+            if resumed > 0 {
+                let _ = write!(tail, ", {resumed} already imported");
+            }
+            let warnings = format!(
+                "{} warning{}",
+                run.warnings.len(),
+                if run.warnings.len() == 1 { "" } else { "s" }
+            );
+            let path = run.map.path().display();
+            match &error {
+                Some(e) => format!(
+                    "\nstopped: {e}\nimported {} of {total} issues before that ({tail}); {warnings}\nmapping: {path} (run gbd import again to resume)",
+                    run.created.len()
+                ),
+                None => format!(
+                    "\nimported {} issues ({tail}){mem}; {warnings}; {dropped} could not map (listed above)\nmapping: {path} (bead → issue; keep it to resolve old references)",
+                    total - resumed
+                ),
+            }
+        },
+    );
+    outcome.map(|()| 0)
+}
+
+/// State of one `gbd import --yes` run.
+struct Run<'a> {
+    ctx: &'a Ctx,
+    board: &'a Board,
+    priority: &'a fields::IssueField,
+    start_date: Option<&'a fields::IssueField>,
+    map: import::Mapping,
+    /// Bead → issue number, seeded from the mapping file: edges resolve
+    /// against it and mentions in bodies are rewritten from it.
+    numbers: BTreeMap<String, u64>,
+    warnings: Vec<String>,
+    created: Vec<Value>,
+    closed_ok: usize,
+    finished: usize,
+    /// Beads that are open on GitHub after this run touched or skipped
+    /// them. Cards are placed against this, not against the plan.
+    open_beads: BTreeSet<String>,
+}
+
+impl Run<'_> {
+    /// The loop over the plan. Stops at the first failed create.
+    fn execute(
+        &mut self,
+        plan: &import::Plan,
+        done: &BTreeMap<String, import::Mapped>,
+        total: usize,
+    ) -> Result<()> {
+        for (n, item) in plan.items.iter().enumerate() {
+            let progress = |what: String| {
+                if !self.ctx.json {
+                    println!("{:>5}/{total}  {} {what}", n + 1, item.bead);
+                }
+            };
+            let (number, url, from) = match done.get(&item.bead) {
+                Some(m) if m.phase == import::Phase::Done => {
+                    progress(format!("= #{}  (already imported)", m.number));
+                    if matches!(item.state, import::State::Open) {
+                        self.open_beads.insert(item.bead.clone());
+                    }
+                    continue;
+                }
+                Some(m) => {
+                    progress(format!("= #{}  (finishing)", m.number));
+                    self.finished += 1;
+                    (m.number, m.url.clone(), m.phase)
+                }
+                None => {
+                    let (number, url) = self.create(item, n, total)?;
+                    (number, url, import::Phase::Created)
+                }
+            };
+            let state = self.finish(item, number, &url, from)?;
+            let closed = if matches!(state, import::State::Closed { .. }) {
+                "  ✓"
+            } else {
+                ""
+            };
+            progress(format!(
+                "→ #{number}  [{}] {}{closed}",
+                item.issue_type, item.title
+            ));
+        }
+        Ok(())
+    }
+
+    /// One mapping line. Its failure is fatal and says exactly what to
+    /// add by hand, since the issue exists whether or not the file does.
+    fn record(
+        &mut self,
+        item: &import::Item,
+        number: u64,
+        url: &str,
+        phase: import::Phase,
+    ) -> Result<()> {
+        let m = import::Mapped {
+            bead: item.bead.clone(),
+            number,
+            url: url.to_string(),
+            phase,
+        };
+        self.map.record(&m).with_context(|| {
+            format!(
+                "{} is #{number} ({url}) but could not be recorded in {}. Add this line to the file before resuming:\n{}",
+                item.bead,
+                self.map.path().display(),
+                serde_json::to_string(&m).unwrap_or_default()
+            )
+        })
+    }
+
+    /// `gh issue create` with the edges resolved through `numbers`.
+    fn create(&mut self, item: &import::Item, n: usize, total: usize) -> Result<(u64, String)> {
         let edge = |bead: &str| {
-            numbers
+            self.numbers
                 .get(bead)
                 .copied()
                 .with_context(|| format!("{}: {bead} was not created before it", item.bead))
@@ -1242,9 +1409,9 @@ fn import_run(
             .iter()
             .map(|b| edge(b))
             .collect::<Result<_>>()?;
-        let body = import::rewrite_ids(&item.body, &numbers);
+        let body = import::rewrite_ids(&item.body, &self.numbers);
         let (number, url) = create_issue(
-            ctx,
+            self.ctx,
             &NewIssue {
                 title: &item.title,
                 body: &body,
@@ -1255,135 +1422,118 @@ fn import_run(
             },
         )
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
-        // Recorded before anything else touches the issue: if the next
-        // step dies, the next run still knows this bead exists.
-        map.record(&import::Mapped {
-            bead: item.bead.clone(),
-            number,
-            url: url.clone(),
-        })?;
-        numbers.insert(item.bead.clone(), number);
-        let t = ctx.target(&number.to_string())?;
-        let mut warn = |what: String| warnings.push(format!("{} (#{number}): {what}", item.bead));
+        self.record(item, number, &url, import::Phase::Created)?;
+        self.numbers.insert(item.bead.clone(), number);
+        Ok((number, url))
+    }
+
+    /// Everything after the create, from `from` onwards. Returns the state
+    /// the issue actually ended in.
+    fn finish(
+        &mut self,
+        item: &import::Item,
+        number: u64,
+        url: &str,
+        from: import::Phase,
+    ) -> Result<import::State> {
+        let t = self.ctx.target(&number.to_string())?;
+        let mut warnings = Vec::new();
+        let warn = |warnings: &mut Vec<String>, what: String| {
+            warnings.push(format!("{} (#{number}): {what}", item.bead));
+        };
         if let Err(err) = fields::option_name(item.priority)
-            .and_then(|p| fields::write_value(&ctx.repo, number, priority.id, p))
+            .and_then(|p| fields::write_value(&self.ctx.repo, number, self.priority.id, p))
         {
-            warn(format!("Priority not set: {err:#}"));
+            warn(&mut warnings, format!("Priority not set: {err:#}"));
         }
-        if let (Some(d), Some(field)) = (&item.start_date, &start_date) {
-            if let Err(err) = fields::write_value(&ctx.repo, number, field.id, d) {
-                warn(format!("Start date not set: {err:#}"));
+        if let (Some(d), Some(field)) = (&item.start_date, self.start_date) {
+            if let Err(err) = fields::write_value(&self.ctx.repo, number, field.id, d) {
+                warn(&mut warnings, format!("Start date not set: {err:#}"));
             }
         }
         if let Some(login) = &item.assignee {
             if let Err(err) = t.edit(&["--add-assignee", login]) {
-                warn(format!("assignee {login} not set: {err:#}"));
+                warn(&mut warnings, format!("assignee {login} not set: {err:#}"));
             }
         }
-        for body in &item.comments {
-            let n = number.to_string();
-            let body = import::rewrite_ids(body, &numbers);
-            if let Err(err) = gh::run_stdin(
-                &[
+        // Comments are the one step that is not idempotent, hence the
+        // `commented` phase right after them.
+        if from == import::Phase::Created {
+            for body in &item.comments {
+                let n = number.to_string();
+                let body = import::rewrite_ids(body, &self.numbers);
+                let args = [
                     "issue",
                     "comment",
                     &n,
                     "-R",
-                    &ctx.repo.name_with_owner,
+                    &self.ctx.repo.name_with_owner,
                     "--body-file",
                     "-",
-                ],
-                body.as_bytes(),
-            ) {
-                warn(format!("comment not added: {err:#}"));
+                ];
+                if let Err(err) = gh::run_stdin(&args, body.as_bytes()) {
+                    warn(&mut warnings, format!("comment not added: {err:#}"));
+                }
             }
+            self.warnings.append(&mut warnings);
+            self.record(item, number, url, import::Phase::Commented)?;
         }
         // What actually happened, not what was planned: a close that failed
-        // leaves the issue open, so the card is left alone rather than Done.
+        // leaves the issue open, so the card is left alone rather than Done,
+        // and a card that says Ready or Blocked follows the blockers' real
+        // state (a blocker whose close failed still blocks).
         let mut state = item.state.clone();
-        let mut status = Some(item.status);
         if let import::State::Closed { reason } = item.state {
             if let Err(err) = t.gh_issue("close", &["--reason", reason.as_flag()]) {
-                warn(format!(
-                    "not closed: {err:#}. Close it by hand, then: gbd board sync"
-                ));
+                warn(
+                    &mut warnings,
+                    format!("not closed: {err:#}. Run gbd import again to retry"),
+                );
                 state = import::State::Open;
+            }
+        }
+        if matches!(state, import::State::Open) {
+            self.open_beads.insert(item.bead.clone());
+        }
+        let mut status = match (&state, &item.state, item.status) {
+            (import::State::Closed { .. }, _, _) => Some(project::STATUS_DONE),
+            // The close failed: the issue is open, so no card rather than Done.
+            (import::State::Open, import::State::Closed { .. }, _) => None,
+            (import::State::Open, _, project::STATUS_READY | project::STATUS_BLOCKED) => {
+                let blocked = item.blocked_by.iter().any(|b| self.open_beads.contains(b));
+                Some(if blocked {
+                    project::STATUS_BLOCKED
+                } else {
+                    project::STATUS_READY
+                })
+            }
+            (import::State::Open, _, planned) => Some(planned),
+        };
+        if let Some(s) = status {
+            if let Err(err) = self.board.set_status(url, s) {
+                warn(
+                    &mut warnings,
+                    format!("card not set to {s}: {err:#}. Run gbd import again to retry"),
+                );
                 status = None;
             }
         }
-        if let Some(s) = status {
-            if let Err(err) = board.set_status(&url, s) {
-                warn(format!("card not set to {s}: {err:#}. Run: gbd board sync"));
-                status = None;
-            }
+        // Done only when everything after the comments went through; else the
+        // phase stays at commented and the next run replays these steps.
+        let clean = warnings.is_empty();
+        self.warnings.append(&mut warnings);
+        if clean {
+            self.record(item, number, url, import::Phase::Done)?;
         }
         if matches!(state, import::State::Closed { .. }) {
-            closed_ok += 1;
+            self.closed_ok += 1;
         }
-        if !ctx.json {
-            let closed = if matches!(state, import::State::Closed { .. }) {
-                "  ✓"
-            } else {
-                ""
-            };
-            println!(
-                "{:>5}/{total}  {} → #{number}  [{}] {}{closed}",
-                n + 1,
-                item.bead,
-                item.issue_type,
-                item.title
-            );
-        }
-        created.push(json!({
+        self.created.push(json!({
             "bead": item.bead, "number": number, "url": url,
             "state": state, "status": status,
         }));
+        Ok(state)
     }
-    // Memories: key/value onto the memories issue, last write wins.
-    let mut memories = json!(null);
-    if !plan.memories.is_empty() {
-        match memories_for_import(ctx, &plan.memories) {
-            Ok((issue, added, updated)) => {
-                memories = json!({ "issue": issue, "added": added, "updated": updated });
-            }
-            Err(err) => warnings.push(format!("memories not imported: {err:#}")),
-        }
-    }
-    for w in &warnings {
-        eprintln!("warning: {w}");
-    }
-    let dropped = plan.skipped.len();
-    let resumed = plan.already_imported.len();
-    ctx.emit(
-        &json!({
-            "created": created, "already_imported": plan.already_imported, "mapping": map.path(),
-            "memories": memories, "warnings": warnings,
-            "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
-        }),
-        || {
-            let closed = closed_ok;
-            let mem = match &memories {
-                serde_json::Value::Null => String::new(),
-                m => format!(
-                    "; memories: {} new, {} updated on #{}",
-                    m["added"], m["updated"], m["issue"]
-                ),
-            };
-            let skipped = if resumed == 0 {
-                String::new()
-            } else {
-                format!(", {resumed} already imported")
-            };
-            format!(
-                "\nimported {} issues ({closed} closed{skipped}){mem}; {} warning{}; {dropped} could not map (listed above)\nmapping: {} (bead → issue; keep it to resolve old references)",
-                total - resumed,
-                warnings.len(),
-                if warnings.len() == 1 { "" } else { "s" },
-                map.path().display()
-            )
-        },
-    );
-    Ok(0)
 }
 
 /// Upsert every `_type: memory` line into the memories issue.
