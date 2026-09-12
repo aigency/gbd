@@ -81,3 +81,28 @@ fn checked_in_agent_files_match_init_constants() {
         );
     }
 }
+
+/// The installer verifies against the same key cargo binstall uses.
+#[test]
+fn installer_pubkey_matches_cargo_toml() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let key = |text: &str, prefix: &str| -> String {
+        text.lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix(prefix)
+                    .map(|r| r.trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| panic!("no line starting with {prefix:?}"))
+    };
+    let cargo = key(
+        &std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        "pubkey = ",
+    );
+    let script = key(
+        &std::fs::read_to_string(root.join("scripts/install.sh")).unwrap(),
+        "SIGNING_PUBKEY=",
+    );
+    assert_eq!(cargo, script);
+    assert!(cargo.starts_with("RW") && cargo.len() > 50, "{cargo}");
+}

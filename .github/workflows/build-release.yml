@@ -1,0 +1,298 @@
+name: build-release
+
+# Stage two of a release. `release.yml` (stage one) bumps the version,
+# commits, tags, pushes, and then dispatches THIS workflow on the tag.
+#
+# Why a second workflow: the attestation each build job produces records
+# the run's `github.sha`. A push-to-main run's sha is the merge commit that
+# triggered it, but the tarballs are built from the release commit the
+# version job creates on top of it (the same commit `gbd --version` embeds).
+# Running the build as its own workflow_dispatch run ON the tag makes
+# `github.sha` the release commit, so the attestation, the binary, and the
+# tag all agree. workflow_dispatch is GitHub's documented exception to the
+# rule that GITHUB_TOKEN-caused events do not start workflows.
+#
+# Re-run a failed or missing build for an existing tag by hand:
+#   gh workflow run build-release.yml --ref vX.Y.Z -f tag=vX.Y.Z
+# The release job creates the GitHub Release or updates its assets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (vX.Y.Z); must match the ref this run is on'
+        type: string
+        required: true
+
+# One group for every tag: stage one already serializes releases by
+# waiting on this run, and this keeps manual re-dispatches from overlapping
+# with an in-flight release. Never cancel: a half-published release is
+# worse than a queued one.
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # Refuse to build if the dispatch ref and the tag input disagree; the
+  # attestation would otherwise describe a different commit than the input.
+  check:
+    name: check tag
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          TAG: ${{ inputs.tag }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/tags/$TAG" ]; then
+            echo "this run is on $REF but was asked to build $TAG; dispatch with --ref $TAG" >&2
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [check]
+    runs-on: ${{ matrix.runner }}
+    # id-token + attestations: sign a build-provenance statement for each
+    # tarball with the workflow's own identity (verify with
+    # `gh attestation verify <file> --repo aigency/gbd`). No key to manage.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+        # x86_64-apple-darwin is intentionally NOT in the matrix. macos-13
+        # x86_64 runners have unbounded GitHub queue waits and the Intel-Mac
+        # install base is small. Intel Mac users build from source via
+        # `cargo install --locked gbd`;
+        # the curl installer surfaces this fallback on Darwin x86_64.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Configure mold as the Linux linker
+        if: runner.os == 'Linux'
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+
+      # `release-ci` is a `release`-derived profile in Cargo.toml that bumps
+      # codegen-units 1→16 for compile-time parallelism.
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --profile release-ci --locked --target "$TARGET"
+
+      - name: Strip binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: strip "target/$TARGET/release-ci/gbd"
+
+      - name: Package tarball + sha256
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          TARBALL="gbd-${TAG}-${TARGET}.tar.gz"
+          tar czf "${TARBALL}" -C "target/${TARGET}/release-ci" gbd
+          shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: gbd-${{ inputs.tag }}-${{ matrix.target }}.tar.gz
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ inputs.tag }}-${{ matrix.target }}
+          path: |
+            gbd-${{ inputs.tag }}-${{ matrix.target }}.tar.gz
+            gbd-${{ inputs.tag }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: smoke (ubuntu)
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-${{ inputs.tag }}-x86_64-unknown-linux-gnu
+          path: dist/
+          merge-multiple: true
+
+      - name: Smoke-test the Linux x86_64 binary
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TARBALL="dist/gbd-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf "$TARBALL" -C /tmp
+          BIN=/tmp/gbd
+          chmod +x "$BIN"
+          "$BIN" --version
+          "$BIN" ping
+
+  release:
+    name: release
+    needs: [build, smoke]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        working-directory: dist
+        run: |
+          cat gbd-*.tar.gz.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      # minisign: one `.sig` per tarball (what cargo binstall verifies against
+      # the pubkey in Cargo.toml) and SHA256SUMS.minisig (what install.sh
+      # verifies). The key is the MINISIGN_KEY secret; the pubkey is read from
+      # Cargo.toml at this tag and every signature is verified against it
+      # before upload, so a wrong secret fails here rather than at install time.
+      - name: Sign release assets (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MINISIGN_KEY" ]; then
+            echo "MINISIGN_KEY is not set; Cargo.toml declares a pubkey, so an unsigned release would be uninstallable with cargo binstall" >&2
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign >/dev/null
+          KEY="$RUNNER_TEMP/minisign.key"
+          umask 077
+          printf '%s\n' "$MINISIGN_KEY" > "$KEY"
+          PUBKEY=$(sed -n 's/^pubkey = "\(.*\)"/\1/p' Cargo.toml)
+          for f in dist/gbd-*.tar.gz dist/SHA256SUMS; do
+            case "$f" in
+              *.tar.gz) sig="$f.sig" ;;
+              *)        sig="$f.minisig" ;;
+            esac
+            minisign -S -W -s "$KEY" -x "$sig" -m "$f"
+            minisign -V -q -P "$PUBKEY" -x "$sig" -m "$f"
+            echo "signed and verified: $f"
+          done
+          rm -f "$KEY"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Notes must span since the last PUBLISHED release, not the last
+          # tag: if a build leg failed after `version` pushed a tag, that
+          # tag exists but has no release.
+          PREV=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // empty' || true)
+          if [ -n "$PREV" ]; then
+            git cliff "${PREV}..${TAG}" --tag "$TAG" -o RELEASE_NOTES.md
+          else
+            git cliff --latest --tag "$TAG" -o RELEASE_NOTES.md
+          fi
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              dist/gbd-*.tar.gz \
+              dist/gbd-*.tar.gz.sig \
+              dist/SHA256SUMS \
+              dist/SHA256SUMS.minisig \
+              --clobber
+          else
+            gh release create "$TAG" \
+              dist/gbd-*.tar.gz \
+              dist/gbd-*.tar.gz.sig \
+              dist/SHA256SUMS \
+              dist/SHA256SUMS.minisig \
+              --title "$TAG" \
+              --notes-file RELEASE_NOTES.md
+          fi
+
+  # Runs only when CARGO_REGISTRY_TOKEN is set (a secret cannot be read in
+  # `if:` directly, so it is routed through env). The first publish of a new
+  # crate must be done by a human with `cargo publish`; after that this
+  # keeps crates.io in step with GitHub Releases so `cargo binstall gbd`
+  # and `cargo install gbd` resolve.
+  publish:
+    name: crates.io
+    needs: [release]
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Read pinned toolchain
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - name: Publish
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked
+      - name: Skipped
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: echo "CARGO_REGISTRY_TOKEN is not set; not publishing to crates.io"

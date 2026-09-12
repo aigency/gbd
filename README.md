@@ -39,6 +39,24 @@ Both download the release tarball for your OS and architecture (linux x86_64/arm
 
 `gbd --version` prints the crate version and the git commit it was built from, e.g. `gbd 1.0.0 (1a2b3c4)`, so you can tell a release from a local build.
 
+### Verifying a download
+
+Every release asset is signed with [minisign](https://jedisct1.github.io/minisign/) and carries a GitHub build-provenance attestation.
+
+- `cargo binstall` verifies the tarball's `.sig` against the public key in `Cargo.toml` automatically and refuses a mismatch.
+- `install.sh` verifies `SHA256SUMS.minisig` when `minisign` is installed, then the tarball's checksum.
+- By hand, the public key is `RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4`:
+
+```bash
+minisign -V -P RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4 -x gbd-v1.1.0-aarch64-apple-darwin.tar.gz.sig -m gbd-v1.1.0-aarch64-apple-darwin.tar.gz
+```
+
+```bash
+gh attestation verify gbd-v1.1.0-aarch64-apple-darwin.tar.gz --repo aigency/gbd
+```
+
+The attestation proves the file was built by this repository's release workflow at a specific commit; the signature proves it was published with this project's key. Releases before 1.1.0 have neither.
+
 ## Quick start
 
 Once per repository, as an org owner (see [Organization setup](#organization-setup) for what that means):
@@ -235,7 +253,7 @@ The toolchain is pinned in `rust-toolchain.toml` and CI reads it, so local clipp
 
 Tests never touch the network: `tests/fake_gh/gh` is a fake `gh` on `PATH` that answers from fixtures and logs every invocation, so tests assert what `gbd` asks `gh` for (one GraphQL call, no `--label`, the exact field-value body on stdin), not only what it prints. `tests/fixtures/snapshot.json` is a captured live response, so the parser is tested against GitHub's real shape.
 
-Releases are cut on merge to `main` by `.github/workflows/release.yml`: conventional-commit PR titles decide the semver bump (`feat:` minor, `fix:` patch, `!`/`BREAKING CHANGE` major), then tarballs for linux x86_64/arm64 and macOS arm64 plus `SHA256SUMS` go on a GitHub Release.
+Releases are cut on merge to `main` in two stages. `release.yml` decides the semver bump from conventional-commit PR titles (`feat:` minor, `fix:` patch, `!`/`BREAKING CHANGE` major), commits and tags the version, and dispatches `build-release.yml` on that tag. That second run builds tarballs for linux x86_64/arm64 and macOS arm64, signs them and `SHA256SUMS` with minisign, attests build provenance, and publishes the GitHub Release and the crate. Running the build on the tag is what makes the attestation name the same commit `gbd --version` prints.
 
 ### Contributing
 
