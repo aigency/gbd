@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::beads::{Bead, Export, Kind, Status};
+use crate::beads::{self, Bead, Export, Kind, Status};
 use crate::project;
 
 /// GitHub's three close reasons, chosen from Beads' free-text
@@ -109,7 +109,8 @@ pub struct Skip {
 #[derive(Debug, Clone, Serialize)]
 pub struct Plan {
     pub items: Vec<Item>,
-    pub memories: usize,
+    /// Every `bd remember` line, to be upserted onto the memories issue.
+    pub memories: Vec<beads::Memory>,
     /// Groups of beads whose edges form a cycle. They are still created,
     /// at the end, with the edges that close the cycle dropped.
     pub cycles: Vec<Vec<String>>,
@@ -235,9 +236,10 @@ fn comments_of(b: &Bead) -> Vec<String> {
 fn board_status(b: &Bead, open_blocker: bool) -> &'static str {
     match b.status {
         Status::Closed => project::STATUS_DONE,
-        Status::InProgress => project::STATUS_IN_PROGRESS,
+        // A date wins over in_progress: deferred work is not being worked.
         Status::Deferred => project::STATUS_DEFERRED,
         _ if b.defer_until.is_some() => project::STATUS_DEFERRED,
+        Status::InProgress => project::STATUS_IN_PROGRESS,
         _ if open_blocker => project::STATUS_BLOCKED,
         _ => project::STATUS_READY,
     }
@@ -483,9 +485,21 @@ pub fn plan(export: &Export) -> Plan {
         });
         done.insert(&b.id);
     }
+    let mut seen_keys = BTreeSet::new();
+    for m in &export.memories {
+        if !seen_keys.insert(m.key.as_str()) {
+            skipped.push(Skip {
+                bead: "memory".into(),
+                what: format!(
+                    "key {:?} appears more than once; the last value wins",
+                    m.key
+                ),
+            });
+        }
+    }
     Plan {
         items,
-        memories: export.memories.len(),
+        memories: export.memories.clone(),
         cycles: cycle_groups,
         skipped,
         problems: export.problems.iter().map(ToString::to_string).collect(),
@@ -500,7 +514,7 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
     let mut out = format!(
         "Import plan: {} issues, {} memories, from {source}\n\n",
         p.items.len(),
-        p.memories
+        p.memories.len()
     );
     let count = |f: &dyn Fn(&Item) -> String| -> BTreeMap<String, usize> {
         let mut m = BTreeMap::new();
@@ -578,6 +592,15 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
             p.items.len() - order_lines
         );
     }
+    if !p.memories.is_empty() {
+        let keys: Vec<&str> = p.memories.iter().map(|m| m.key.as_str()).collect();
+        let _ = writeln!(
+            out,
+            "\nMemories ({}), upserted by key: {}",
+            keys.len(),
+            keys.join(" ")
+        );
+    }
     if !p.cycles.is_empty() {
         let _ = writeln!(
             out,
@@ -630,7 +653,8 @@ mod tests {
     fn everything_is_planned_in_dependency_order() {
         let p = fixture();
         assert_eq!(p.items.len(), 8);
-        assert_eq!(p.memories, 1);
+        assert_eq!(p.memories.len(), 1);
+        assert_eq!(p.memories[0].key, "deploy-runbook");
         assert!(pos(&p, "wx-1") < pos(&p, "wx-1.1"), "parent first");
         assert!(pos(&p, "wx-2") < pos(&p, "wx-1.1"), "blocker first");
         assert!(pos(&p, "wx-1") < pos(&p, "wx-6"));
@@ -799,6 +823,29 @@ mod tests {
             p.skipped
         );
         assert!(render(&p, "x", 5).contains("Dependency cycles (1)"));
+    }
+
+    #[test]
+    fn a_defer_date_beats_in_progress_and_memories_ride_along() {
+        let line = "{\"id\":\"d-1\",\"title\":\"later\",\"issue_type\":\"task\",\"status\":\"in_progress\",\"priority\":2,\"assignee\":\"dev1\",\"created_at\":\"t\",\"defer_until\":\"2027-01-01T00:00:00Z\"}\n\
+                    {\"_type\":\"memory\",\"key\":\"k\",\"value\":\"one\"}\n{\"_type\":\"memory\",\"key\":\"k\",\"value\":\"two\"}\n";
+        let e = beads::parse(line.as_bytes()).unwrap();
+        let p = plan(&e);
+        assert_eq!(item(&p, "d-1").status, project::STATUS_DEFERRED);
+        assert_eq!(item(&p, "d-1").start_date.as_deref(), Some("2027-01-01"));
+        assert_eq!(
+            p.memories.len(),
+            2,
+            "both kept; the upsert makes the last one win"
+        );
+        assert!(
+            p.skipped
+                .iter()
+                .any(|s| s.bead == "memory" && s.what.contains("appears more than once")),
+            "{:?}",
+            p.skipped
+        );
+        assert!(render(&p, "x", 5).contains("Memories (2), upserted by key: k k"));
     }
 
     #[test]
