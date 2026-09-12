@@ -1922,8 +1922,8 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
         "{calls}"
     );
     assert!(
-        calls.contains("--title Rename the endpoints --body Child of the epic."),
-        "{calls}"
+        calls.contains("--title Rename the endpoints --body Child of the epic; see #102 and wx-9."),
+        "a mention of a bead created earlier in the run is rewritten; an unknown one is kept: {calls}"
     );
     assert!(
         calls.contains("--type Task --parent 101 --blocked-by 102"),
@@ -2059,4 +2059,80 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
         "an open issue is never marked Done: {calls}"
     );
     assert!(!calls.contains("✓"), "{calls}");
+}
+
+#[test]
+fn import_resumes_from_the_mapping_file() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // A previous run got through wx-1 and died.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+
+    // The dry run says what will be skipped.
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Already imported (1), skipped: wx-1",
+        ));
+
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1/3  wx-1 = #101  (already imported)\n",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 already imported)",
+        ))
+        .stdout(predicate::str::contains("mapping: beads-map.jsonl"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("--title Widget API v2"),
+        "wx-1 is not created twice: {calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "edges resolve through the mapping: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let lines: Vec<&str> = map.lines().collect();
+    assert_eq!(lines.len(), 3, "{map}");
+    assert!(
+        lines[1].contains("\"bead\":\"wx-2\"") && lines[1].contains("\"number\":102"),
+        "{map}"
+    );
+    assert!(
+        lines[2].contains("\"bead\":\"wx-1.1\"") && lines[2].contains("\"number\":103"),
+        "{map}"
+    );
 }

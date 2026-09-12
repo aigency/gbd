@@ -10,8 +10,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::beads::{self, Bead, Export, Kind, Status};
 use crate::project;
@@ -117,6 +120,9 @@ pub struct Plan {
     pub skipped: Vec<Skip>,
     /// Parse-time problems, rendered.
     pub problems: Vec<String>,
+    /// Beads the mapping file already has; the run skips them.
+    #[serde(default)]
+    pub already_imported: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +509,100 @@ pub fn plan(export: &Export) -> Plan {
         cycles: cycle_groups,
         skipped,
         problems: export.problems.iter().map(ToString::to_string).collect(),
+        already_imported: Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The mapping file
+
+/// One line of the mapping file: which issue a bead became.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mapped {
+    pub bead: String,
+    pub number: u64,
+    pub url: String,
+}
+
+/// `bead → number` from an existing mapping file; absent means empty.
+pub fn read_mapping(path: &Path) -> Result<BTreeMap<String, u64>> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    let mut map = BTreeMap::new();
+    for (idx, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let m: Mapped = serde_json::from_str(&line)
+            .with_context(|| format!("{}:{}: not a mapping line", path.display(), idx + 1))?;
+        map.insert(m.bead, m.number);
+    }
+    Ok(map)
+}
+
+/// Append-only, flushed per line: a run killed halfway loses nothing, and
+/// the next run resumes from it.
+pub struct Mapping {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl Mapping {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("opening {} for writing", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn record(&mut self, m: &Mapped) -> Result<()> {
+        let line = serde_json::to_string(m).context("encoding mapping line")?;
+        writeln!(self.file, "{line}")
+            .and_then(|()| self.file.flush())
+            .with_context(|| format!("writing {}", self.path.display()))
+    }
+}
+
+/// `wx-12` → `#101` for every mention whose target is in `known`. A token
+/// is a maximal run of id characters; trailing dots are punctuation; a
+/// token wrapped in backticks (the import footer) is left alone, and so is
+/// anything not in `known`.
+pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
+    fn id_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(id_char) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(|c: char| !id_char(c)).unwrap_or(rest.len());
+        let token = &rest[..end];
+        let core = token.trim_end_matches('.');
+        let fenced = out.ends_with('`') && rest[end..].starts_with('`');
+        match known.get(core) {
+            Some(n) if !fenced => {
+                let _ = write!(out, "#{n}{}", &token[core.len()..]);
+            }
+            _ => out.push_str(token),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +724,14 @@ pub fn render_diagnostics(p: &Plan) -> String {
         for s in &p.skipped {
             let _ = writeln!(out, "  {}: {}", s.bead, s.what);
         }
+    }
+    if !p.already_imported.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nAlready imported ({}), skipped: {}",
+            p.already_imported.len(),
+            p.already_imported.join(" ")
+        );
     }
     if !p.problems.is_empty() {
         let _ = writeln!(out, "\nExport problems ({}):", p.problems.len());
@@ -854,6 +961,67 @@ mod tests {
             p.skipped
         );
         assert!(render(&p, "x", 5).contains("Memories (2), upserted by key: k k"));
+    }
+
+    #[test]
+    fn ids_are_rewritten_only_when_known_and_not_in_the_footer() {
+        let known: BTreeMap<String, u64> = [("wx-2".to_string(), 102), ("wx-1.1".to_string(), 103)]
+            .into_iter()
+            .collect();
+        assert_eq!(rewrite_ids("see wx-2.", &known), "see #102.");
+        assert_eq!(
+            rewrite_ids("(wx-2) and wx-1.1, then wx-9", &known),
+            "(#102) and #103, then wx-9"
+        );
+        assert_eq!(
+            rewrite_ids("wx-20 is not wx-2", &known),
+            "wx-20 is not #102"
+        );
+        assert_eq!(
+            rewrite_ids("Imported from Beads `wx-2` (x).", &known),
+            "Imported from Beads `wx-2` (x)."
+        );
+        assert_eq!(rewrite_ids("", &known), "");
+        assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
+    }
+
+    #[test]
+    fn the_mapping_file_appends_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.jsonl");
+        assert!(read_mapping(&path).unwrap().is_empty(), "absent is empty");
+        let mut m = Mapping::open(&path).unwrap();
+        m.record(&Mapped {
+            bead: "a-1".into(),
+            number: 7,
+            url: "u".into(),
+        })
+        .unwrap();
+        m.record(&Mapped {
+            bead: "a-2".into(),
+            number: 8,
+            url: "v".into(),
+        })
+        .unwrap();
+        drop(m);
+        let mut again = Mapping::open(&path).unwrap();
+        again
+            .record(&Mapped {
+                bead: "a-3".into(),
+                number: 9,
+                url: "w".into(),
+            })
+            .unwrap();
+        let map = read_mapping(&path).unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["a-3"], 9);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+        std::fs::write(&path, "{\"bead\":1}\n").unwrap();
+        let err = read_mapping(&path).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(":1: not a mapping line"),
+            "{err:#}"
+        );
     }
 
     #[test]

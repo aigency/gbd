@@ -225,6 +225,10 @@ pub enum Commands {
         /// Create the issues. One shot, not a sync: run it once per tracker.
         #[arg(long)]
         yes: bool,
+        /// Where each bead → issue pair is recorded as it happens; an
+        /// existing file resumes the run and drives id rewriting
+        #[arg(long, value_name = "FILE", default_value = "beads-map.jsonl")]
+        mapping: PathBuf,
     },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
@@ -591,7 +595,8 @@ fn dispatch(cli: Cli) -> Result<u8> {
             from_beads,
             dry_run,
             yes,
-        } => cmd_import(explicit, json, &from_beads, dry_run, yes),
+            mapping,
+        } => cmd_import(explicit, json, &from_beads, dry_run, yes, &mapping),
         Commands::Ready {
             claim,
             explain,
@@ -1145,9 +1150,17 @@ fn cmd_import(
     from_beads: &Path,
     dry_run: bool,
     yes: bool,
+    mapping: &Path,
 ) -> Result<u8> {
     let export = beads::load(from_beads)?;
-    let plan = import::plan(&export);
+    let mut plan = import::plan(&export);
+    let done = import::read_mapping(mapping)?;
+    plan.already_imported = plan
+        .items
+        .iter()
+        .filter(|i| done.contains_key(&i.bead))
+        .map(|i| i.bead.clone())
+        .collect();
     let source = from_beads.display().to_string();
     if dry_run {
         // Local: no gh, no auth, no repo lookup.
@@ -1158,12 +1171,12 @@ fn cmd_import(
     if !yes {
         bail!(
             "this creates {} issues in {} and writes {} memories. Add --yes, or --dry-run to see the plan first",
-            plan.items.len(),
+            plan.items.len() - plan.already_imported.len(),
             ctx.repo.name_with_owner,
             plan.memories.len()
         );
     }
-    import_run(&ctx, &plan)
+    import_run(&ctx, &plan, mapping, done)
 }
 
 /// Execute the plan top to bottom: one `gh issue create` per bead, its
@@ -1171,7 +1184,13 @@ fn cmd_import(
 /// date, assignee, comments, the close, and the card. The create is fatal
 /// (resuming is the mapping file's job); the rest warn and move on, since
 /// `board sync` and one edit repair them.
-fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
+fn import_run(
+    ctx: &Ctx,
+    plan: &import::Plan,
+    mapping: &Path,
+    done: BTreeMap<String, u64>,
+) -> Result<u8> {
+    let mut map = import::Mapping::open(mapping)?;
     // Without a board, In Progress and Deferred have nowhere to go and the
     // beads would land in `ready` as plain open issues.
     let Some(board) = ctx.board()? else {
@@ -1194,11 +1213,23 @@ fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
         .then(|| fields::start_date_field(org))
         .transpose()?;
     let total = plan.items.len();
-    let mut numbers: BTreeMap<&str, u64> = BTreeMap::new();
+    // Bead → issue number, seeded from the mapping file: edges resolve
+    // against it and mentions in bodies are rewritten from it.
+    let mut numbers = done;
     let mut created = Vec::new();
     let mut closed_ok = 0usize;
     let mut warnings: Vec<String> = Vec::new();
     for (n, item) in plan.items.iter().enumerate() {
+        if let Some(number) = numbers.get(&item.bead) {
+            if !ctx.json {
+                println!(
+                    "{:>5}/{total}  {} = #{number}  (already imported)",
+                    n + 1,
+                    item.bead
+                );
+            }
+            continue;
+        }
         let edge = |bead: &str| {
             numbers
                 .get(bead)
@@ -1211,11 +1242,12 @@ fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
             .iter()
             .map(|b| edge(b))
             .collect::<Result<_>>()?;
+        let body = import::rewrite_ids(&item.body, &numbers);
         let (number, url) = create_issue(
             ctx,
             &NewIssue {
                 title: &item.title,
-                body: &item.body,
+                body: &body,
                 issue_type: item.issue_type,
                 parent,
                 blocked_by: &blocked_by,
@@ -1223,7 +1255,14 @@ fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
             },
         )
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
-        numbers.insert(&item.bead, number);
+        // Recorded before anything else touches the issue: if the next
+        // step dies, the next run still knows this bead exists.
+        map.record(&import::Mapped {
+            bead: item.bead.clone(),
+            number,
+            url: url.clone(),
+        })?;
+        numbers.insert(item.bead.clone(), number);
         let t = ctx.target(&number.to_string())?;
         let mut warn = |what: String| warnings.push(format!("{} (#{number}): {what}", item.bead));
         if let Err(err) = fields::option_name(item.priority)
@@ -1243,6 +1282,7 @@ fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
         }
         for body in &item.comments {
             let n = number.to_string();
+            let body = import::rewrite_ids(body, &numbers);
             if let Err(err) = gh::run_stdin(
                 &[
                     "issue",
@@ -1313,9 +1353,11 @@ fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
         eprintln!("warning: {w}");
     }
     let dropped = plan.skipped.len();
+    let resumed = plan.already_imported.len();
     ctx.emit(
         &json!({
-            "created": created, "memories": memories, "warnings": warnings,
+            "created": created, "already_imported": plan.already_imported, "mapping": map.path(),
+            "memories": memories, "warnings": warnings,
             "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
         }),
         || {
@@ -1327,10 +1369,17 @@ fn import_run(ctx: &Ctx, plan: &import::Plan) -> Result<u8> {
                     m["added"], m["updated"], m["issue"]
                 ),
             };
+            let skipped = if resumed == 0 {
+                String::new()
+            } else {
+                format!(", {resumed} already imported")
+            };
             format!(
-                "\nimported {total} issues ({closed} closed){mem}; {} warning{}; {dropped} could not map (listed above)",
+                "\nimported {} issues ({closed} closed{skipped}){mem}; {} warning{}; {dropped} could not map (listed above)\nmapping: {} (bead → issue; keep it to resolve old references)",
+                total - resumed,
                 warnings.len(),
-                if warnings.len() == 1 { "" } else { "s" }
+                if warnings.len() == 1 { "" } else { "s" },
+                map.path().display()
             )
         },
     );
