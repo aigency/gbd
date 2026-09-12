@@ -1966,14 +1966,45 @@ fn current_body(ctx: &Ctx, number: u64) -> Result<String> {
 
 /// The issue an earlier import made for `bead`, found by the footer its
 /// body carries ("Imported from Beads" followed by the id in backticks).
-/// Search narrows, the exact footer decides.
+/// The newest issues are read directly first, since the one a killed run
+/// just created is not in the search index yet; search covers the rest.
 fn find_imported(ctx: &Ctx, bead: &str) -> Result<Option<(u64, String)>> {
+    let footer = format!("Imported from Beads `{bead}`");
+    let pick = |found: &[Value]| -> Option<(u64, String)> {
+        found.iter().find_map(|i| {
+            let body = i.get("body").and_then(Value::as_str)?;
+            if !body.contains(&footer) {
+                return None;
+            }
+            Some((
+                i.get("number")?.as_u64()?,
+                i.get("url")?.as_str()?.to_string(),
+            ))
+        })
+    };
+    let repo = ctx.repo.name_with_owner.as_str();
+    let newest: Vec<Value> = gh::run_json(&[
+        "issue",
+        "list",
+        "-R",
+        repo,
+        "--state",
+        "all",
+        "--limit",
+        "20",
+        "--json",
+        "number,url,body",
+    ])
+    .with_context(|| format!("checking the newest issues for an unrecorded {bead}"))?;
+    if let Some(hit) = pick(&newest) {
+        return Ok(Some(hit));
+    }
     let query = format!("\"Imported from Beads {bead}\" in:body");
     let found: Vec<Value> = gh::run_json(&[
         "issue",
         "list",
         "-R",
-        &ctx.repo.name_with_owner,
+        repo,
         "--search",
         &query,
         "--state",
@@ -1984,17 +2015,7 @@ fn find_imported(ctx: &Ctx, bead: &str) -> Result<Option<(u64, String)>> {
         "number,url,body",
     ])
     .with_context(|| format!("checking GitHub for an unrecorded {bead}"))?;
-    let footer = format!("Imported from Beads `{bead}`");
-    Ok(found.iter().find_map(|i| {
-        let body = i.get("body").and_then(Value::as_str)?;
-        if !body.contains(&footer) {
-            return None;
-        }
-        Some((
-            i.get("number")?.as_u64()?,
-            i.get("url")?.as_str()?.to_string(),
-        ))
-    }))
+    Ok(pick(&found))
 }
 
 /// Upsert every `_type: memory` line into the memories issue.

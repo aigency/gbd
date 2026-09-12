@@ -412,7 +412,8 @@ fn board_fixtures(h: &Harness) {
          r#"{"id":"PVTI_12"}"#)
      .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "")
      // The importer's check for an issue an earlier run created but never recorded.
-     .on("no-unrecorded", "issue list -R acme/widgets --search", "[]");
+     .on("no-unrecorded", "issue list -R acme/widgets --search", "[]")
+     .on("no-newest", "issue list -R acme/widgets --state all --limit 20 --json number,url,body", "[]");
 }
 
 #[test]
@@ -2459,10 +2460,11 @@ fn import_adopts_an_issue_created_but_never_recorded() {
             {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
             {"id":7886557,"name":"Start date","data_type":"date"}]"#,
     )
+    // Just created, so not in the search index yet: it shows among the newest issues.
     .on(
-        "found-wx2",
-        "issue list -R acme/widgets --search \"Imported from Beads wx-2\" in:body",
-        r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."},{"number":101,"url":"https://github.com/acme/widgets/issues/101","body":"…Imported from Beads `wx-1`…"}]"#,
     )
     .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
     .on("values", "issue-field-values --input -", "{}")
@@ -2488,10 +2490,9 @@ fn import_adopts_an_issue_created_but_never_recorded() {
         !calls.contains("--title Auth refresh"),
         "not created twice: {calls}"
     );
-    assert_eq!(
-        calls.matches("issue list -R acme/widgets --search").count(),
-        1,
-        "one check per run: {calls}"
+    assert!(
+        !calls.contains("issue list -R acme/widgets --search"),
+        "found among the newest issues, no search needed: {calls}"
     );
     assert!(
         calls.contains("--type Task --parent 101 --blocked-by 102"),
