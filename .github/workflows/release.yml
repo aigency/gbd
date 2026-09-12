@@ -17,6 +17,16 @@ name: release
 # pre-bump merge commit. The release commit pushed back to `main` cannot
 # re-trigger this workflow: no loop.
 #
+# Pushing the release commit to a protected `main` needs a credential the
+# ruleset's bypass list covers. The workflow's own GITHUB_TOKEN is rejected
+# ("Changes must be made through the merge queue"), and GitHub Actions
+# cannot be added as a bypass actor unless it is an installed app. So the
+# version job pushes with RELEASE_TOKEN: a fine-grained personal access
+# token (Contents: read and write, this repository only) belonging to a
+# repository admin, which the ruleset's admin bypass already allows. The
+# release commit carries [skip ci] so that push does not start another
+# run of this workflow or of CI.
+#
 # First release: a repo with no `v*` tags treats the last version as v0.0.0,
 # so a `feat:` squash-merge becomes v0.1.0.
 
@@ -70,12 +80,16 @@ jobs:
       release: ${{ steps.compute.outputs.release }}
     steps:
       # Check out `main` (not github.sha): a queued run picks up release
-      # commits pushed by the run before it.
+      # commits pushed by the run before it. No credential is persisted:
+      # RELEASE_TOKEN can rewrite protected main, so it is handed to git
+      # only inside the push step, never left in the checkout for the tool
+      # installers or anything else in this job to read.
       - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Compute next version
         id: compute
@@ -126,6 +140,26 @@ jobs:
           echo "tag=v$NEXT" >> "$GITHUB_OUTPUT"
           echo "release=true" >> "$GITHUB_OUTPUT"
 
+      - name: Require RELEASE_TOKEN
+        if: steps.compute.outputs.release == 'true'
+        env:
+          HAVE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
+        run: |
+          if [ "$HAVE_TOKEN" != "true" ]; then
+            cat >&2 <<'MSG'
+          RELEASE_TOKEN is not set, so the release commit cannot be pushed to the
+          protected main branch (the workflow token is rejected by the ruleset).
+
+          Create a fine-grained personal access token as a repository admin:
+            Settings → Developer settings → Fine-grained tokens → Generate new token
+            Resource owner: the organization; Repository access: only this repo;
+            Permissions → Repository → Contents: Read and write.
+          Then: gh secret set RELEASE_TOKEN --repo <owner>/<repo>
+          and re-run this workflow (Actions → release → Run workflow).
+          MSG
+            exit 1
+          fi
+
       - name: Install cargo-edit
         if: steps.compute.outputs.release == 'true'
         uses: taiki-e/install-action@v2
@@ -167,14 +201,32 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock CHANGELOG.md
-          git commit -m "chore(release): $TAG"
+          # [skip ci]: this push must not start another release run or CI.
+          git commit -m "chore(release): $TAG [skip ci]"
           git tag "$TAG"
 
+      # The only step that can see RELEASE_TOKEN. The credential helper reads
+      # it from this step's environment, so it is never written to disk, to
+      # git config, or to a URL.
+      - name: Push release commit and tag
+        if: steps.compute.outputs.release == 'true'
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 \
+            && git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG is already on origin — nothing to push"
+            exit 0
+          fi
           # --atomic is load-bearing: without it, a raced push can PARTIALLY
           # succeed — main rejected as non-fast-forward while the tag still
           # lands — leaving a stray tag pointing at a commit that never
           # reached main.
-          git push --atomic origin main "$TAG"
+          git -c credential.helper= \
+              -c credential.helper='!f() { echo "username=x-access-token"; echo "password=$RELEASE_TOKEN"; }; f' \
+              push --atomic origin main "$TAG"
 
       - name: Dispatch the build on the tag and wait for it
         if: steps.compute.outputs.release == 'true'
