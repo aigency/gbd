@@ -186,11 +186,17 @@ Without `project:` in `.gbd.yml`, gbd still works: an assignee means in progress
 
 `gbd import` moves an existing Beads tracker onto GitHub Issues and the board, once. It is not a sync: run it, keep the mapping file, retire `bd` for that repo.
 
+The JSONL is a snapshot of the Beads database at export time, and the Dolt database is the system of record, so export right before the run and not earlier: pull the Dolt remote, commit anything pending, then stop writing to Beads until the import has finished. Anything written to Beads after the export never comes over.
+
 ```bash
-bd export --include-memories -o beads.jsonl      # in the Beads repo
-gbd import --from-beads beads.jsonl --dry-run    # the plan; nothing written, gh not called
-gbd import --from-beads beads.jsonl --yes        # in the target repo, board configured
+bd dolt pull                                      # in the Beads repo: everything on the remote
+bd dolt commit                                    # anything pending locally (bd dolt status shows it)
+bd export --include-memories -o ~/beads.jsonl     # fresh, outside any repo; --all is not needed
+gbd import --from-beads ~/beads.jsonl --dry-run   # the plan; nothing written, gh not called
+gbd import --from-beads ~/beads.jsonl --yes       # in the target repo, board configured
 ```
+
+Compare the dry run's counts with any earlier one before `--yes`; a surprising difference means the export is not what you think it is.
 
 The dry run prints counts by type, board column, state, and priority; the creation order (parents and blockers before what depends on them); dependency cycles; everything that cannot map and why; the parser's problems; the memory keys. The real run prints the same diagnostics first, then one line per bead, then a summary.
 
