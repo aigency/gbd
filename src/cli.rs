@@ -646,10 +646,33 @@ fn dispatch(cli: Cli) -> Result<u8> {
             if !yes {
                 bail!("refusing to delete {} without --yes (prefer: gbd close {} --reason not_planned)", t.label, t.number);
             }
+            // The issue is about to vanish: capture what it blocks first.
+            let board = ctx.board()?;
+            let held = board.as_ref().map(|_| t.fetch(ctx.scope())).transpose()?;
             t.gh_issue("delete", &["--yes"])?;
-            ctx.emit(&json!({ "number": t.number, "deleted": true }), || {
-                format!("deleted {}", t.label)
-            });
+            let mut moved = Vec::new();
+            if let (Some(board), Some(d)) = (&board, held) {
+                // GitHub counted the deleted issue as a blocker only while it
+                // was open; the copies fetched above still include it.
+                let was_open = d.issue.is_open();
+                let freed: Vec<Issue> = d
+                    .blocking
+                    .into_iter()
+                    .map(|mut b| {
+                        if was_open {
+                            b.open_blockers = b.open_blockers.saturating_sub(1);
+                        }
+                        b
+                    })
+                    .collect();
+                if let Err(err) = reconcile_each(board, &freed, &mut moved) {
+                    eprintln!("warning: board not reconciled: {err:#}. Run: gbd board sync");
+                }
+            }
+            ctx.emit(
+                &json!({ "number": t.number, "deleted": true, "moved": moves_json(&moved) }),
+                || with_moves(format!("deleted {}", t.label), &moved),
+            );
             Ok(0)
         }
         Commands::Dep { cmd } => cmd_dep(&Ctx::open(explicit, json)?, cmd),

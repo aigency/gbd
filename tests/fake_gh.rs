@@ -1780,3 +1780,49 @@ fn reopen_lands_on_blocked_and_reblocks_what_it_holds() {
     let reopen = calls.find("issue reopen").expect(&calls);
     assert!(card < reopen, "card first, then the issue: {calls}");
 }
+
+#[test]
+fn delete_frees_the_cards_it_was_holding() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    // #14 had only #12 as a blocker; #15 has another one.
+    let blocking = [
+        card_node(14, "OPEN", 1, Some("Blocked"), ""),
+        card_node(15, "OPEN", 2, Some("Blocked"), ""),
+    ]
+    .join(",");
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Ready"), &blocking)),
+    )
+    .on("delete", "issue delete 12 -R acme/widgets --yes", "")
+    .on(
+        "padd14",
+        "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/14 --format json",
+        r#"{"id":"PVTI_14"}"#,
+    )
+    .on("pedit14", "project item-edit --id PVTI_14", "");
+    h.gbd()
+        .args(["delete", "12", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted #12; #14 → Ready"));
+    let calls = h.calls();
+    let fetch = calls.find("issue(number").expect(&calls);
+    let delete = calls.find("issue delete").expect(&calls);
+    assert!(
+        fetch < delete,
+        "blockees are read before the issue is gone: {calls}"
+    );
+    assert!(
+        calls.contains(
+            "--id PVTI_14 --project-id PVT_1 --field-id F_status --single-select-option-id O_ready"
+        ),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("issues/15 "),
+        "#15 is still blocked: {calls}"
+    );
+}
