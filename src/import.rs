@@ -927,6 +927,23 @@ fn find_ignore_ascii_case(hay: &str, needle: &str) -> Option<usize> {
         .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
+/// Byte length of `hay` up to and including the first `</name>` (any case,
+/// whitespace allowed before the `>`); the name must end there, so
+/// `</code-example>` does not close `<code>`.
+fn closing_tag_end(hay: &str, name: &str) -> Option<usize> {
+    let needle = format!("</{name}");
+    let mut from = 0;
+    while let Some(j) = find_ignore_ascii_case(&hay[from..], &needle) {
+        let after = from + j + needle.len();
+        let rest = hay[after..].trim_start_matches([' ', '\t', '\n', '\r']);
+        if let Some(r) = rest.strip_prefix('>') {
+            return Some(hay.len() - r.len());
+        }
+        from = after;
+    }
+    None
+}
+
 /// Byte index of the `>` that closes an HTML tag whose `<` sits just before
 /// `s`, quotes respected; None when it does not close in the paragraph.
 fn tag_end(s: &str) -> Option<usize> {
@@ -1019,6 +1036,7 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
             let line = &rest[..line_end];
             // Block-quote markers are seen through by the line rules.
             let (_, inner) = unquote(line, usize::MAX);
+            let strip = line.len() - inner.len();
             let blank = inner.trim().is_empty();
             // Inside a fence every line is code, and only a line of the
             // fence closes it, or the block quote it sits in ending.
@@ -1049,8 +1067,8 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                 }
                 if indented {
                     verbatim = Some(line_end);
-                } else if let Some(len) = reference_definition_end(rest) {
-                    verbatim = Some(len);
+                } else if let Some(len) = reference_definition_end(&rest[strip..]) {
+                    verbatim = Some(strip + len);
                 } else if let Some((c, n, depth)) = fence_open(line) {
                     md = Code::Fence(c, n, depth);
                     verbatim = Some(line_end);
@@ -1087,16 +1105,8 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                     .collect();
                 let mut end = i + 1;
                 if matches!(name.as_str(), "code" | "pre") && !rest[..i].ends_with('/') {
-                    let close = format!("</{name}");
-                    end = match find_ignore_ascii_case(&rest[end..], &close) {
-                        Some(j) => {
-                            let after = end + j + close.len();
-                            rest[after..]
-                                .find('>')
-                                .map_or(rest.len(), |k| after + k + 1)
-                        }
-                        None => rest.len(),
-                    };
+                    let body = end;
+                    end = closing_tag_end(&rest[body..], &name).map_or(rest.len(), |e| body + e);
                 }
                 out.push_str(&rest[..end]);
                 rest = &rest[end..];
@@ -1792,6 +1802,16 @@ mod tests {
             rewrite_ids("[foo\\]]: /issues/wx-2\n\n[wx-2][foo\\]]", &known),
             "[foo\\]]: /issues/wx-2\n\n[#102][foo\\]]",
             "an escaped bracket inside a label"
+        );
+        assert_eq!(
+            rewrite_ids("<code>a </code-example> wx-2</code > wx-2", &known),
+            "<code>a </code-example> wx-2</code > #102",
+            "only the exact closing tag ends a code element"
+        );
+        assert_eq!(
+            rewrite_ids("> [doc]: /issues/wx-2\n>\n> [wx-2][doc]", &known),
+            "> [doc]: /issues/wx-2\n>\n> [#102][doc]",
+            "a reference definition inside a block quote"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
