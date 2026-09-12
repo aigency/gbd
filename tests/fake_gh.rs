@@ -2562,3 +2562,29 @@ fn import_adopts_an_issue_created_but_never_recorded() {
         "{fixed}"
     );
 }
+
+#[test]
+fn import_of_memories_alone_needs_no_board() {
+    let h = Harness::new(); // .gbd.yml without project:, memory_issue 3
+    let export = h.cwd.path().join("memories.jsonl");
+    fs::write(&export, "{\"_type\":\"memory\",\"key\":\"deploy-runbook\",\"value\":\"Deploy with make deploy.\"}\n").unwrap();
+    h.on(
+        "mem-view",
+        "issue view 3 -R acme/widgets --json body",
+        "{\"body\":\"\"}",
+    )
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", export.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no issues to import; memories: 1 new, 0 updated on #3",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("project view") && !calls.contains("issue-fields"),
+        "no board, no fields: {calls}"
+    );
+    assert!(calls.contains("\n## deploy-runbook\n"), "{calls}");
+}

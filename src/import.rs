@@ -692,8 +692,8 @@ impl Mapping {
 
 /// `wx-12` → `#101` for every mention whose target is in `known`. A token
 /// is a maximal run of id characters; trailing dots are punctuation; a
-/// token wrapped in backticks (the import footer) is left alone, and so is
-/// anything not in `known`.
+/// token wrapped in backticks (the import footer) or sitting inside a URL
+/// is left alone, and so is anything not in `known`.
 pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     fn id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
@@ -707,8 +707,16 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         let token = &rest[..end];
         let core = token.trim_end_matches('.');
         let fenced = out.ends_with('`') && rest[end..].starts_with('`');
+        // Inside a URL the id is part of an address, not a mention.
+        let in_url = {
+            let word_start = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            let word_end = rest[end..]
+                .find(char::is_whitespace)
+                .map_or(rest.len(), |i| end + i);
+            out[word_start..].contains("://") || rest[..word_end].contains("://")
+        };
         match known.get(core) {
-            Some(n) if !fenced => {
+            Some(n) if !fenced && !in_url => {
                 let _ = write!(out, "#{n}{}", &token[core.len()..]);
             }
             _ => out.push_str(token),
@@ -1104,6 +1112,15 @@ mod tests {
             "Imported from Beads `wx-2` (x)."
         );
         assert_eq!(rewrite_ids("", &known), "");
+        assert_eq!(
+            rewrite_ids("see https://beads.example/wx-2/notes and wx-2", &known),
+            "see https://beads.example/wx-2/notes and #102",
+            "a URL keeps its path"
+        );
+        assert_eq!(
+            rewrite_ids("(https://x.io/a?bead=wx-1.1) wx-1.1", &known),
+            "(https://x.io/a?bead=wx-1.1) #103"
+        );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
 

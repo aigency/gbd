@@ -1217,6 +1217,18 @@ fn import_run(
     mapping: &Path,
     done: &BTreeMap<String, import::Mapped>,
 ) -> Result<u8> {
+    // An export of memories alone needs no board and no fields.
+    if plan.items.is_empty() {
+        let (issue, added, updated) = memories_for_import(ctx, &plan.memories)?;
+        ctx.emit(
+            &json!({
+                "created": [], "memories": { "issue": issue, "added": added, "updated": updated },
+                "warnings": [], "skipped": plan.skipped, "problems": plan.problems,
+            }),
+            || format!("no issues to import; memories: {added} new, {updated} updated on #{issue}"),
+        );
+        return Ok(0);
+    }
     // Without a board, In Progress and Deferred have nowhere to go and the
     // beads would land in `ready` as plain open issues.
     let Some(board) = ctx.board()? else {
