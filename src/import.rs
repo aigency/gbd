@@ -649,7 +649,12 @@ fn repair_tail(path: &Path) -> Result<()> {
     } else {
         text[..cut].to_string()
     };
-    std::fs::write(path, fixed).with_context(|| format!("repairing {}", path.display()))
+    // Written beside the file and renamed over it, so a kill or a full disk
+    // during the repair leaves either the old file or the new one, never a
+    // truncated one.
+    let tmp = path.with_extension("jsonl.repair");
+    std::fs::write(&tmp, fixed).with_context(|| format!("repairing {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("repairing {}", path.display()))
 }
 
 /// Append-only, flushed per line: a run killed halfway loses nothing, and

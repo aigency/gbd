@@ -410,7 +410,9 @@ fn board_fixtures(h: &Harness) {
             {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
      .on("padd", "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/12 --format json",
          r#"{"id":"PVTI_12"}"#)
-     .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "");
+     .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "")
+     // The importer's check for an issue an earlier run created but never recorded.
+     .on("no-unrecorded", "issue list -R acme/widgets --search", "[]");
 }
 
 #[test]
@@ -2401,4 +2403,99 @@ fn import_reconciles_comments_from_github_before_resuming() {
             && last[0].contains("\"comments\":2"),
         "{map}"
     );
+}
+
+#[test]
+fn import_adopts_an_issue_created_but_never_recorded() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // wx-1 is done; the previous run was killed right after creating wx-2,
+    // before its line was written.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on(
+        "found-wx2",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-2\" in:body",
+        r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+    )
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wx-2 = #102  (found on GitHub, unrecorded; recorded now)",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 finished from an earlier run, 1 already imported)",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("--title Auth refresh"),
+        "not created twice: {calls}"
+    );
+    assert_eq!(
+        calls.matches("issue list -R acme/widgets --search").count(),
+        1,
+        "one check per run: {calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "{calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert!(
+        map.lines().nth(1).unwrap().contains("\"bead\":\"wx-2\"")
+            && map
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("\"phase\":\"created\""),
+        "{map}"
+    );
+
+    // With an empty file the same find is a refusal: an earlier import ran without it.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "found-wx1",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-1\" in:body",
+        r#"[{"number":7,"url":"https://github.com/acme/widgets/issues/7","body":"x\n\n---\nImported from Beads `wx-1` (created 2026-03-01 by dev1)."}]"#,
+    )
+    .on("create", "issue create -R acme/widgets", "https://github.com/acme/widgets/issues/1")
+    .on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "wx-1 already exists as #7 (https://github.com/acme/widgets/issues/7) but",
+        ))
+        .stderr(predicate::str::contains(
+            "is empty: an earlier import ran without this file",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
 }

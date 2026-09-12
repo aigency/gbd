@@ -1370,6 +1370,8 @@ impl Run<'_> {
         done: &BTreeMap<String, import::Mapped>,
         total: usize,
     ) -> Result<()> {
+        let mut done = done.clone();
+        self.adopt_unrecorded(plan, &mut done)?;
         for (n, item) in plan.items.iter().enumerate() {
             let progress = |what: String| {
                 if !self.ctx.json {
@@ -1423,6 +1425,61 @@ impl Run<'_> {
         }
         self.rewrite_forward(plan);
         self.comments(plan)
+    }
+
+    /// A create that a previous run finished without recording (killed in
+    /// the instant between the two) can only be the first bead the file
+    /// does not have. One search finds it by the footer every imported body
+    /// carries; found, it is recorded as created and the run carries on
+    /// from it. On an empty file the same find is a refusal: an earlier
+    /// import ran without this file, and going on would duplicate it all.
+    fn adopt_unrecorded(
+        &mut self,
+        plan: &import::Plan,
+        done: &mut BTreeMap<String, import::Mapped>,
+    ) -> Result<()> {
+        let Some(item) = plan.items.iter().find(|i| !done.contains_key(&i.bead)) else {
+            return Ok(());
+        };
+        let Some((number, url)) = find_imported(self.ctx, &item.bead)? else {
+            return Ok(());
+        };
+        if done.is_empty() {
+            bail!(
+                "{} already exists as #{number} ({url}) but {} is empty: an earlier import ran without this file. Restore it, or pass --mapping with its path",
+                item.bead,
+                self.map.path().display()
+            );
+        }
+        if !self.ctx.json {
+            println!(
+                "       {} = #{number}  (found on GitHub, unrecorded; recorded now)",
+                item.bead
+            );
+        }
+        let t = Touched {
+            bead: item.bead.clone(),
+            number,
+            url: url.clone(),
+            resumed: true,
+            comments: 0,
+            rewritten: false,
+            clean: true,
+        };
+        self.record(&t, import::Phase::Created)?;
+        self.numbers.insert(item.bead.clone(), number);
+        done.insert(
+            item.bead.clone(),
+            import::Mapped {
+                bead: item.bead.clone(),
+                number,
+                url,
+                phase: import::Phase::Created,
+                comments: 0,
+                rewritten: false,
+            },
+        );
+        Ok(())
     }
 
     /// One mapping line. Its failure is fatal and says exactly what to
@@ -1721,6 +1778,39 @@ impl Run<'_> {
             .collect();
         Ok(import::posted_comments(&bodies, &t.bead))
     }
+}
+
+/// The issue an earlier import made for `bead`, found by the footer its
+/// body carries ("Imported from Beads" followed by the id in backticks).
+/// Search narrows, the exact footer decides.
+fn find_imported(ctx: &Ctx, bead: &str) -> Result<Option<(u64, String)>> {
+    let query = format!("\"Imported from Beads {bead}\" in:body");
+    let found: Vec<Value> = gh::run_json(&[
+        "issue",
+        "list",
+        "-R",
+        &ctx.repo.name_with_owner,
+        "--search",
+        &query,
+        "--state",
+        "all",
+        "--limit",
+        "20",
+        "--json",
+        "number,url,body",
+    ])
+    .with_context(|| format!("checking GitHub for an unrecorded {bead}"))?;
+    let footer = format!("Imported from Beads `{bead}`");
+    Ok(found.iter().find_map(|i| {
+        let body = i.get("body").and_then(Value::as_str)?;
+        if !body.contains(&footer) {
+            return None;
+        }
+        Some((
+            i.get("number")?.as_u64()?,
+            i.get("url")?.as_str()?.to_string(),
+        ))
+    }))
 }
 
 /// Upsert every `_type: memory` line into the memories issue.
