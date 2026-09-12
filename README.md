@@ -206,7 +206,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | closed | closed with a reason read from the free-text `close_reason` (duplicate / not planned / else completed), board Done |
 | `notes`, comments | comments, with author and date |
 | description, design, acceptance criteria | the body, as sections |
-| labels, owner, dates, estimate, external ref, the original close reason | an import footer at the end of the body, so nothing is lost and nothing becomes a label |
+| labels, owner, dates, estimate, external ref, the original close reason | an import footer at the end of the body (dates to the day), so nothing becomes a label |
 | `_type: memory` lines | the memories issue, upserted by key |
 | `related`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, edges to beads outside the export, agents, gates, templates | dropped, each one listed with the reason |
 
