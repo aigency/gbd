@@ -746,17 +746,33 @@ fn reference_definition_end(rest: &str) -> Option<usize> {
     (!next[..next_end].trim().is_empty()).then_some(line_end + next_end)
 }
 
-/// The fence a line opens, as (char, run length): three or more backticks
-/// or tildes after up to three spaces. A backtick fence's info string
-/// cannot contain a backtick.
-fn fence_open(line: &str) -> Option<(char, usize)> {
+/// Block-quote markers at the start of a line: how many `>` prefixes (each
+/// after up to three spaces, with an optional space after it) there are,
+/// and what follows them.
+fn unquote(line: &str) -> (usize, &str) {
+    let (mut depth, mut s) = (0, line);
+    loop {
+        let t = s.trim_start_matches(' ');
+        if s.len() - t.len() > 3 || !t.starts_with('>') {
+            return (depth, s);
+        }
+        depth += 1;
+        s = t[1..].strip_prefix(' ').unwrap_or(&t[1..]);
+    }
+}
+
+/// The fence a line opens, as (char, run length, block-quote depth): three
+/// or more backticks or tildes after up to three spaces, inside any block
+/// quote. A backtick fence's info string cannot contain a backtick.
+fn fence_open(line: &str) -> Option<(char, usize, usize)> {
+    let (depth, line) = unquote(line);
     let s = line.trim_start_matches(' ');
     if line.len() - s.len() > 3 {
         return None;
     }
     let c = s.chars().next().filter(|c| matches!(c, '`' | '~'))?;
     let n = s.chars().take_while(|&x| x == c).count();
-    (n >= 3 && (c == '~' || !s[n..].contains('`'))).then_some((c, n))
+    (n >= 3 && (c == '~' || !s[n..].contains('`'))).then_some((c, n, depth))
 }
 
 /// Whether a line closes a fence of `n` of `c`: a run at least as long
@@ -798,9 +814,10 @@ enum Code {
     /// the same length closes it, so a literal backtick inside is fine.
     Span(usize),
     /// Inside a fenced block opened by a line of this many backticks or
-    /// tildes (the char says which); only a line of at least as many closes
-    /// it, so a run of the fence char inside the block is fine.
-    Fence(char, usize),
+    /// tildes (the char says which) at this block-quote depth; only a line
+    /// of at least as many closes it, so a run of the fence char inside the
+    /// block is fine, and the quote ending ends it too.
+    Fence(char, usize, usize),
 }
 
 /// Where the paragraph at the start of `s` ends: the start of its first
@@ -896,7 +913,8 @@ fn is_indented(line: &str) -> bool {
 /// An indented code block is a line indented four spaces or a tab after a
 /// blank line (or at the start), through the next line indented less. A
 /// nested list item indented that far after a blank line counts too and is
-/// left as written: the safe direction.
+/// left as written: the safe direction. Fences are seen through block-quote
+/// markers; no other container is modelled beyond its indentation.
 pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     fn id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
@@ -922,13 +940,20 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
             let line = &rest[..line_end];
             let blank = line.trim().is_empty();
             // Inside a fence every line is code, and only a line of the
-            // fence closes it.
-            let verbatim = if let Code::Fence(c, n) = md {
-                if fence_close(line, c, n) {
+            // fence closes it, or the block quote it sits in ending.
+            let mut verbatim = None;
+            if let Code::Fence(c, n, depth) = md {
+                let (d, inner) = unquote(line);
+                if d < depth {
                     md = Code::Prose;
+                } else {
+                    if fence_close(inner, c, n) {
+                        md = Code::Prose;
+                    }
+                    verbatim = Some(line_end);
                 }
-                Some(line_end)
-            } else {
+            }
+            if verbatim.is_none() {
                 if blank {
                     // A blank line ends the paragraph, and any span in it.
                     md = Code::Prose;
@@ -940,16 +965,14 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                     indented = true;
                 }
                 if indented {
-                    Some(line_end)
+                    verbatim = Some(line_end);
                 } else if let Some(len) = reference_definition_end(rest) {
-                    Some(len)
-                } else if let Some((c, n)) = fence_open(line) {
-                    md = Code::Fence(c, n);
-                    Some(line_end)
-                } else {
-                    None
+                    verbatim = Some(len);
+                } else if let Some((c, n, depth)) = fence_open(line) {
+                    md = Code::Fence(c, n, depth);
+                    verbatim = Some(line_end);
                 }
-            };
+            }
             prev_blank = blank;
             if let Some(len) = verbatim {
                 out.push_str(&rest[..len]);
@@ -1597,6 +1620,21 @@ mod tests {
             rewrite_ids("a < b and wx-2 > c", &known),
             "a < b and #102 > c",
             "a lone less-than is prose"
+        );
+        assert_eq!(
+            rewrite_ids("> ```\n> bd show wx-2\n> ```\n\nwx-2", &known),
+            "> ```\n> bd show wx-2\n> ```\n\n#102",
+            "a fence inside a block quote"
+        );
+        assert_eq!(
+            rewrite_ids("> ```\n> wx-2\n\nwx-2", &known),
+            "> ```\n> wx-2\n\n#102",
+            "the quote ending ends its fence"
+        );
+        assert_eq!(
+            rewrite_ids("> see wx-2", &known),
+            "> see #102",
+            "quoted prose is prose"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
