@@ -35,7 +35,7 @@ cargo binstall gbd
 cargo install --locked gbd
 ```
 
-`install.sh` and `cargo binstall` download the release tarball for your OS and architecture (linux x86_64/arm64, macOS arm64) and verify its SHA256; the script installs `~/.local/bin/gbd` (override with `GBD_INSTALL_DIR`), so put `~/.local/bin` on your `PATH`.
+Both download the release tarball for your OS and architecture (linux x86_64/arm64, macOS arm64). `install.sh` also verifies the tarball against the release's `SHA256SUMS` and installs `~/.local/bin/gbd` (override with `GBD_INSTALL_DIR`), so put `~/.local/bin` on your `PATH`; `cargo binstall` does no checksum verification of its own.
 
 `gbd --version` prints the crate version and the git commit it was built from, e.g. `gbd 1.0.0 (1a2b3c4)`, so you can tell a release from a local build.
 
