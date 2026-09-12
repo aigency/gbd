@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -222,6 +222,14 @@ pub enum Commands {
         /// Print the plan and write nothing
         #[arg(long)]
         dry_run: bool,
+        /// Create the issues. One shot, not a sync: run it once per tracker.
+        #[arg(long)]
+        yes: bool,
+        /// Where each bead → issue pair is recorded as it happens; an
+        /// existing file resumes the run and drives id rewriting. Default:
+        /// beads-map.jsonl next to .gbd.yml
+        #[arg(long, value_name = "FILE")]
+        mapping: Option<PathBuf>,
     },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
@@ -587,7 +595,9 @@ fn dispatch(cli: Cli) -> Result<u8> {
         Commands::Import {
             from_beads,
             dry_run,
-        } => cmd_import(explicit, json, &from_beads, dry_run),
+            yes,
+            mapping,
+        } => cmd_import(explicit, json, &from_beads, dry_run, yes, mapping),
         Commands::Ready {
             claim,
             explain,
@@ -922,45 +932,45 @@ fn cmd_doctor(explicit: Option<&str>, no_skills: bool, json: bool) -> Result<u8>
     Ok(u8::from(!report.ok))
 }
 
-fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
-    let rank = args
-        .priority
-        .as_deref()
-        .map(fields::parse_rank)
-        .transpose()?;
-    let parent = args
-        .parent
-        .as_deref()
-        .map(|p| ctx.target(p))
-        .transpose()?
-        .map(|t| t.number.to_string());
-    let deps = args
-        .deps
-        .as_deref()
-        .map(ids::parse_number_list)
-        .transpose()?
-        .filter(|v| !v.is_empty())
-        .map(|v| v.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
-    let blocking = args
-        .blocking
-        .as_deref()
-        .map(ids::parse_number_list)
-        .transpose()?
-        .filter(|v| !v.is_empty())
-        .map(|v| v.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
+/// What one `gh issue create` carries: title, body, type, parent, and both
+/// edge lists, so there is never a create-then-attach step. `create` and
+/// `import` both go through here.
+struct NewIssue<'a> {
+    title: &'a str,
+    body: &'a str,
+    issue_type: &'a str,
+    parent: Option<u64>,
+    blocked_by: &'a [u64],
+    blocking: &'a [u64],
+}
 
-    // One gh call carries title, body, type, parent, and both edge lists.
+/// `12,13` for flags and JSON; None when empty.
+fn csv(numbers: &[u64]) -> Option<String> {
+    (!numbers.is_empty()).then(|| {
+        numbers
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+/// Returns the new issue's number and URL.
+fn create_issue(ctx: &Ctx, new: &NewIssue<'_>) -> Result<(u64, String)> {
+    let parent = new.parent.map(|p| p.to_string());
+    let deps = csv(new.blocked_by);
+    let blocking = csv(new.blocking);
     let mut gh_args: Vec<&str> = vec![
         "issue",
         "create",
         "-R",
         &ctx.repo.name_with_owner,
         "--title",
-        &args.title,
+        new.title,
         "--body",
-        &args.body,
+        new.body,
         "--type",
-        &args.r#type,
+        new.issue_type,
     ];
     if let Some(p) = &parent {
         gh_args.extend(["--parent", p]);
@@ -974,11 +984,48 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
     let url = gh::run(&gh_args).with_context(|| {
         format!(
             "creating issue (type {:?} must exist on org {}: gbd types)",
-            args.r#type,
+            new.issue_type,
             ctx.repo.owner()
         )
     })?;
-    let number = ids::number_from_url(&url)?;
+    Ok((ids::number_from_url(&url)?, url))
+}
+
+fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
+    let rank = args
+        .priority
+        .as_deref()
+        .map(fields::parse_rank)
+        .transpose()?;
+    let parent = args
+        .parent
+        .as_deref()
+        .map(|p| ctx.target(p))
+        .transpose()?
+        .map(|t| t.number);
+    let deps = args
+        .deps
+        .as_deref()
+        .map(ids::parse_number_list)
+        .transpose()?
+        .unwrap_or_default();
+    let blocking = args
+        .blocking
+        .as_deref()
+        .map(ids::parse_number_list)
+        .transpose()?
+        .unwrap_or_default();
+    let (number, url) = create_issue(
+        ctx,
+        &NewIssue {
+            title: &args.title,
+            body: &args.body,
+            issue_type: &args.r#type,
+            parent,
+            blocked_by: &deps,
+            blocking: &blocking,
+        },
+    )?;
     let t = ctx.target(&number.to_string())?;
 
     let mut warnings = Vec::new();
@@ -999,7 +1046,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
             // Edges move cards: the new issue starts Blocked while GitHub
             // counts an open blocker (a closed one blocks nothing), and what
             // it blocks leaves Ready. One fetch, only when an edge was given.
-            let detail = if deps.is_none() && blocking.is_none() {
+            let detail = if deps.is_empty() && blocking.is_empty() {
                 None
             } else {
                 match t.fetch(ctx.scope()) {
@@ -1014,7 +1061,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
             };
             let initial = match &detail {
                 Some(d) => ready_or_blocked(&d.issue),
-                None if deps.is_some() => project::STATUS_BLOCKED,
+                None if !deps.is_empty() => project::STATUS_BLOCKED,
                 None => project::STATUS_READY,
             };
             let status = match t.set_board_status(Some(&board), initial) {
@@ -1046,7 +1093,7 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
         &json!({
             "number": number, "id": id, "url": url, "title": args.title,
             "type": args.r#type, "priority": priority, "status": status,
-            "parent": parent, "blocked_by": deps, "blocking": blocking,
+            "parent": parent.map(|p| p.to_string()), "blocked_by": csv(&deps), "blocking": csv(&blocking),
             "moved": moves_json(&moved),
         }),
         || {
@@ -1098,18 +1145,928 @@ fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
 
 /// Beads → GitHub, planned in memory first. Only the plan exists so far:
 /// without `--dry-run` the command refuses, so nothing half-imports.
-fn cmd_import(explicit: Option<&str>, json: bool, from_beads: &Path, dry_run: bool) -> Result<u8> {
-    if !dry_run {
-        bail!("gbd import can only --dry-run in this version; creating the issues is the next release");
-    }
-    // A dry run is local: no gh, no auth, no repo lookup. `explicit` is
-    // for the real run, which opens a Ctx.
-    let _ = explicit;
+fn cmd_import(
+    explicit: Option<&str>,
+    json: bool,
+    from_beads: &Path,
+    dry_run: bool,
+    yes: bool,
+    mapping: Option<PathBuf>,
+) -> Result<u8> {
+    // The default lives beside .gbd.yml, so a resume from any directory
+    // of the repo finds the same file.
+    let mapping = mapping.unwrap_or_else(|| {
+        config::find().map_or_else(
+            || PathBuf::from("beads-map.jsonl"),
+            |cfg| cfg.with_file_name("beads-map.jsonl"),
+        )
+    });
+    let mapping = mapping.as_path();
     let export = beads::load(from_beads)?;
-    let plan = import::plan(&export);
+    let mut plan = import::plan(&export);
+    let done = import::read_mapping(mapping)?;
+    import::note_imported(&mut plan, &done);
     let source = from_beads.display().to_string();
-    emit_to(json, &plan, || import::render(&plan, &source, 25));
-    Ok(0)
+    if dry_run {
+        // Local: no gh, no auth, no repo lookup.
+        emit_to(json, &plan, || import::render(&plan, &source, 25));
+        return Ok(0);
+    }
+    let ctx = Ctx::open(explicit, json)?;
+    // A mapping file from another repo would silently skip beads and wire
+    // edges to unrelated issues.
+    let refuse_foreign = |done: &BTreeMap<String, import::Mapped>| -> Result<()> {
+        if let Some(m) = import::foreign_entry(done, &ctx.repo.name_with_owner) {
+            bail!(
+                "{} was written for {} ({} → {}), not {}. Point --mapping at a fresh file",
+                mapping.display(),
+                m.repo().unwrap_or("an unknown repo"),
+                m.bead,
+                m.url,
+                ctx.repo.name_with_owner
+            );
+        }
+        Ok(())
+    };
+    refuse_foreign(&done)?;
+    if !yes {
+        bail!(
+            "this creates {} issues in {} and writes {} memories. Add --yes, or --dry-run to see the plan first",
+            plan.items.len() - plan.already_imported.len(),
+            ctx.repo.name_with_owner,
+            plan.memories.len()
+        );
+    }
+    // The state a run starts from is read under the file's lock, held until
+    // the run ends: two resumes at once would otherwise both start from the
+    // same state and create everything twice.
+    let map = import::Mapping::open(mapping)?;
+    let done = import::read_mapping(mapping)?;
+    // Checked again: another import may have written to the file between
+    // the first read and the lock.
+    refuse_foreign(&done)?;
+    import::note_imported(&mut plan, &done);
+    import_run(&ctx, &plan, map, &done)
+}
+
+/// Execute the plan top to bottom: one `gh issue create` per bead, its
+/// edges pointing at issues made earlier (this run or a previous one, via
+/// the mapping file), then Priority, Start date, assignee, comments, the
+/// close, and the card. The mapping file records each bead as `created`,
+/// `commented`, and `done`, so a run killed anywhere resumes at the right
+/// step without duplicating anything. The create is fatal; every later
+/// step warns and moves on, since `board sync` and one edit repair them.
+fn import_run(
+    ctx: &Ctx,
+    plan: &import::Plan,
+    map: import::Mapping,
+    done: &BTreeMap<String, import::Mapped>,
+) -> Result<u8> {
+    // Nothing left to create or finish (an export of memories alone, or a
+    // re-run after everything landed): only the memories, and no board or
+    // field lookups to get in the way of that.
+    let unfinished = plan
+        .items
+        .iter()
+        .filter(|i| {
+            !done
+                .get(&i.bead)
+                .is_some_and(|m| m.phase == import::Phase::Done)
+        })
+        .count();
+    if unfinished == 0 {
+        let already = plan.items.len();
+        let memories = if plan.memories.is_empty() {
+            json!(null)
+        } else {
+            let (issue, added, updated) = memories_for_import(ctx, &plan.memories)?;
+            json!({ "issue": issue, "added": added, "updated": updated })
+        };
+        ctx.emit(
+            &json!({
+                "created": [], "already_imported": plan.already_imported,
+                "finished": [], "mapping": map.path(), "rewritten": [],
+                "memories": memories, "warnings": [], "error": null,
+                "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
+            }),
+            || {
+                let issues = if already == 0 {
+                    "no issues to import".to_string()
+                } else {
+                    format!("no issues left to import ({already} already imported)")
+                };
+                match &memories {
+                    Value::Null => format!("{issues}; nothing to do"),
+                    m => format!(
+                        "{issues}; memories: {} new, {} updated on #{}",
+                        m["added"], m["updated"], m["issue"]
+                    ),
+                }
+            },
+        );
+        return Ok(0);
+    }
+    // Without a board, In Progress and Deferred have nowhere to go and the
+    // beads would land in `ready` as plain open issues.
+    let Some(board) = ctx.board()? else {
+        bail!(
+            "gbd import needs a board so In Progress and Deferred survive the move (.gbd.yml project:). Run: gbd init"
+        );
+    };
+    if !ctx.json {
+        let diagnostics = import::render_diagnostics(plan);
+        if !diagnostics.is_empty() {
+            println!("{diagnostics}");
+        }
+    }
+    let org = ctx.repo.owner();
+    let priority = fields::priority_field(org)?;
+    let start_date = plan
+        .items
+        .iter()
+        .filter(|i| {
+            !done
+                .get(&i.bead)
+                .is_some_and(|m| m.phase == import::Phase::Done)
+        })
+        .any(|i| i.start_date.is_some())
+        .then(|| fields::start_date_field(org))
+        .transpose()?;
+    let mut run = Run {
+        ctx,
+        board: &board,
+        priority: &priority,
+        start_date: start_date.as_ref(),
+        map,
+        numbers: done.iter().map(|(b, m)| (b.clone(), m.number)).collect(),
+        warnings: Vec::new(),
+        created: Vec::new(),
+        closed_ok: 0,
+        finished: Vec::new(),
+        rewritten: Vec::new(),
+        open_beads: BTreeSet::new(),
+        unsure_blockers: BTreeSet::new(),
+        touched: Vec::new(),
+    };
+    let total = plan.items.len();
+    let outcome = run.execute(plan, done, total);
+    // Memories: key/value onto the memories issue, last write wins. Only on
+    // a run that got through the issues.
+    let mut memories = json!(null);
+    if outcome.is_ok() && !plan.memories.is_empty() {
+        match memories_for_import(ctx, &plan.memories) {
+            Ok((issue, added, updated)) => {
+                memories = json!({ "issue": issue, "added": added, "updated": updated });
+            }
+            Err(err) => run.warnings.push(format!("memories not imported: {err:#}")),
+        }
+    }
+    for w in &run.warnings {
+        eprintln!("warning: {w}");
+    }
+    // The report goes out even when a create failed: what exists, what
+    // went wrong, and where to resume from.
+    let error = outcome.as_ref().err().map(|e| format!("{e:#}"));
+    let dropped = plan.skipped.len();
+    let resumed = plan.already_imported.len();
+    ctx.emit(
+        &json!({
+            "created": run.created, "already_imported": plan.already_imported,
+            "finished": run.finished, "mapping": run.map.path(), "rewritten": run.rewritten,
+            "memories": memories, "warnings": run.warnings, "error": error,
+            "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
+        }),
+        || {
+            let mem = match &memories {
+                serde_json::Value::Null => String::new(),
+                m => format!(
+                    "; memories: {} new, {} updated on #{}",
+                    m["added"], m["updated"], m["issue"]
+                ),
+            };
+            let mut tail = format!("{} closed", run.closed_ok);
+            if !run.finished.is_empty() {
+                let _ = write!(
+                    tail,
+                    ", {} finished from an earlier run",
+                    run.finished.len()
+                );
+            }
+            if resumed > 0 {
+                let _ = write!(tail, ", {resumed} already imported");
+            }
+            let warnings = format!(
+                "{} warning{}",
+                run.warnings.len(),
+                if run.warnings.len() == 1 { "" } else { "s" }
+            );
+            let path = run.map.path().display();
+            match &error {
+                Some(e) => format!(
+                    "\nstopped: {e}\nimported {} of {total} issues before that ({tail}); {warnings}\nmapping: {path} (run gbd import again to resume)",
+                    run.created.len()
+                ),
+                None => format!(
+                    "\nimported {} issues ({tail}){mem}; {warnings}; {dropped} could not map (listed above)\nmapping: {path} (bead → issue; keep it to resolve old references)",
+                    total - resumed
+                ),
+            }
+        },
+    );
+    outcome.map(|()| 0)
+}
+
+/// State of one `gbd import --yes` run.
+struct Run<'a> {
+    ctx: &'a Ctx,
+    board: &'a Board,
+    priority: &'a fields::IssueField,
+    start_date: Option<&'a fields::IssueField>,
+    map: import::Mapping,
+    /// Bead → issue number, seeded from the mapping file: edges resolve
+    /// against it and mentions in bodies and comments are rewritten from it.
+    numbers: BTreeMap<String, u64>,
+    warnings: Vec<String>,
+    created: Vec<Value>,
+    closed_ok: usize,
+    /// Beads a previous run left unfinished that reached `done` this run.
+    finished: Vec<String>,
+    /// Issues whose body was edited once every number was known.
+    rewritten: Vec<u64>,
+    /// Beads that are open on GitHub after this run touched or skipped
+    /// them. Cards are placed against this, not against the plan.
+    open_beads: BTreeSet<String>,
+    /// Finished blockers whose live state could not be read: anything
+    /// placed against them stays unfinished, so the next run looks again.
+    unsure_blockers: BTreeSet<String>,
+    /// Per bead touched this run: its issue, how far the mapping file says
+    /// it got, and whether every step so far succeeded.
+    touched: Vec<Touched>,
+}
+
+struct Touched {
+    bead: String,
+    number: u64,
+    url: String,
+    resumed: bool,
+    /// Comments the mapping file says are on the issue.
+    comments: usize,
+    /// The body was already edited for forward references.
+    rewritten: bool,
+    clean: bool,
+}
+
+impl Run<'_> {
+    /// Pass one over the plan: create (or resume), then Priority, dates,
+    /// assignee, the close, and the card. Stops at the first failed create.
+    /// Pass two, once every issue exists: bodies that mentioned a bead
+    /// created later, then the comments, so no text is ever posted with a
+    /// Beads id that could have been an issue number.
+    fn execute(
+        &mut self,
+        plan: &import::Plan,
+        done: &BTreeMap<String, import::Mapped>,
+        total: usize,
+    ) -> Result<()> {
+        let mut done = done.clone();
+        self.adopt_unrecorded(plan, &mut done)?;
+        // A finished blocker of something still to place may have been
+        // closed or reopened on GitHub since: its state is read live.
+        let pending: BTreeSet<&str> = plan
+            .items
+            .iter()
+            .filter(|i| {
+                !done
+                    .get(&i.bead)
+                    .is_some_and(|m| m.phase == import::Phase::Done)
+            })
+            .flat_map(|i| i.blocked_by.iter().map(String::as_str))
+            .collect();
+        for (n, item) in plan.items.iter().enumerate() {
+            let progress = |what: String| {
+                if !self.ctx.json {
+                    println!("{:>5}/{total}  {} {what}", n + 1, item.bead);
+                }
+            };
+            let mut t = match done.get(&item.bead) {
+                Some(m) if m.phase == import::Phase::Done => {
+                    progress(format!("= #{}  (already imported)", m.number));
+                    let open = if pending.contains(item.bead.as_str()) {
+                        match issue_is_open(self.ctx, m.number) {
+                            Ok(open) => open,
+                            Err(err) => {
+                                self.warnings.push(format!(
+                                    "{} (#{}): could not read its state, using the export's: {err:#}",
+                                    item.bead, m.number
+                                ));
+                                self.unsure_blockers.insert(item.bead.clone());
+                                matches!(item.state, import::State::Open)
+                            }
+                        }
+                    } else {
+                        matches!(item.state, import::State::Open)
+                    };
+                    if open {
+                        self.open_beads.insert(item.bead.clone());
+                    }
+                    continue;
+                }
+                Some(m) => {
+                    progress(format!("= #{}  (finishing)", m.number));
+                    Touched {
+                        bead: item.bead.clone(),
+                        number: m.number,
+                        url: m.url.clone(),
+                        resumed: true,
+                        comments: m.comments,
+                        rewritten: m.rewritten,
+                        clean: true,
+                    }
+                }
+                None => {
+                    let (number, url) = self.create(item, n, total)?;
+                    Touched {
+                        bead: item.bead.clone(),
+                        number,
+                        url,
+                        resumed: false,
+                        comments: 0,
+                        rewritten: false,
+                        clean: true,
+                    }
+                }
+            };
+            let state = self.place(item, &mut t);
+            let closed = if matches!(state, import::State::Closed { .. }) {
+                "  ✓"
+            } else {
+                ""
+            };
+            progress(format!(
+                "→ #{}  [{}] {}{closed}",
+                t.number, item.issue_type, item.title
+            ));
+            self.touched.push(t);
+        }
+        self.rewrite_forward(plan);
+        self.comments(plan)
+    }
+
+    /// A create that a previous run finished without recording (killed in
+    /// the instant between the two) can only be the first bead the file
+    /// does not have. One search finds it by the footer every imported body
+    /// carries; found, it is recorded as created and the run carries on
+    /// from it. On an empty file the same find is a refusal: an earlier
+    /// import ran without this file, and going on would duplicate it all.
+    fn adopt_unrecorded(
+        &mut self,
+        plan: &import::Plan,
+        done: &mut BTreeMap<String, import::Mapped>,
+    ) -> Result<()> {
+        let Some(item) = plan.items.iter().find(|i| !done.contains_key(&i.bead)) else {
+            return Ok(());
+        };
+        let Some((number, url)) = find_imported(self.ctx, &item.bead)? else {
+            return Ok(());
+        };
+        // An empty file with the first bead on GitHub is either a run killed
+        // right after its first create (nothing to restore) or a whole earlier
+        // import that ran without this file. The second bead tells them
+        // apart: an earlier import made that one too.
+        if done.is_empty() {
+            if let Some(second) = plan.items.get(1) {
+                if find_imported(self.ctx, &second.bead)?.is_some() {
+                    bail!(
+                        "{} already exists as #{number} ({url}) and so does {}, but {} is empty: an earlier import ran without this file. Restore it, or pass --mapping with its path",
+                        item.bead,
+                        second.bead,
+                        self.map.path().display()
+                    );
+                }
+            }
+        }
+        // `gh issue create` sets the type, parent, and blockers after the
+        // create; the run that died may not have got that far. Reapply them
+        // (each is idempotent) before recording anything: a failure stops
+        // the run with nothing recorded, so the next run finds the issue
+        // again and retries, rather than resuming past a missing edge.
+        let target = self.ctx.target(&number.to_string())?;
+        let mut redo: Vec<(&str, Vec<String>)> =
+            vec![("type", vec!["--type".into(), item.issue_type.into()])];
+        if let Some(parent) = item.parent.as_deref().and_then(|p| self.numbers.get(p)) {
+            redo.push(("parent", vec!["--parent".into(), parent.to_string()]));
+        }
+        for blocker in item.blocked_by.iter().filter_map(|b| self.numbers.get(b)) {
+            redo.push((
+                "blocker",
+                vec!["--add-blocked-by".into(), blocker.to_string()],
+            ));
+        }
+        for (what, flags) in &redo {
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            target.edit(&flags).with_context(|| {
+                format!(
+                    "{} is #{number} ({url}) but its {what} could not be reapplied; nothing was recorded, run gbd import again to retry",
+                    item.bead
+                )
+            })?;
+        }
+        if !self.ctx.json {
+            println!(
+                "       {} = #{number}  (found on GitHub, unrecorded; recorded now)",
+                item.bead
+            );
+        }
+        let t = Touched {
+            bead: item.bead.clone(),
+            number,
+            url: url.clone(),
+            resumed: true,
+            comments: 0,
+            rewritten: false,
+            clean: true,
+        };
+        self.record(&t, import::Phase::Created)?;
+        self.numbers.insert(item.bead.clone(), number);
+        done.insert(
+            item.bead.clone(),
+            import::Mapped {
+                bead: item.bead.clone(),
+                number,
+                url,
+                phase: import::Phase::Created,
+                comments: 0,
+                rewritten: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// One mapping line. Its failure is fatal and says exactly what to
+    /// add by hand, since the issue exists whether or not the file does.
+    fn record(&mut self, t: &Touched, phase: import::Phase) -> Result<()> {
+        let m = import::Mapped {
+            bead: t.bead.clone(),
+            number: t.number,
+            url: t.url.clone(),
+            phase,
+            comments: t.comments,
+            rewritten: t.rewritten,
+        };
+        self.map.record(&m).with_context(|| {
+            format!(
+                "{} is #{} ({}) but could not be recorded in {}. Add this line to the file before resuming:\n{}",
+                t.bead,
+                t.number,
+                t.url,
+                self.map.path().display(),
+                serde_json::to_string(&m).unwrap_or_default()
+            )
+        })
+    }
+
+    /// `gh issue create` with the edges resolved through `numbers`.
+    fn create(&mut self, item: &import::Item, n: usize, total: usize) -> Result<(u64, String)> {
+        let edge = |bead: &str| {
+            self.numbers
+                .get(bead)
+                .copied()
+                .with_context(|| format!("{}: {bead} was not created before it", item.bead))
+        };
+        let parent = item.parent.as_deref().map(edge).transpose()?;
+        let blocked_by: Vec<u64> = item
+            .blocked_by
+            .iter()
+            .map(|b| edge(b))
+            .collect::<Result<_>>()?;
+        let body = import::rewrite_ids(&item.body, &self.numbers);
+        let (number, url) = create_issue(
+            self.ctx,
+            &NewIssue {
+                title: &item.title,
+                body: &body,
+                issue_type: item.issue_type,
+                parent,
+                blocked_by: &blocked_by,
+                blocking: &[],
+            },
+        )
+        .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
+        let t = Touched {
+            bead: item.bead.clone(),
+            number,
+            url: url.clone(),
+            resumed: false,
+            comments: 0,
+            rewritten: false,
+            clean: true,
+        };
+        self.record(&t, import::Phase::Created)?;
+        self.numbers.insert(item.bead.clone(), number);
+        Ok((number, url))
+    }
+
+    /// Priority, Start date, assignee, the close, and the card: all
+    /// idempotent, so a resumed bead simply gets them again. Returns the
+    /// state the issue actually ended in; a failure clears `t.clean`.
+    fn place(&mut self, item: &import::Item, t: &mut Touched) -> import::State {
+        let number = t.number;
+        let mut warnings = Vec::new();
+        let warn = |warnings: &mut Vec<String>, what: String| {
+            warnings.push(format!("{} (#{number}): {what}", item.bead));
+        };
+        let target = match self.ctx.target(&number.to_string()) {
+            Ok(target) => target,
+            Err(err) => {
+                warn(&mut warnings, format!("{err:#}"));
+                self.warnings.append(&mut warnings);
+                t.clean = false;
+                return item.state.clone();
+            }
+        };
+        if let Err(err) = fields::option_name(item.priority)
+            .and_then(|p| fields::write_value(&self.ctx.repo, number, self.priority.id, p))
+        {
+            warn(&mut warnings, format!("Priority not set: {err:#}"));
+        }
+        if let (Some(d), Some(field)) = (&item.start_date, self.start_date) {
+            if let Err(err) = fields::write_value(&self.ctx.repo, number, field.id, d) {
+                warn(&mut warnings, format!("Start date not set: {err:#}"));
+            }
+        }
+        if let Some(login) = &item.assignee {
+            if let Err(err) = target.edit(&["--add-assignee", login]) {
+                warn(&mut warnings, format!("assignee {login} not set: {err:#}"));
+            }
+        }
+        // What actually happened, not what was planned: a close that failed
+        // leaves the issue open, so the card is left alone rather than Done,
+        // and a card that says Ready or Blocked follows the blockers' real
+        // state (a blocker whose close failed still blocks).
+        let mut state = item.state.clone();
+        // A resumed bead planned open may have been closed on GitHub since;
+        // that stands.
+        if t.resumed && matches!(item.state, import::State::Open) {
+            match issue_is_open(self.ctx, number) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state = import::State::Closed {
+                        reason: import::CloseReason::Completed,
+                    };
+                }
+                Err(err) => {
+                    warn(
+                        &mut warnings,
+                        format!("could not read its state, using the export's: {err:#}"),
+                    );
+                    self.unsure_blockers.insert(item.bead.clone());
+                }
+            }
+        }
+        if let import::State::Closed { reason } = item.state {
+            if let Err(err) = target.gh_issue("close", &["--reason", reason.as_flag()]) {
+                warn(
+                    &mut warnings,
+                    format!("not closed: {err:#}. Run gbd import again to retry"),
+                );
+                state = import::State::Open;
+                // Its dependents are placed against a state that will
+                // change when the close succeeds: keep them resumable.
+                self.unsure_blockers.insert(item.bead.clone());
+            }
+        }
+        if matches!(state, import::State::Open) {
+            self.open_beads.insert(item.bead.clone());
+        }
+        let mut status = match (&state, &item.state, item.status) {
+            (import::State::Closed { .. }, _, _) => Some(project::STATUS_DONE),
+            // The close failed: the issue is open, so no card rather than Done.
+            (import::State::Open, import::State::Closed { .. }, _) => None,
+            (import::State::Open, _, project::STATUS_READY | project::STATUS_BLOCKED) => {
+                let blocked = item.blocked_by.iter().any(|b| self.open_beads.contains(b));
+                Some(if blocked {
+                    project::STATUS_BLOCKED
+                } else {
+                    project::STATUS_READY
+                })
+            }
+            (import::State::Open, _, planned) => Some(planned),
+        };
+        if let Some(unsure) = item
+            .blocked_by
+            .iter()
+            .find(|b| self.unsure_blockers.contains(b.as_str()))
+        {
+            warn(
+                &mut warnings,
+                format!("placed against {unsure}, whose state could not be read; run gbd import again to settle it"),
+            );
+        }
+        if let Some(s) = status {
+            if let Err(err) = self.board.set_status(&t.url, s) {
+                warn(
+                    &mut warnings,
+                    format!("card not set to {s}: {err:#}. Run gbd import again to retry"),
+                );
+                status = None;
+            }
+        }
+        if !warnings.is_empty() {
+            t.clean = false;
+        }
+        self.warnings.append(&mut warnings);
+        if matches!(state, import::State::Closed { .. }) {
+            self.closed_ok += 1;
+        }
+        self.created.push(json!({
+            "bead": item.bead, "number": number, "url": t.url,
+            "state": state, "status": status,
+        }));
+        state
+    }
+
+    /// A body written before the bead it mentions existed still says
+    /// `wx-9`. Now that every number is known, edit those bodies once and
+    /// checkpoint it, so a later retry of the same bead never overwrites
+    /// edits made on GitHub in between. Only beads this run created or
+    /// resumed: a `done` bead had this pass in the run that finished it.
+    /// A failed edit keeps the bead off `done`.
+    fn rewrite_forward(&mut self, plan: &import::Plan) {
+        let pos: BTreeMap<&str, usize> = plan
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (it.bead.as_str(), i))
+            .collect();
+        let by_bead: BTreeMap<&str, &import::Item> =
+            plan.items.iter().map(|it| (it.bead.as_str(), it)).collect();
+        let mut touched = std::mem::take(&mut self.touched);
+        for t in &mut touched {
+            if t.rewritten {
+                continue;
+            }
+            let (Some(item), Some(&i)) = (by_bead.get(t.bead.as_str()), pos.get(t.bead.as_str()))
+            else {
+                continue;
+            };
+            // Only what comes later in the plan, and the bead itself, was
+            // unknown at creation.
+            let later: BTreeMap<String, u64> = self
+                .numbers
+                .iter()
+                .filter(|(b, _)| pos.get(b.as_str()).is_some_and(|&p| p >= i))
+                .map(|(b, n)| (b.clone(), *n))
+                .collect();
+            if later.is_empty() || import::rewrite_ids(&item.body, &later) == item.body {
+                continue;
+            }
+            // A resumed bead's body is whatever is on GitHub now: it may
+            // already carry the rewrite (killed before the checkpoint), or
+            // edits made by hand. Rewrite that text in place.
+            let base = if t.resumed {
+                match current_body(self.ctx, t.number) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        self.warnings.push(format!(
+                            "{} (#{}): could not read its body: {err:#}. Run gbd import again to retry",
+                            t.bead, t.number
+                        ));
+                        t.clean = false;
+                        continue;
+                    }
+                }
+            } else {
+                item.body.clone()
+            };
+            let body = import::rewrite_ids(&base, &self.numbers);
+            if body == base {
+                // Nothing left to rewrite: checkpoint what an earlier run did.
+                t.rewritten = true;
+                if let Err(err) = self.record(t, import::Phase::Created) {
+                    self.warnings.push(format!("{err:#}"));
+                    t.clean = false;
+                }
+                continue;
+            }
+            let n = t.number.to_string();
+            let args = [
+                "issue",
+                "edit",
+                &n,
+                "-R",
+                &self.ctx.repo.name_with_owner,
+                "--body-file",
+                "-",
+            ];
+            match gh::run_stdin(&args, body.as_bytes()) {
+                Ok(_) => {
+                    t.rewritten = true;
+                    self.rewritten.push(t.number);
+                    if let Err(err) = self.record(t, import::Phase::Created) {
+                        self.warnings.push(format!("{err:#}"));
+                        t.clean = false;
+                    }
+                }
+                Err(err) => {
+                    self.warnings.push(format!(
+                        "{} (#{}): body still mentions Beads ids; edit failed: {err:#}. Run gbd import again to retry",
+                        t.bead, t.number
+                    ));
+                    t.clean = false;
+                }
+            }
+        }
+        self.touched = touched;
+    }
+
+    /// Comments are the one step that is not idempotent, so each carries a
+    /// hidden `<!-- gbd-import bead/k -->` marker. A resumed bead is first
+    /// reconciled against the comments GitHub already has, so a kill
+    /// between a post and its checkpoint never duplicates one; then each
+    /// post is checkpointed, a failure stops that bead's rest, and `done`
+    /// follows the last one only when everything else on the bead
+    /// succeeded too.
+    fn comments(&mut self, plan: &import::Plan) -> Result<()> {
+        let mut touched = std::mem::take(&mut self.touched);
+        for t in &mut touched {
+            let Some(item) = plan.items.iter().find(|i| i.bead == t.bead) else {
+                continue;
+            };
+            if t.resumed && t.comments < item.comments.len() {
+                match self.posted_on_github(t) {
+                    Ok(on_github) => t.comments = t.comments.max(on_github),
+                    Err(err) => {
+                        self.warnings.push(format!(
+                            "{} (#{}): could not read its comments, none posted: {err:#}. Run gbd import again to retry",
+                            t.bead, t.number
+                        ));
+                        t.clean = false;
+                        continue;
+                    }
+                }
+            }
+            for (k, body) in item.comments.iter().enumerate().skip(t.comments) {
+                let n = t.number.to_string();
+                let body = format!(
+                    "{}\n\n{}",
+                    import::rewrite_ids(body, &self.numbers),
+                    import::comment_marker(&t.bead, k + 1)
+                );
+                let args = [
+                    "issue",
+                    "comment",
+                    &n,
+                    "-R",
+                    &self.ctx.repo.name_with_owner,
+                    "--body-file",
+                    "-",
+                ];
+                if let Err(err) = gh::run_stdin(&args, body.as_bytes()) {
+                    self.warnings.push(format!(
+                        "{} (#{}): comment {} not added: {err:#}. Run gbd import again to retry",
+                        t.bead,
+                        t.number,
+                        k + 1
+                    ));
+                    t.clean = false;
+                    break;
+                }
+                t.comments = k + 1;
+                self.record(t, import::Phase::Created)?;
+            }
+            if t.clean {
+                self.record(t, import::Phase::Done)?;
+                if t.resumed {
+                    self.finished.push(t.bead.clone());
+                }
+            }
+        }
+        self.touched = touched;
+        Ok(())
+    }
+
+    /// How many of a bead's comments are already on its issue, by marker.
+    fn posted_on_github(&self, t: &Touched) -> Result<usize> {
+        let path = format!(
+            "repos/{}/issues/{}/comments",
+            self.ctx.repo.name_with_owner, t.number
+        );
+        // `--paginate` alone prints one JSON array per page; `--slurp` wraps
+        // the pages in one outer array.
+        let pages: Vec<Vec<Value>> = gh::run_json(&["api", &path, "--paginate", "--slurp"])?;
+        let bodies: Vec<&str> = pages
+            .iter()
+            .flatten()
+            .filter_map(|c| c.get("body").and_then(Value::as_str))
+            .collect();
+        Ok(import::posted_comments(&bodies, &t.bead))
+    }
+}
+
+/// Whether an issue is open right now.
+fn issue_is_open(ctx: &Ctx, number: u64) -> Result<bool> {
+    let n = number.to_string();
+    let view: Value = gh::run_json(&[
+        "issue",
+        "view",
+        &n,
+        "-R",
+        &ctx.repo.name_with_owner,
+        "--json",
+        "state",
+    ])?;
+    Ok(view
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("OPEN")))
+}
+
+/// The body an issue has right now.
+fn current_body(ctx: &Ctx, number: u64) -> Result<String> {
+    let n = number.to_string();
+    let view: Value = gh::run_json(&[
+        "issue",
+        "view",
+        &n,
+        "-R",
+        &ctx.repo.name_with_owner,
+        "--json",
+        "body",
+    ])?;
+    Ok(view
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
+}
+
+/// The issue an earlier import made for `bead`, found by the footer its
+/// body carries ("Imported from Beads" followed by the id in backticks).
+/// The newest issues are read directly first, since the one a killed run
+/// just created is not in the search index yet; search covers the rest.
+fn find_imported(ctx: &Ctx, bead: &str) -> Result<Option<(u64, String)>> {
+    let footer = format!("Imported from Beads `{bead}`");
+    let pick = |found: &[Value]| -> Option<(u64, String)> {
+        found.iter().find_map(|i| {
+            let body = i.get("body").and_then(Value::as_str)?;
+            if !body.contains(&footer) {
+                return None;
+            }
+            Some((
+                i.get("number")?.as_u64()?,
+                i.get("url")?.as_str()?.to_string(),
+            ))
+        })
+    };
+    let repo = ctx.repo.name_with_owner.as_str();
+    let newest: Vec<Value> = gh::run_json(&[
+        "issue",
+        "list",
+        "-R",
+        repo,
+        "--state",
+        "all",
+        "--limit",
+        "20",
+        "--json",
+        "number,url,body",
+    ])
+    .with_context(|| format!("checking the newest issues for an unrecorded {bead}"))?;
+    if let Some(hit) = pick(&newest) {
+        return Ok(Some(hit));
+    }
+    let query = format!("\"Imported from Beads {bead}\" in:body");
+    let found: Vec<Value> = gh::run_json(&[
+        "issue",
+        "list",
+        "-R",
+        repo,
+        "--search",
+        &query,
+        "--state",
+        "all",
+        "--limit",
+        "20",
+        "--json",
+        "number,url,body",
+    ])
+    .with_context(|| format!("checking GitHub for an unrecorded {bead}"))?;
+    Ok(pick(&found))
+}
+
+/// Upsert every `_type: memory` line into the memories issue.
+fn memories_for_import(ctx: &Ctx, records: &[beads::Memory]) -> Result<(u64, usize, usize)> {
+    let (issue, mut map) = memories(ctx)?;
+    let (mut added, mut updated) = (0, 0);
+    for m in records {
+        if map.insert(m.key.clone(), m.value.clone()).is_some() {
+            updated += 1;
+        } else {
+            added += 1;
+        }
+    }
+    memory::save(&ctx.repo, issue, &map)?;
+    Ok((issue, added, updated))
 }
 
 fn cmd_blocked(ctx: &Ctx) -> Result<u8> {

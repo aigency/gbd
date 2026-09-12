@@ -410,7 +410,10 @@ fn board_fixtures(h: &Harness) {
             {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
      .on("padd", "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/12 --format json",
          r#"{"id":"PVTI_12"}"#)
-     .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "");
+     .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "")
+     // The importer's check for an issue an earlier run created but never recorded.
+     .on("no-unrecorded", "issue list -R acme/widgets --search", "[]")
+     .on("no-newest", "issue list -R acme/widgets --state all --limit 20 --json number,url,body", "[]");
 }
 
 #[test]
@@ -1849,11 +1852,925 @@ fn import_dry_run_prints_the_plan_and_calls_nothing() {
         "a dry run is local: not even gh --version or auth: {}",
         h.calls()
     );
-    // The importer itself is not here yet: refuse rather than half-import.
+    // Without --dry-run the real run needs --yes; nothing is written first.
+    board_fixtures(&h);
     h.gbd()
         .args(["import", "--from-beads", fixture.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("can only --dry-run"));
+        .stderr(predicate::str::contains("Add --yes, or --dry-run"));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
+
+#[test]
+fn import_creates_issues_in_dependency_order_through_the_create_path() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"## old-key\\n\\nstill here\\n\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
+
+    // Refuses without --yes, before any write.
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "this creates 3 issues in acme/widgets and writes 1 memories. Add --yes",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1/3  wx-1 → #101  [Epic] Widget API v2\n",
+        ))
+        .stdout(predicate::str::contains(
+            "2/3  wx-2 → #102  [Bug] Auth refresh drops the session  ✓\n",
+        ))
+        .stdout(predicate::str::contains(
+            "3/3  wx-1.1 → #103  [Task] Rename the endpoints\n",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 3 issues (1 closed); memories: 1 new, 0 updated on #3; 0 warnings",
+        ));
+    let calls = h.calls();
+    let at = |s: &str| {
+        calls
+            .find(s)
+            .unwrap_or_else(|| panic!("{s} not called:\n{calls}"))
+    };
+    // Creation order follows the edges; each create carries its edges.
+    assert!(
+        at("--title Widget API v2") < at("--title Auth refresh")
+            && at("--title Auth refresh") < at("--title Rename"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--title Rename the endpoints --body Child of the epic; see #102 and wx-9."),
+        "a mention of a bead created earlier in the run is rewritten; an unknown one is kept: {calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--type Epic\n"),
+        "epic has no edges: {calls}"
+    );
+    assert!(
+        !calls.contains("--label"),
+        "nothing is ever a label: {calls}"
+    );
+    // Org fields: one lookup per field for the whole run, then plain writes.
+    assert_eq!(
+        calls.matches(FIELDS_GET).count(),
+        2,
+        "field ids are cached: {calls}"
+    );
+    assert!(
+        calls.contains(r#"STDIN: {"issue_field_values":[{"field_id":46822523,"value":"P1"}]}"#),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(r#"STDIN: {"issue_field_values":[{"field_id":46822523,"value":"P0"}]}"#),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(
+            r#"STDIN: {"issue_field_values":[{"field_id":7886557,"value":"2026-10-01"}]}"#
+        ),
+        "{calls}"
+    );
+    // Closed bead: assignee, close with the guessed reason, then Done.
+    assert!(at("--add-assignee dev1") < at("issue close 102"), "{calls}");
+    assert!(
+        at("issue close 102") < at("--single-select-option-id O_done"),
+        "{calls}"
+    );
+    // Cards: Deferred (defer_until), Done, Ready (its only blocker is closed).
+    for opt in ["O_def", "O_done", "O_ready"] {
+        assert_eq!(
+            calls
+                .matches(&format!("--single-select-option-id {opt}"))
+                .count(),
+            1,
+            "{opt}: {calls}"
+        );
+    }
+    assert!(!calls.contains("O_blocked"), "{calls}");
+    // Notes and comments arrive on stdin, notes first.
+    assert!(
+        at("STDIN: **Notes**\n\nKeep the old routes")
+            < at("STDIN: **dev2** · 2026-03-03\n\nAlso drop the v1 docs."),
+        "{calls}"
+    );
+    assert_eq!(calls.matches("issue comment 103").count(), 2, "{calls}");
+    // wx-1 mentioned wx-2 before it existed: its body is edited once at the end.
+    let fixed = calls
+        .rsplit("issue edit 101 -R acme/widgets --body-file -\nSTDIN: ")
+        .next()
+        .unwrap();
+    assert!(
+        fixed.starts_with("Umbrella; the auth fix is #102. Tracked as #101."),
+        "a self-reference is rewritten too: {fixed}"
+    );
+    assert!(
+        !calls.contains("issue edit 103 -R acme/widgets --body-file"),
+        "a backward reference needs no edit: {calls}"
+    );
+    // Memories merge into the existing body.
+    let saved = calls
+        .rsplit("issue edit 3 -R acme/widgets --body-file -\nSTDIN: ")
+        .next()
+        .unwrap();
+    assert!(
+        saved.contains("## deploy-runbook") && saved.contains("## old-key"),
+        "{saved}"
+    );
+}
+
+#[test]
+fn import_needs_a_board_before_it_creates_anything() {
+    let h = Harness::new(); // .gbd.yml without project:
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/1",
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "needs a board so In Progress and Deferred survive",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
+
+#[test]
+fn import_reports_what_it_could_not_map_and_a_failed_close() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on_fail("close", "issue close 102 -R acme/widgets --reason duplicate", "HTTP 502")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        // The plan's losses are shown before anything is created.
+        .stdout(predicate::str::contains(
+            "Cannot map (1):\n  wx-1.1: related edge to wx-2 has no GitHub relation\n",
+        ))
+        .stdout(predicate::str::contains(
+            "2/3  wx-2 → #102  [Bug] Auth refresh drops the session\n",
+        ))
+        .stdout(predicate::str::contains("imported 3 issues (0 closed)"))
+        .stdout(predicate::str::contains(
+            "2 warnings; 1 could not map (listed above)",
+        ))
+        .stderr(predicate::str::contains("wx-2 (#102): not closed: "))
+        .stderr(predicate::str::contains("Run gbd import again to retry"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("O_done"),
+        "an open issue is never marked Done: {calls}"
+    );
+    assert!(!calls.contains("✓"), "{calls}");
+    // wx-1.1 is blocked by wx-2, which is still open: Blocked, not the planned Ready.
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    // Its dependent is placed against it and stays resumable too.
+    let last_wx11 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-1.1\""))
+        .unwrap();
+    assert!(
+        last_wx11.contains("\"phase\":\"created\""),
+        "the dependent waits for the close to succeed: {map}"
+    );
+    // The blocker never reaches `done`, so the next run retries its close.
+    let last_wx2 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-2\""))
+        .unwrap();
+    assert!(last_wx2.contains("\"phase\":\"created\""), "{map}");
+}
+
+#[test]
+fn import_reports_what_exists_when_a_create_fails() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on_fail("create-3", "--title Rename the endpoints", "HTTP 500: Internal Server Error")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "stopped: wx-1.1: stopped after 2 of 3",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 of 3 issues before that (1 closed)",
+        ))
+        .stdout(predicate::str::contains(
+            "/beads-map.jsonl (run gbd import again to resume)",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("issue view 3"),
+        "memories are not written on a failed run: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert_eq!(
+        map.lines()
+            .filter(|l| l.contains("\"phase\":\"done\""))
+            .count(),
+        0,
+        "nothing is done until every issue exists and its comments are on: {map}"
+    );
+    assert_eq!(
+        map.lines()
+            .filter(|l| l.contains("\"phase\":\"created\""))
+            .count(),
+        2,
+        "{map}"
+    );
+}
+
+#[test]
+fn import_resumes_from_the_mapping_file() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // A previous run finished wx-1, created wx-2, and died before its
+    // follow-up steps.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"created\"}\n\
+         {\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n\
+         {\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"created\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
+
+    // The dry run says what will be skipped.
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Already imported (1), skipped: wx-1",
+        ))
+        .stdout(predicate::str::contains(
+            "Partially imported (1), to be finished: wx-2",
+        ));
+
+    fs::create_dir(h.cwd.path().join("sub")).unwrap();
+    // From a subdirectory: the default mapping file is the one next to .gbd.yml.
+    h.gbd()
+        .current_dir(h.cwd.path().join("sub"))
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1/3  wx-1 = #101  (already imported)\n",
+        ))
+        .stdout(predicate::str::contains("2/3  wx-2 = #102  (finishing)\n"))
+        .stdout(predicate::str::contains(
+            "2/3  wx-2 → #102  [Bug] Auth refresh drops the session  ✓\n",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 finished from an earlier run, 1 already imported)",
+        ))
+        .stdout(predicate::str::contains("/beads-map.jsonl (bead → issue"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("--title Widget API v2") && !calls.contains("--title Auth refresh"),
+        "nothing is created twice: {calls}"
+    );
+    // wx-2 gets its follow-up steps replayed: priority, assignee, close, card.
+    assert!(
+        calls.contains("issues/102/issue-field-values --input -"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--add-assignee dev1") && calls.contains("issue close 102"),
+        "{calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_done").count(),
+        1,
+        "{calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "edges resolve through the mapping: {calls}"
+    );
+    assert!(
+        !calls.contains("issue edit 101"),
+        "a done bead is never re-edited, even with a forward reference: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let lines: Vec<&str> = map.lines().collect();
+    assert_eq!(lines.len(), 8, "{map}");
+    let phases: Vec<String> = lines[3..]
+        .iter()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            format!(
+                "{} {} {}",
+                v["bead"].as_str().unwrap(),
+                v["phase"].as_str().unwrap(),
+                v["comments"]
+            )
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "wx-1.1 created 0",
+            "wx-2 done 0",
+            "wx-1.1 created 1",
+            "wx-1.1 created 2",
+            "wx-1.1 done 2"
+        ],
+        "pass one creates and places; pass two posts comments with a checkpoint each, then done: {map}"
+    );
+}
+
+#[test]
+fn import_refuses_a_mapping_file_from_another_repo() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":5,\"url\":\"https://github.com/acme/other/issues/5\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "create",
+        "issue create -R acme/widgets",
+        "https://github.com/acme/widgets/issues/1",
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("beads-map.jsonl was written for acme/other (wx-1 → https://github.com/acme/other/issues/5), not acme/widgets"));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
+
+#[test]
+fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on_fail("edit-101", "issue edit 101 -R acme/widgets --body-file -", "HTTP 500: Internal Server Error");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "wx-1 (#101): body still mentions Beads ids; edit failed",
+        ));
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last_wx1 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-1\""))
+        .unwrap();
+    assert!(
+        last_wx1.contains("\"phase\":\"created\""),
+        "not done until the body is right: {map}"
+    );
+    assert!(
+        map.lines()
+            .rfind(|l| l.contains("\"bead\":\"wx-2\""))
+            .unwrap()
+            .contains("\"phase\":\"done\""),
+        "{map}"
+    );
+}
+
+#[test]
+fn import_reconciles_comments_from_github_before_resuming() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // Everything was created; wx-1 had its body rewritten; wx-1.1's first
+    // comment was posted but the kill came before its checkpoint.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        concat!(
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"created\",\"comments\":0}\n",
+            "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"created\",\"comments\":0}\n",
+        ),
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("values", "issue-field-values --input -", "{}")
+    .on(
+        "comments-103",
+        "repos/acme/widgets/issues/103/comments --paginate --slurp",
+        r#"[[{"body":"**Notes**\n\nKeep the old routes for a release.\n\n<!-- gbd-import wx-1.1/1 -->"}],[{"body":"a human said hi"}]]"#,
+    )
+    // wx-2 is done in the file and closed in the export, but was reopened on
+    // GitHub since: wx-1.1 (blocked by it) must land on Blocked, not Ready.
+    .on("state-102", "issue view 102 -R acme/widgets --json state", "{\"state\":\"OPEN\"}")
+    // wx-1 (resumed, planned open) was closed by hand meanwhile: Done, not Ready.
+    .on("state-101", "issue view 101 -R acme/widgets --json state", "{\"state\":\"CLOSED\"}")
+    .on("state-103", "issue view 103 -R acme/widgets --json state", "{\"state\":\"OPEN\"}")
+    // wx-1's body was already rewritten (and touched by hand) before the kill.
+    .on(
+        "body-101",
+        "issue view 101 -R acme/widgets --json body",
+        "{\"body\":\"Umbrella; the auth fix is #102, says a human.\\n\\n---\\nImported from Beads `wx-1` (created 2026-03-01 by dev1).\"}",
+    )
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 2 finished from an earlier run, 1 already imported)",
+        ));
+    let calls = h.calls();
+    assert!(!calls.contains("issue create"), "{calls}");
+    assert!(
+        !calls.contains("issue edit 101 -R acme/widgets --body-file"),
+        "nothing left to rewrite, so no edit: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert!(
+        map.lines()
+            .any(|l| l.contains("\"bead\":\"wx-1\"") && l.contains("\"rewritten\":true")),
+        "the finished rewrite is checkpointed: {map}"
+    );
+    assert_eq!(
+        calls.matches("issue comment 103").count(),
+        1,
+        "only the second comment is posted: {calls}"
+    );
+    assert!(
+        calls.contains("issue view 102 -R acme/widgets --json state"),
+        "a finished blocker is read live: {calls}"
+    );
+    assert_eq!(
+        calls.matches("--single-select-option-id O_done").count(),
+        1,
+        "wx-1, closed on GitHub meanwhile: {calls}"
+    );
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "wx-1.1 is blocked by the reopened wx-2: {calls}"
+    );
+    assert!(
+        !calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+    assert!(calls.contains("STDIN: **dev2** · 2026-03-03\n\nAlso drop the v1 docs.\n\n<!-- gbd-import wx-1.1/2 -->"), "marker on the posted comment: {calls}");
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last: Vec<&str> = map.lines().rev().take(3).collect();
+    assert!(
+        last[0].contains("\"bead\":\"wx-1.1\"")
+            && last[0].contains("\"phase\":\"done\"")
+            && last[0].contains("\"comments\":2"),
+        "{map}"
+    );
+}
+
+#[test]
+fn import_adopts_an_issue_created_but_never_recorded() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // wx-1 is done; the previous run was killed right after creating wx-2,
+    // before its line was written.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    // Just created, so not in the search index yet: it shows among the newest issues.
+    .on(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."},{"number":101,"url":"https://github.com/acme/widgets/issues/101","body":"…Imported from Beads `wx-1`…"}]"#,
+    )
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("retype", "issue edit 102 -R acme/widgets --type Bug", "")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wx-2 = #102  (found on GitHub, unrecorded; recorded now)",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 finished from an earlier run, 1 already imported)",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("--title Auth refresh"),
+        "not created twice: {calls}"
+    );
+    assert!(
+        calls.contains("issue edit 102 -R acme/widgets --type Bug"),
+        "the type a dying create may not have set is reapplied: {calls}"
+    );
+    assert!(
+        !calls.contains("issue list -R acme/widgets --search"),
+        "found among the newest issues, no search needed: {calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "{calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert!(
+        map.lines().nth(1).unwrap().contains("\"bead\":\"wx-2\"")
+            && map
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("\"phase\":\"created\""),
+        "{map}"
+    );
+
+    // With an empty file and the second bead on GitHub too, it is a refusal:
+    // an earlier import ran without this file.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "found-wx2",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-2\" in:body",
+        r#"[{"number":8,"url":"https://github.com/acme/widgets/issues/8","body":"y\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+    )
+    .on(
+        "found-wx1",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-1\" in:body",
+        r#"[{"number":7,"url":"https://github.com/acme/widgets/issues/7","body":"x\n\n---\nImported from Beads `wx-1` (created 2026-03-01 by dev1)."}]"#,
+    )
+    .on("create", "issue create -R acme/widgets", "https://github.com/acme/widgets/issues/1")
+    .on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "wx-1 already exists as #7 (https://github.com/acme/widgets/issues/7) and so does wx-2, but",
+        ))
+        .stderr(predicate::str::contains(
+            "is empty: an earlier import ran without this file",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    // With an empty file and only the first bead on GitHub, the first record
+    // was lost: adopt it and carry on.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "found-wx1",
+        "issue list -R acme/widgets --search \"Imported from Beads wx-1\" in:body",
+        r#"[{"number":7,"url":"https://github.com/acme/widgets/issues/7","body":"Umbrella; the auth fix is wx-2.\n\n---\nImported from Beads `wx-1` (created 2026-03-01 by dev1)."}]"#,
+    )
+    .on("fields", FIELDS_GET, r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#)
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("retype-7", "issue edit 7 -R acme/widgets --type Epic", "")
+    .on("body-7", "issue view 7 -R acme/widgets --json body", "{\"body\":\"Umbrella; the auth fix is wx-2.\\n\\n---\\nImported from Beads `wx-1` (created 2026-03-01 by dev1).\"}")
+    .on("edit-7", "issue edit 7 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wx-1 = #7  (found on GitHub, unrecorded; recorded now)",
+        ));
+    let calls = h.calls();
+    assert!(!calls.contains("--title Widget API v2"), "{calls}");
+    assert!(
+        calls.contains("--type Task --parent 7 --blocked-by 102"),
+        "{calls}"
+    );
+    // Its live body is rewritten in place, so the forward reference is fixed.
+    let fixed = calls
+        .rsplit("issue edit 7 -R acme/widgets --body-file -\nSTDIN: ")
+        .next()
+        .unwrap();
+    assert!(
+        fixed.starts_with("Umbrella; the auth fix is #102."),
+        "{fixed}"
+    );
+}
+
+#[test]
+fn import_of_memories_alone_needs_no_board() {
+    let h = Harness::new(); // .gbd.yml without project:, memory_issue 3
+    let export = h.cwd.path().join("memories.jsonl");
+    fs::write(&export, "{\"_type\":\"memory\",\"key\":\"deploy-runbook\",\"value\":\"Deploy with make deploy.\"}\n").unwrap();
+    h.on(
+        "mem-view",
+        "issue view 3 -R acme/widgets --json body",
+        "{\"body\":\"\"}",
+    )
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", export.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no issues to import; memories: 1 new, 0 updated on #3",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("project view") && !calls.contains("issue-fields"),
+        "no board, no fields: {calls}"
+    );
+    assert!(calls.contains("\n## deploy-runbook\n"), "{calls}");
+}
+
+#[test]
+fn import_with_everything_done_only_retries_the_memories() {
+    let h = Harness::new(); // no board configured
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        concat!(
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"done\"}\n",
+        ),
+    )
+    .unwrap();
+    h.on(
+        "mem-view",
+        "issue view 3 -R acme/widgets --json body",
+        "{\"body\":\"\"}",
+    )
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no issues left to import (3 already imported); memories: 1 new, 0 updated on #3",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("project view")
+            && !calls.contains("issue-fields")
+            && !calls.contains("issue create"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn import_keeps_a_dependent_unfinished_when_its_blocker_cannot_be_read() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        concat!(
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"created\",\"comments\":2,\"rewritten\":true}\n",
+        ),
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("values", "issue-field-values --input -", "{}")
+    .on_fail("state-102", "issue view 102 -R acme/widgets --json state", "HTTP 502: Bad Gateway")
+    .on("state-103", "issue view 103 -R acme/widgets --json state", "{\"state\":\"OPEN\"}")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "wx-1.1 (#103): placed against wx-2, whose state could not be read",
+        ));
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-1.1\""))
+        .unwrap();
+    assert!(
+        last.contains("\"phase\":\"created\""),
+        "not done until the blocker can be read: {map}"
+    );
+}
+
+#[test]
+fn import_stops_when_an_adopted_issue_cannot_be_completed() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+    )
+    // The type a dying create may not have set cannot be put back.
+    .on_fail("retype", "issue edit 102 -R acme/widgets --type Bug", "HTTP 500: boom")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "wx-2 is #102 (https://github.com/acme/widgets/issues/102) but its type could not be reapplied; nothing was recorded",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("--title Rename the endpoints"),
+        "nothing after it is created: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert_eq!(
+        map.lines().count(),
+        1,
+        "the adoption is not recorded: {map}"
+    );
+}
+
+#[test]
+fn import_refuses_a_mapping_file_another_import_holds() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // Another import (or a retry of one that only looks hung) has the file.
+    let other = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(h.cwd.path().join("beads-map.jsonl"))
+        .unwrap();
+    other.try_lock().unwrap();
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "beads-map.jsonl is in use by another gbd import; wait for it to finish",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+    drop(other);
 }
