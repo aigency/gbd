@@ -2121,7 +2121,7 @@ fn import_reports_what_exists_when_a_create_fails() {
             "imported 2 of 3 issues before that (1 closed)",
         ))
         .stdout(predicate::str::contains(
-            "mapping: beads-map.jsonl (run gbd import again to resume)",
+            "/beads-map.jsonl (run gbd import again to resume)",
         ));
     let calls = h.calls();
     assert!(
@@ -2195,7 +2195,10 @@ fn import_resumes_from_the_mapping_file() {
             "Partially imported (1), to be finished: wx-2",
         ));
 
+    fs::create_dir(h.cwd.path().join("sub")).unwrap();
+    // From a subdirectory: the default mapping file is the one next to .gbd.yml.
     h.gbd()
+        .current_dir(h.cwd.path().join("sub"))
         .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
         .assert()
         .success()
@@ -2209,7 +2212,7 @@ fn import_resumes_from_the_mapping_file() {
         .stdout(predicate::str::contains(
             "imported 2 issues (1 closed, 1 finished from an earlier run, 1 already imported)",
         ))
-        .stdout(predicate::str::contains("mapping: beads-map.jsonl"));
+        .stdout(predicate::str::contains("/beads-map.jsonl (bead → issue"));
     let calls = h.calls();
     assert!(
         !calls.contains("--title Widget API v2") && !calls.contains("--title Auth refresh"),
@@ -2232,6 +2235,10 @@ fn import_resumes_from_the_mapping_file() {
     assert!(
         calls.contains("--type Task --parent 101 --blocked-by 102"),
         "edges resolve through the mapping: {calls}"
+    );
+    assert!(
+        !calls.contains("issue edit 101"),
+        "a done bead is never re-edited, even with a forward reference: {calls}"
     );
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
     let lines: Vec<&str> = map.lines().collect();
@@ -2282,4 +2289,53 @@ fn import_refuses_a_mapping_file_from_another_repo() {
         .failure()
         .stderr(predicate::str::contains("beads-map.jsonl was written for acme/other (wx-1 → https://github.com/acme/other/issues/5), not acme/widgets"));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
+
+#[test]
+fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on_fail("edit-101", "issue edit 101 -R acme/widgets --body-file -", "HTTP 500: Internal Server Error");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "wx-1 (#101): body still mentions Beads ids; edit failed",
+        ));
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last_wx1 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-1\""))
+        .unwrap();
+    assert!(
+        last_wx1.contains("\"phase\":\"created\""),
+        "not done until the body is right: {map}"
+    );
+    assert!(
+        map.lines()
+            .rfind(|l| l.contains("\"bead\":\"wx-2\""))
+            .unwrap()
+            .contains("\"phase\":\"done\""),
+        "{map}"
+    );
 }

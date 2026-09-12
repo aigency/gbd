@@ -226,9 +226,10 @@ pub enum Commands {
         #[arg(long)]
         yes: bool,
         /// Where each bead → issue pair is recorded as it happens; an
-        /// existing file resumes the run and drives id rewriting
-        #[arg(long, value_name = "FILE", default_value = "beads-map.jsonl")]
-        mapping: PathBuf,
+        /// existing file resumes the run and drives id rewriting. Default:
+        /// beads-map.jsonl next to .gbd.yml
+        #[arg(long, value_name = "FILE")]
+        mapping: Option<PathBuf>,
     },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
@@ -596,7 +597,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             dry_run,
             yes,
             mapping,
-        } => cmd_import(explicit, json, &from_beads, dry_run, yes, &mapping),
+        } => cmd_import(explicit, json, &from_beads, dry_run, yes, mapping),
         Commands::Ready {
             claim,
             explain,
@@ -1150,8 +1151,17 @@ fn cmd_import(
     from_beads: &Path,
     dry_run: bool,
     yes: bool,
-    mapping: &Path,
+    mapping: Option<PathBuf>,
 ) -> Result<u8> {
+    // The default lives beside .gbd.yml, so a resume from any directory
+    // of the repo finds the same file.
+    let mapping = mapping.unwrap_or_else(|| {
+        config::find().map_or_else(
+            || PathBuf::from("beads-map.jsonl"),
+            |cfg| cfg.with_file_name("beads-map.jsonl"),
+        )
+    });
+    let mapping = mapping.as_path();
     let export = beads::load(from_beads)?;
     let mut plan = import::plan(&export);
     let done = import::read_mapping(mapping)?;
@@ -1547,7 +1557,10 @@ impl Run<'_> {
 
     /// A body written before the bead it mentions existed still says
     /// `wx-9`. Now that every number is known, edit those bodies once.
-    /// Idempotent, so a resumed run repeats it harmlessly.
+    /// Only beads this run created or resumed: a `done` bead had this pass
+    /// in the run that finished it (`done` is written after it), and its
+    /// body may have been edited by hand since. A failed edit keeps the
+    /// bead off `done`, so the next run tries again.
     fn rewrite_forward(&mut self, plan: &import::Plan) {
         let pos: BTreeMap<&str, usize> = plan
             .items
@@ -1555,8 +1568,12 @@ impl Run<'_> {
             .enumerate()
             .map(|(i, it)| (it.bead.as_str(), i))
             .collect();
-        for (i, item) in plan.items.iter().enumerate() {
-            let Some(&number) = self.numbers.get(&item.bead) else {
+        let by_bead: BTreeMap<&str, &import::Item> =
+            plan.items.iter().map(|it| (it.bead.as_str(), it)).collect();
+        let mut touched = std::mem::take(&mut self.touched);
+        for t in &mut touched {
+            let (Some(item), Some(&i)) = (by_bead.get(t.bead.as_str()), pos.get(t.bead.as_str()))
+            else {
                 continue;
             };
             // Only what comes later in the plan was unknown at creation.
@@ -1570,7 +1587,7 @@ impl Run<'_> {
                 continue;
             }
             let body = import::rewrite_ids(&item.body, &self.numbers);
-            let n = number.to_string();
+            let n = t.number.to_string();
             let args = [
                 "issue",
                 "edit",
@@ -1581,13 +1598,17 @@ impl Run<'_> {
                 "-",
             ];
             match gh::run_stdin(&args, body.as_bytes()) {
-                Ok(_) => self.rewritten.push(number),
-                Err(err) => self.warnings.push(format!(
-                    "{} (#{number}): body still mentions Beads ids; edit failed: {err:#}",
-                    item.bead
-                )),
+                Ok(_) => self.rewritten.push(t.number),
+                Err(err) => {
+                    self.warnings.push(format!(
+                        "{} (#{}): body still mentions Beads ids; edit failed: {err:#}. Run gbd import again to retry",
+                        t.bead, t.number
+                    ));
+                    t.clean = false;
+                }
             }
         }
+        self.touched = touched;
     }
 
     /// Comments are the one step that is not idempotent: each one is
