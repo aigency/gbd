@@ -2349,6 +2349,10 @@ fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
             .unwrap()
             .contains("\"phase\":\"done\""),
         "{map}"
+    );
+}
+
+#[test]
 fn a_secondary_rate_limit_is_retried_after_waiting() {
     let h = Harness::new();
     h.on_seq(
