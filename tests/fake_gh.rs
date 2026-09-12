@@ -2045,6 +2045,7 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
         .stdout(predicate::str::contains(
             "2/3  wx-2 → #102  [Bug] Auth refresh drops the session\n",
         ))
+        .stdout(predicate::str::contains("imported 3 issues (0 closed)"))
         .stdout(predicate::str::contains(
             "1 warning; 1 could not map (listed above)",
         ))
