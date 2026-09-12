@@ -253,7 +253,7 @@ The toolchain is pinned in `rust-toolchain.toml` and CI reads it, so local clipp
 
 Tests never touch the network: `tests/fake_gh/gh` is a fake `gh` on `PATH` that answers from fixtures and logs every invocation, so tests assert what `gbd` asks `gh` for (one GraphQL call, no `--label`, the exact field-value body on stdin), not only what it prints. `tests/fixtures/snapshot.json` is a captured live response, so the parser is tested against GitHub's real shape.
 
-Releases are cut on merge to `main` by `.github/workflows/release.yml`: conventional-commit PR titles decide the semver bump (`feat:` minor, `fix:` patch, `!`/`BREAKING CHANGE` major), then tarballs for linux x86_64/arm64 and macOS arm64 plus `SHA256SUMS` go on a GitHub Release.
+Releases are cut on merge to `main` in two stages. `release.yml` decides the semver bump from conventional-commit PR titles (`feat:` minor, `fix:` patch, `!`/`BREAKING CHANGE` major), commits and tags the version, and dispatches `build-release.yml` on that tag. That second run builds tarballs for linux x86_64/arm64 and macOS arm64, signs them and `SHA256SUMS` with minisign, attests build provenance, and publishes the GitHub Release and the crate. Running the build on the tag is what makes the attestation name the same commit `gbd --version` prints.
 
 ### Contributing
 
