@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-12
+
+### Added
+
+- feat: keep a Blocked column on the board (#20)
+
+### Other
+
+- ci: one weekly Dependabot PR for all action updates (#8)
+- ci: pin every action to a commit SHA (#7)
+
 ## [1.1.0] - 2026-09-12
 
 ### Added
