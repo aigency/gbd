@@ -1,5 +1,6 @@
 //! gbd: Beads workflow on GitHub Issues and Projects. `gh` is the transport.
 
+pub mod beads;
 pub mod cli;
 pub mod config;
 pub mod fields;
