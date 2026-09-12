@@ -1175,16 +1175,20 @@ fn cmd_import(
     let ctx = Ctx::open(explicit, json)?;
     // A mapping file from another repo would silently skip beads and wire
     // edges to unrelated issues.
-    if let Some(m) = import::foreign_entry(&done, &ctx.repo.name_with_owner) {
-        bail!(
-            "{} was written for {} ({} → {}), not {}. Point --mapping at a fresh file",
-            mapping.display(),
-            m.repo().unwrap_or("an unknown repo"),
-            m.bead,
-            m.url,
-            ctx.repo.name_with_owner
-        );
-    }
+    let refuse_foreign = |done: &BTreeMap<String, import::Mapped>| -> Result<()> {
+        if let Some(m) = import::foreign_entry(done, &ctx.repo.name_with_owner) {
+            bail!(
+                "{} was written for {} ({} → {}), not {}. Point --mapping at a fresh file",
+                mapping.display(),
+                m.repo().unwrap_or("an unknown repo"),
+                m.bead,
+                m.url,
+                ctx.repo.name_with_owner
+            );
+        }
+        Ok(())
+    };
+    refuse_foreign(&done)?;
     if !yes {
         bail!(
             "this creates {} issues in {} and writes {} memories. Add --yes, or --dry-run to see the plan first",
@@ -1198,6 +1202,9 @@ fn cmd_import(
     // same state and create everything twice.
     let map = import::Mapping::open(mapping)?;
     let done = import::read_mapping(mapping)?;
+    // Checked again: another import may have written to the file between
+    // the first read and the lock.
+    refuse_foreign(&done)?;
     import::note_imported(&mut plan, &done);
     import_run(&ctx, &plan, map, &done)
 }
