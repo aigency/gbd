@@ -35,8 +35,13 @@ on:
           - minor
           - major
 
-# Releases must QUEUE, not cancel each other — a canceled half-release can
-# leave a tag with no release behind it.
+# Releases must QUEUE, not cancel each other. This lock is held for the
+# whole release: the version job waits for the stage-two run it dispatches,
+# so builds and publishes happen in tag order even when merges are quick.
+# GitHub keeps at most one pending run per group; a pending stage-one run
+# that gets superseded is harmless, because the newer run computes its bump
+# from main HEAD and folds the superseded commits into one version before
+# any tag exists.
 concurrency:
   group: release-main
   cancel-in-progress: false
@@ -171,12 +176,27 @@ jobs:
           # reached main.
           git push --atomic origin main "$TAG"
 
-      - name: Dispatch the build on the tag
+      - name: Dispatch the build on the tag and wait for it
         if: steps.compute.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.compute.outputs.tag }}
         run: |
           set -euo pipefail
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           gh workflow run build-release.yml --ref "$TAG" -f tag="$TAG"
-          echo "dispatched build-release.yml on $TAG"
+          echo "dispatched build-release.yml on $TAG; waiting for the run to appear"
+          RUN=""
+          for _ in $(seq 1 30); do
+            RUN=$(gh run list --workflow build-release.yml --branch "$TAG" --event workflow_dispatch \
+                    --created ">=$SINCE" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$RUN" ] && break
+            sleep 5
+          done
+          if [ -z "$RUN" ]; then
+            echo "build-release.yml run for $TAG did not appear; re-dispatch by hand:" >&2
+            echo "  gh workflow run build-release.yml --ref $TAG -f tag=$TAG" >&2
+            exit 1
+          fi
+          echo "watching run $RUN (this job holds the release lock until it finishes)"
+          gh run watch "$RUN" --exit-status --interval 30

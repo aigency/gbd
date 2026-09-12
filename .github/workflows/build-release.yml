@@ -24,8 +24,12 @@ on:
         type: string
         required: true
 
+# One group for every tag: stage one already serializes releases by
+# waiting on this run, and this keeps manual re-dispatches from overlapping
+# with an in-flight release. Never cancel: a half-published release is
+# worse than a queued one.
 concurrency:
-  group: build-release-${{ inputs.tag }}
+  group: build-release
   cancel-in-progress: false
 
 permissions:
