@@ -37,31 +37,42 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
     let mut wait = base;
     for attempt in 1..=RETRIES {
         let output = spawn(args, stdin)?;
-        match finish(args, &output) {
-            Err(err) if rate_limited(&err) => {
-                let ms = retry_after_ms(&err).unwrap_or(wait);
-                eprintln!(
-                    "gh: rate limited; retrying in {}s ({attempt} of {RETRIES})",
-                    ms.div_ceil(1000)
-                );
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                wait = wait.saturating_mul(2);
-            }
-            other => return other,
+        // Classified on what gh printed, never on the command line: a body
+        // that happens to say "rate limit" must not turn a 502 into a retry.
+        if output.status.success() || !rate_limited(&output) {
+            return finish(args, &output);
         }
+        let ms = retry_after_ms(&output).unwrap_or(wait);
+        eprintln!(
+            "gh: rate limited; retrying in {}s ({attempt} of {RETRIES})",
+            ms.div_ceil(1000)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        wait = wait.saturating_mul(2);
     }
     finish(args, &spawn(args, stdin)?)
 }
 
-fn rate_limited(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
+/// gh's own output for a failed call, lowercased: stderr, else stdout.
+fn failure_text(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&output.stdout)
+    } else {
+        stderr
+    };
+    text.to_ascii_lowercase()
+}
+
+fn rate_limited(output: &Output) -> bool {
+    let msg = failure_text(output);
     msg.contains("http 429")
         || (msg.contains("http 403") && (msg.contains("rate limit") || msg.contains("abuse")))
 }
 
 /// `retry-after: 30` → 30 000 ms, when gh relays the header.
-fn retry_after_ms(err: &anyhow::Error) -> Option<u64> {
-    let msg = format!("{err:#}").to_ascii_lowercase();
+fn retry_after_ms(output: &Output) -> Option<u64> {
+    let msg = failure_text(output);
     let idx = msg.find("retry-after:")?;
     let secs: String = msg[idx + "retry-after:".len()..]
         .trim_start()

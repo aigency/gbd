@@ -2390,6 +2390,32 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         "{}",
         h.calls()
     );
+
+    // The words in the command itself never count: only what gh printed.
+    let h = Harness::new();
+    h.on_fail(
+        "create",
+        "issue create -R acme/widgets",
+        "HTTP 502: Bad Gateway",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args([
+            "create",
+            "HTTP 403 rate limit abuse",
+            "-t",
+            "Task",
+            "--body",
+            "HTTP 429",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("issue create").count(),
+        1,
+        "{}",
+        h.calls()
+    );
 }
 
 #[test]
