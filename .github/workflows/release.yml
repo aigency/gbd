@@ -173,6 +173,13 @@ jobs:
     needs: [version]
     if: needs.version.outputs.release == 'true'
     runs-on: ${{ matrix.runner }}
+    # id-token + attestations: sign a build-provenance statement for each
+    # tarball with the workflow's own identity (verify with
+    # `gh attestation verify <file> --repo aigency/gbd`). No key to manage.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -234,6 +241,11 @@ jobs:
           tar czf "${TARBALL}" -C "target/${TARGET}/release-ci" gbd
           shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256"
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: gbd-${{ needs.version.outputs.tag }}-${{ matrix.target }}.tar.gz
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
@@ -294,6 +306,36 @@ jobs:
           cat gbd-*.tar.gz.sha256 > SHA256SUMS
           cat SHA256SUMS
 
+      # minisign: one `.sig` per tarball (what cargo binstall verifies against
+      # the pubkey in Cargo.toml) and SHA256SUMS.minisig (what install.sh
+      # verifies). The key is the MINISIGN_KEY secret; the pubkey is read from
+      # Cargo.toml at this tag and every signature is verified against it
+      # before upload, so a wrong secret fails here rather than at install time.
+      - name: Sign release assets (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MINISIGN_KEY" ]; then
+            echo "MINISIGN_KEY is not set; Cargo.toml declares a pubkey, so an unsigned release would be uninstallable with cargo binstall" >&2
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign >/dev/null
+          KEY="$RUNNER_TEMP/minisign.key"
+          umask 077
+          printf '%s\n' "$MINISIGN_KEY" > "$KEY"
+          PUBKEY=$(sed -n 's/^pubkey = "\(.*\)"/\1/p' Cargo.toml)
+          for f in dist/gbd-*.tar.gz dist/SHA256SUMS; do
+            case "$f" in
+              *.tar.gz) sig="$f.sig" ;;
+              *)        sig="$f.minisig" ;;
+            esac
+            minisign -S -W -s "$KEY" -x "$sig" -m "$f"
+            minisign -V -q -P "$PUBKEY" -x "$sig" -m "$f"
+            echo "signed and verified: $f"
+          done
+          rm -f "$KEY"
+
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
         with:
@@ -324,12 +366,16 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
               dist/gbd-*.tar.gz \
+              dist/gbd-*.tar.gz.sig \
               dist/SHA256SUMS \
+              dist/SHA256SUMS.minisig \
               --clobber
           else
             gh release create "$TAG" \
               dist/gbd-*.tar.gz \
+              dist/gbd-*.tar.gz.sig \
               dist/SHA256SUMS \
+              dist/SHA256SUMS.minisig \
               --title "$TAG" \
               --notes-file RELEASE_NOTES.md
           fi

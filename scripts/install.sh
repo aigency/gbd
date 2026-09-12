@@ -2,17 +2,16 @@
 # gbd installer — POSIX sh, designed for `curl -fsSL <url> | sh`.
 #
 # Resolves OS/arch, downloads the matching release tarball + SHA256SUMS from
-# GitHub Releases, verifies the checksum, extracts the `gbd` binary into
-# ${GBD_INSTALL_DIR:-$HOME/.local/bin}, and writes a sentinel `.gbd-installed-by`.
+# GitHub Releases, verifies the release signature on SHA256SUMS when
+# `minisign` is installed, verifies the tarball's checksum, extracts the `gbd`
+# binary into ${GBD_INSTALL_DIR:-$HOME/.local/bin}, and writes a sentinel
+# `.gbd-installed-by`.
 #
 # Fetch:
-#   Public:  curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh | sh
-#   Private / cloud agents (gh already logged in):
-#     gh api -H "Accept: application/vnd.github.raw" \
-#       repos/aigency/gbd/contents/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh | sh
 #
-# Downloads prefer `gh release download` (private releases work), then curl
-# with GH_TOKEN/GITHUB_TOKEN, then unauthenticated curl (public releases).
+# Downloads prefer `gh release download`, then curl with GH_TOKEN/GITHUB_TOKEN,
+# then unauthenticated curl.
 #
 # Environment variables:
 #   GBD_VERSION       Pin to a specific tag (e.g. v0.1.0). Defaults to latest.
@@ -24,17 +23,20 @@ set -eu
 REPO="aigency/gbd"
 RELEASES_API="https://api.github.com/repos/${REPO}/releases/latest"
 RELEASES_DOWNLOAD="https://github.com/${REPO}/releases/download"
-SOURCE_INSTALL_HINT="cargo install --locked --git https://github.com/aigency/gbd gbd"
+SOURCE_INSTALL_HINT="cargo install --locked gbd"
+# The release signing public key (minisign). Must match
+# [package.metadata.binstall.signing] in Cargo.toml; a test checks that.
+SIGNING_PUBKEY="RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4"
 
 usage() {
     cat <<'EOF'
 gbd installer
 
 Usage:
-    # Public (the long-term path, including cloud agents once the repo is public)
     curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh | sh
 
-    # While private — Cloud agents (gh already logged in)
+    # Cloud agents with gh already logged in can fetch the script the same way,
+    # or through the API:
     gh api -H "Accept: application/vnd.github.raw" \
         repos/aigency/gbd/contents/scripts/install.sh | sh
 
@@ -48,8 +50,13 @@ Environment variables:
     GH_TOKEN / GITHUB_TOKEN
                       Used for curl if `gh` is not on PATH.
 
-Prefers `gh release download` (works on the private repo). Falls back to
-authenticated curl, then unauthenticated curl. Installs to ~/.local/bin/gbd.
+Prefers `gh release download`, then authenticated curl, then unauthenticated
+curl. Installs to ~/.local/bin/gbd.
+
+Verification: the tarball's SHA256 is always checked against the release's
+SHA256SUMS. If `minisign` is installed, SHA256SUMS itself is first verified
+against the release signature (SHA256SUMS.minisig) and the project's public
+key, which proves the sums came from this project's release workflow.
 EOF
 }
 
@@ -155,6 +162,10 @@ download_assets() {
     if have_gh; then
         if gh release download -R "${REPO}" "${version}" \
                 -p "${tarball}" -p SHA256SUMS -D "${tmpdir}"; then
+            # Signature is best-effort at download time: releases before
+            # signing was added do not have one. verify_signature decides.
+            gh release download -R "${REPO}" "${version}" \
+                -p SHA256SUMS.minisig -D "${tmpdir}" 2>/dev/null || true
             return 0
         fi
         printf 'warning: gh release download failed; trying curl\n' >&2
@@ -174,6 +185,25 @@ Or from source:
     if ! curl_github "${sums_url}" "${tmpdir}/SHA256SUMS"; then
         err "failed to download ${sums_url}"
     fi
+    curl_github "${sums_url}.minisig" "${tmpdir}/SHA256SUMS.minisig" 2>/dev/null || true
+}
+
+# Verify SHA256SUMS against the release signature. Hard failure on a bad
+# signature; a missing signature is reported, since releases before signing
+# was introduced have none; a missing `minisign` is a one-line note.
+verify_signature() {
+    # $1=tmpdir
+    if ! command -v minisign >/dev/null 2>&1; then
+        printf 'note: install minisign to also verify the release signature\n'
+        return 0
+    fi
+    if [ ! -s "$1/SHA256SUMS.minisig" ]; then
+        printf 'warning: this release has no SHA256SUMS.minisig; checksum only\n' >&2
+        return 0
+    fi
+    printf 'verifying release signature\n'
+    (cd "$1" && minisign -V -q -P "${SIGNING_PUBKEY}" -x SHA256SUMS.minisig -m SHA256SUMS) \
+        || err "release signature verification FAILED for SHA256SUMS; not installing"
 }
 
 detect_sha_verifier() {
@@ -236,6 +266,7 @@ main() {
     trap 'rm -rf "${tmpdir}"' EXIT INT TERM HUP
 
     download_assets "${tmpdir}" "${version}" "${tarball}"
+    verify_signature "${tmpdir}"
 
     if ! grep " ${tarball}$" "${tmpdir}/SHA256SUMS" > "${tmpdir}/SHA256SUMS.expected"; then
         err "SHA256SUMS does not contain an entry for ${tarball}"

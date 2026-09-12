@@ -39,6 +39,24 @@ Both download the release tarball for your OS and architecture (linux x86_64/arm
 
 `gbd --version` prints the crate version and the git commit it was built from, e.g. `gbd 1.0.0 (1a2b3c4)`, so you can tell a release from a local build.
 
+### Verifying a download
+
+Every release asset is signed with [minisign](https://jedisct1.github.io/minisign/) and carries a GitHub build-provenance attestation.
+
+- `cargo binstall` verifies the tarball's `.sig` against the public key in `Cargo.toml` automatically and refuses a mismatch.
+- `install.sh` verifies `SHA256SUMS.minisig` when `minisign` is installed, then the tarball's checksum.
+- By hand, the public key is `RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4`:
+
+```bash
+minisign -V -P RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4 -m gbd-v1.1.0-aarch64-apple-darwin.tar.gz
+```
+
+```bash
+gh attestation verify gbd-v1.1.0-aarch64-apple-darwin.tar.gz --repo aigency/gbd
+```
+
+The attestation proves the file was built by this repository's release workflow at a specific commit; the signature proves it was published with this project's key. Releases before 1.1.0 have neither.
+
 ## Quick start
 
 Once per repository, as an org owner (see [Organization setup](#organization-setup) for what that means):

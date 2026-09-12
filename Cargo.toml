@@ -44,6 +44,12 @@ pkg-url = "https://github.com/aigency/gbd/releases/download/v{ version }/gbd-v{ 
 bin-dir = "{ bin }"
 pkg-fmt = "tgz"
 
+# cargo binstall downloads `{ url }.sig` next to each tarball and refuses a
+# mismatch. The private half is the MINISIGN_KEY secret used by release.yml.
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWTJfFNVFWOcQa3j8m8WBvpgOGO0qocEnMMt8UnIb0wqO0KLgvwb6Fi4"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
