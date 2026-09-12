@@ -2708,3 +2708,46 @@ fn import_keeps_a_dependent_unfinished_when_its_blocker_cannot_be_read() {
         "not done until the blocker can be read: {map}"
     );
 }
+
+#[test]
+fn import_stops_when_an_adopted_issue_cannot_be_completed() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+    )
+    // The type a dying create may not have set cannot be put back.
+    .on_fail("retype", "issue edit 102 -R acme/widgets --type Bug", "HTTP 500: boom")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "wx-2 is #102 (https://github.com/acme/widgets/issues/102) but its type could not be reapplied; nothing was recorded",
+        ));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("--title Rename the endpoints"),
+        "nothing after it is created: {calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert_eq!(
+        map.lines().count(),
+        1,
+        "the adoption is not recorded: {map}"
+    );
+}

@@ -690,14 +690,6 @@ impl Mapping {
     }
 }
 
-/// `wx-12` → `#101` for every mention whose target is in `known`. A token
-/// is a maximal run of id characters; trailing dots are punctuation. Left
-/// alone: anything inside a code span or a fenced block (the import footer
-/// and command examples), a bare URL (a word containing `://`, words
-/// ending at whitespace or brackets), a Markdown link destination
-/// (`](…)`), and a reference definition line (`[label]: …`); the link's
-/// visible text is still rewritten. Anything not in `known` stays as
-/// written.
 /// `[label]: destination`, up to three leading spaces, as `CommonMark`
 /// defines a link reference definition's first line.
 fn is_reference_definition(line: &str) -> bool {
@@ -715,11 +707,15 @@ fn is_reference_definition(line: &str) -> bool {
 }
 
 /// Byte index of the `)` that closes a link destination starting at the
-/// beginning of `s`, with nested parentheses balanced.
+/// beginning of `s`, with nested parentheses balanced and backslash-escaped
+/// ones skipped.
 fn destination_end(s: &str) -> Option<usize> {
     let mut depth = 1usize;
+    let mut escaped = false;
     for (i, c) in s.char_indices() {
         match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
@@ -771,6 +767,24 @@ fn note_code(literal: &str, code: &mut Code) {
     }
 }
 
+/// A line indented enough to be, or to continue, an indented code block.
+fn is_indented(line: &str) -> bool {
+    line.starts_with("    ") || line.starts_with('\t')
+}
+
+/// `wx-12` → `#101` for every mention whose target is in `known`. A token
+/// is a maximal run of id characters; trailing dots are punctuation. Left
+/// alone: anything inside a code span, a fenced block, or an indented code
+/// block (the import footer and command examples), a bare URL (a word
+/// containing `://`, words ending at whitespace or brackets), a Markdown
+/// link destination (`](…)`), and a reference definition line
+/// (`[label]: …`); the link's visible text is still rewritten. Anything
+/// not in `known` stays as written.
+///
+/// An indented code block is a line indented four spaces or a tab after a
+/// blank line (or at the start), through the next line indented less. A
+/// nested list item indented that far after a blank line counts too and is
+/// left as written: the safe direction.
 pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     fn id_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
@@ -781,12 +795,29 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut md = Code::Prose;
+    // For indented code blocks: the previous line was blank (or there was
+    // none), and the scanner is inside such a block.
+    let mut prev_blank = true;
+    let mut indented = false;
     while !rest.is_empty() {
-        // A reference definition line is all destination.
-        if (out.is_empty() || out.ends_with('\n')) && md == Code::Prose {
-            let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        // Whole-line rules at a line start: a reference definition line is
+        // all destination, and an indented code block is copied through.
+        if out.is_empty() || out.ends_with('\n') {
             let line = &rest[..line_end];
-            if is_reference_definition(line) {
+            let blank = line.trim().is_empty();
+            let mut verbatim = false;
+            if md == Code::Prose {
+                if indented && !blank && !is_indented(line) {
+                    indented = false;
+                }
+                if !indented && prev_blank && !blank && is_indented(line) {
+                    indented = true;
+                }
+                verbatim = indented || is_reference_definition(line);
+            }
+            prev_blank = blank;
+            if verbatim {
                 out.push_str(line);
                 rest = &rest[line_end..];
                 continue;
@@ -804,8 +835,12 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
                 None => break,
             }
         }
-        let Some(start) = rest.find(id_char) else {
-            break;
+        // Only the rest of this line, so the next line starts at the top.
+        let Some(start) = rest[..line_end].find(id_char) else {
+            note_code(&rest[..line_end], &mut md);
+            out.push_str(&rest[..line_end]);
+            rest = &rest[line_end..];
+            continue;
         };
         let literal = &rest[..start];
         // A destination that starts with something other than an id char
@@ -1310,6 +1345,36 @@ mod tests {
             rewrite_ids("[doc](/archive(v1)/wx-2) wx-2", &known),
             "[doc](/archive(v1)/wx-2) #102",
             "parentheses inside a destination balance"
+        );
+        assert_eq!(
+            rewrite_ids("[doc](/archive\\)/wx-2) wx-2", &known),
+            "[doc](/archive\\)/wx-2) #102",
+            "an escaped parenthesis does not close a destination"
+        );
+        assert_eq!(
+            rewrite_ids("para\n\n    bd show wx-2\n    wx-1.1\n\nwx-2", &known),
+            "para\n\n    bd show wx-2\n    wx-1.1\n\n#102",
+            "an indented code block is left alone"
+        );
+        assert_eq!(
+            rewrite_ids("\tbd show wx-2\nwx-2", &known),
+            "\tbd show wx-2\n#102",
+            "a tab indents; the block ends at a line indented less"
+        );
+        assert_eq!(
+            rewrite_ids("para\n    wx-2", &known),
+            "para\n    #102",
+            "an indented line cannot interrupt a paragraph"
+        );
+        assert_eq!(
+            rewrite_ids("```\n    wx-2\n```\n\n    wx-2\nwx-2", &known),
+            "```\n    wx-2\n```\n\n    wx-2\n#102",
+            "indentation inside a fence is the fence's"
+        );
+        assert_eq!(
+            rewrite_ids("see wx-2\n[doc]: /issues/wx-2", &known),
+            "see #102\n[doc]: /issues/wx-2",
+            "a reference definition after the first line"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
