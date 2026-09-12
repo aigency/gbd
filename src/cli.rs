@@ -8,12 +8,14 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::beads;
 use crate::config::{self, Config};
 use crate::fields;
 use crate::gh;
 use crate::ids::{self, IssueRef};
+use crate::import;
 use crate::init::{self, InitOpts};
 use crate::issue::{self, Issue, Scope};
 use crate::memory::{self, RememberOutcome};
@@ -212,6 +214,15 @@ pub enum Commands {
     Priority { id: String, value: String },
     /// Open issues that are is:blocked, with their blockers
     Blocked,
+    /// Move a Beads tracker onto GitHub (one shot; --dry-run prints the plan)
+    Import {
+        /// JSONL from `bd export --include-memories`
+        #[arg(long = "from-beads", value_name = "FILE")]
+        from_beads: PathBuf,
+        /// Print the plan and write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
         insight: String,
@@ -390,22 +401,27 @@ impl Ctx {
     }
 
     fn emit<T: Serialize>(&self, value: &T, human: impl FnOnce() -> String) {
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(value).unwrap());
-        } else {
-            let text = human();
-            if text.is_empty() {
-                return;
-            }
-            print!("{text}");
-            if !text.ends_with('\n') {
-                println!();
-            }
-        }
+        emit_to(self.json, value, human);
     }
 
     fn search_prefix(&self) -> String {
         format!("repo:{} is:issue", self.repo.name_with_owner)
+    }
+}
+
+/// JSON record or human text, on stdout.
+fn emit_to<T: Serialize>(json: bool, value: &T, human: impl FnOnce() -> String) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value).unwrap());
+    } else {
+        let text = human();
+        if text.is_empty() {
+            return;
+        }
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
     }
 }
 
@@ -568,6 +584,10 @@ fn dispatch(cli: Cli) -> Result<u8> {
             cmd_list(&ctx, &q, 50, true)
         }
         Commands::Blocked => cmd_blocked(&Ctx::open(explicit, json)?),
+        Commands::Import {
+            from_beads,
+            dry_run,
+        } => cmd_import(explicit, json, &from_beads, dry_run),
         Commands::Ready {
             claim,
             explain,
@@ -1073,6 +1093,22 @@ fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
             render::tree(&issues)
         }
     });
+    Ok(0)
+}
+
+/// Beads → GitHub, planned in memory first. Only the plan exists so far:
+/// without `--dry-run` the command refuses, so nothing half-imports.
+fn cmd_import(explicit: Option<&str>, json: bool, from_beads: &Path, dry_run: bool) -> Result<u8> {
+    if !dry_run {
+        bail!("gbd import can only --dry-run in this version; creating the issues is the next release");
+    }
+    // A dry run is local: no gh, no auth, no repo lookup. `explicit` is
+    // for the real run, which opens a Ctx.
+    let _ = explicit;
+    let export = beads::load(from_beads)?;
+    let plan = import::plan(&export);
+    let source = from_beads.display().to_string();
+    emit_to(json, &plan, || import::render(&plan, &source, 25));
     Ok(0)
 }
 

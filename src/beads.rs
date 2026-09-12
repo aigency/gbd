@@ -16,7 +16,7 @@ use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Beads `issue_type`. Anything Beads may grow that gbd does not know is
 /// carried as `Other`, so the dry run can name it.
@@ -171,7 +171,7 @@ pub struct Bead {
 }
 
 /// A `bd remember` line.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Memory {
     pub key: String,
     pub value: String,

@@ -1826,3 +1826,34 @@ fn delete_frees_the_cards_it_was_holding() {
         "#15 is still blocked: {calls}"
     );
 }
+
+#[test]
+fn import_dry_run_prints_the_plan_and_calls_nothing() {
+    let h = Harness::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-export.jsonl");
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Import plan: 8 issues, 1 memories",
+        ))
+        .stdout(predicate::str::contains("Nothing written (--dry-run)."));
+    assert!(
+        h.calls().is_empty(),
+        "a dry run is local: not even gh --version or auth: {}",
+        h.calls()
+    );
+    // The importer itself is not here yet: refuse rather than half-import.
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("can only --dry-run"));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}
