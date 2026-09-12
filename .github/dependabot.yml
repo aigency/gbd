@@ -4,6 +4,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # One PR per week for all action bumps (SHA + version comment together)
+    # instead of one PR per action.
+    groups:
+      actions:
+        patterns: ["*"]
   - package-ecosystem: cargo
     directory: /
     schedule:
