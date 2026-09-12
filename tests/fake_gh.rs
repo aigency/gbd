@@ -2437,6 +2437,26 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         h.calls()
     );
 
+    // `issue create` is several mutations in one: never retried, even on a
+    // real secondary limit, since the issue may already exist.
+    let h = Harness::new();
+    h.on_fail(
+        "create",
+        "issue create -R acme/widgets",
+        "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["create", "One shot", "-t", "Task"])
+        .assert()
+        .failure();
+    assert_eq!(
+        h.calls().matches("issue create").count(),
+        1,
+        "{}",
+        h.calls()
+    );
+
     // The words in the command itself never count: only what gh printed.
     let h = Harness::new();
     h.on_fail(

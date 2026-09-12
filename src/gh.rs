@@ -27,7 +27,8 @@ pub fn run(args: &[&str]) -> Result<String> {
 /// answer means the request was rejected, so repeating it is safe. The
 /// primary hourly quota is not retried (it will not clear in time), and
 /// neither is anything else, 5xx included, since a create behind a 502
-/// may have gone through. gh does not relay the `Retry-After` header for
+/// may have gone through; `gh issue create` is never retried at all, being
+/// several mutations in one. gh does not relay the `Retry-After` header for
 /// these commands, so the wait is what GitHub documents for that case:
 /// at least a minute, doubling on each retry (`GBD_BACKOFF_MS` sets the
 /// first wait; five retries). A `retry-after: N` in the message, when gh
@@ -38,12 +39,18 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60_000);
+    // `gh issue create --type` is two mutations (create, then set the
+    // type; parent and blocked-by add more): a limit hit on a later one
+    // leaves the issue in place, so repeating the command would duplicate
+    // it. That command gets one attempt; `gbd import` finds an issue whose
+    // record was lost on its next run.
+    let composite = args.first() == Some(&"issue") && args.get(1) == Some(&"create");
     let mut wait = base;
     for attempt in 1..=RETRIES {
         let output = spawn(args, stdin)?;
         // Classified on what gh printed, never on the command line: a body
         // that happens to say "rate limit" must not turn a 502 into a retry.
-        if output.status.success() || !rate_limited(&output) {
+        if composite || output.status.success() || !rate_limited(&output) {
             return finish(args, &output);
         }
         let ms = retry_after_ms(&output).unwrap_or(wait);
