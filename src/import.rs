@@ -526,11 +526,10 @@ pub fn plan(export: &Export) -> Plan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// The issue exists; nothing else has been written to it.
+    /// The issue exists. Priority, dates, assignee, close, and the card are
+    /// idempotent and get replayed; `comments` says how many comments are
+    /// on it already.
     Created,
-    /// Comments are on it; Priority, dates, assignee, close, and the card
-    /// are idempotent and get replayed.
-    Commented,
     /// Everything is on it.
     #[default]
     Done,

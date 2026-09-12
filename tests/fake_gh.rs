@@ -2081,13 +2081,13 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
         !calls.contains("--single-select-option-id O_ready"),
         "{calls}"
     );
-    // The blocker stays at `commented`, so the next run retries its close.
+    // The blocker never reaches `done`, so the next run retries its close.
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
     let last_wx2 = map
         .lines()
         .rfind(|l| l.contains("\"bead\":\"wx-2\""))
         .unwrap();
-    assert!(last_wx2.contains("\"phase\":\"commented\""), "{map}");
+    assert!(last_wx2.contains("\"phase\":\"created\""), "{map}");
 }
 
 #[test]
@@ -2132,6 +2132,13 @@ fn import_reports_what_exists_when_a_create_fails() {
     assert_eq!(
         map.lines()
             .filter(|l| l.contains("\"phase\":\"done\""))
+            .count(),
+        0,
+        "nothing is done until every issue exists and its comments are on: {map}"
+    );
+    assert_eq!(
+        map.lines()
+            .filter(|l| l.contains("\"phase\":\"created\""))
             .count(),
         2,
         "{map}"
@@ -2228,7 +2235,7 @@ fn import_resumes_from_the_mapping_file() {
     );
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
     let lines: Vec<&str> = map.lines().collect();
-    assert_eq!(lines.len(), 10, "{map}");
+    assert_eq!(lines.len(), 8, "{map}");
     let phases: Vec<String> = lines[3..]
         .iter()
         .map(|l| {
@@ -2244,15 +2251,13 @@ fn import_resumes_from_the_mapping_file() {
     assert_eq!(
         phases,
         [
-            "wx-2 commented 0",
-            "wx-2 done 0",
             "wx-1.1 created 0",
+            "wx-2 done 0",
             "wx-1.1 created 1",
             "wx-1.1 created 2",
-            "wx-1.1 commented 2",
             "wx-1.1 done 2"
         ],
-        "each comment is checkpointed: {map}"
+        "pass one creates and places; pass two posts comments with a checkpoint each, then done: {map}"
     );
 }
 

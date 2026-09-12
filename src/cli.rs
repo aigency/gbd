@@ -1238,9 +1238,10 @@ fn import_run(
         warnings: Vec::new(),
         created: Vec::new(),
         closed_ok: 0,
-        finished: 0,
+        finished: Vec::new(),
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
+        touched: Vec::new(),
     };
     let total = plan.items.len();
     let outcome = run.execute(plan, done, total);
@@ -1266,7 +1267,7 @@ fn import_run(
     ctx.emit(
         &json!({
             "created": run.created, "already_imported": plan.already_imported,
-            "finished": plan.partially_imported, "mapping": run.map.path(), "rewritten": run.rewritten,
+            "finished": run.finished, "mapping": run.map.path(), "rewritten": run.rewritten,
             "memories": memories, "warnings": run.warnings, "error": error,
             "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
         }),
@@ -1279,8 +1280,12 @@ fn import_run(
                 ),
             };
             let mut tail = format!("{} closed", run.closed_ok);
-            if run.finished > 0 {
-                let _ = write!(tail, ", {} finished from an earlier run", run.finished);
+            if !run.finished.is_empty() {
+                let _ = write!(
+                    tail,
+                    ", {} finished from an earlier run",
+                    run.finished.len()
+                );
             }
             if resumed > 0 {
                 let _ = write!(tail, ", {resumed} already imported");
@@ -1314,21 +1319,39 @@ struct Run<'a> {
     start_date: Option<&'a fields::IssueField>,
     map: import::Mapping,
     /// Bead → issue number, seeded from the mapping file: edges resolve
-    /// against it and mentions in bodies are rewritten from it.
+    /// against it and mentions in bodies and comments are rewritten from it.
     numbers: BTreeMap<String, u64>,
     warnings: Vec<String>,
     created: Vec<Value>,
     closed_ok: usize,
-    finished: usize,
+    /// Beads a previous run left unfinished that reached `done` this run.
+    finished: Vec<String>,
     /// Issues whose body was edited once every number was known.
     rewritten: Vec<u64>,
     /// Beads that are open on GitHub after this run touched or skipped
     /// them. Cards are placed against this, not against the plan.
     open_beads: BTreeSet<String>,
+    /// Per bead touched this run: its issue, its URL, whether it was
+    /// resumed, and whether every step so far succeeded.
+    touched: Vec<Touched>,
+}
+
+struct Touched {
+    bead: String,
+    number: u64,
+    url: String,
+    resumed: bool,
+    /// Comments already on the issue when this run started.
+    comments: usize,
+    clean: bool,
 }
 
 impl Run<'_> {
-    /// The loop over the plan. Stops at the first failed create.
+    /// Pass one over the plan: create (or resume), then Priority, dates,
+    /// assignee, the close, and the card. Stops at the first failed create.
+    /// Pass two, once every issue exists: bodies that mentioned a bead
+    /// created later, then the comments, so no text is ever posted with a
+    /// Beads id that could have been an issue number.
     fn execute(
         &mut self,
         plan: &import::Plan,
@@ -1341,7 +1364,7 @@ impl Run<'_> {
                     println!("{:>5}/{total}  {} {what}", n + 1, item.bead);
                 }
             };
-            let (number, url, from) = match done.get(&item.bead) {
+            let (number, url, resumed, comments) = match done.get(&item.bead) {
                 Some(m) if m.phase == import::Phase::Done => {
                     progress(format!("= #{}  (already imported)", m.number));
                     if matches!(item.state, import::State::Open) {
@@ -1351,15 +1374,22 @@ impl Run<'_> {
                 }
                 Some(m) => {
                     progress(format!("= #{}  (finishing)", m.number));
-                    self.finished += 1;
-                    (m.number, m.url.clone(), (m.phase, m.comments))
+                    (m.number, m.url.clone(), true, m.comments)
                 }
                 None => {
                     let (number, url) = self.create(item, n, total)?;
-                    (number, url, (import::Phase::Created, 0))
+                    (number, url, false, 0)
                 }
             };
-            let state = self.finish(item, number, &url, from)?;
+            let (state, clean) = self.place(item, number, &url);
+            self.touched.push(Touched {
+                bead: item.bead.clone(),
+                number,
+                url,
+                resumed,
+                comments,
+                clean,
+            });
             let closed = if matches!(state, import::State::Closed { .. }) {
                 "  ✓"
             } else {
@@ -1371,78 +1401,21 @@ impl Run<'_> {
             ));
         }
         self.rewrite_forward(plan);
-        Ok(())
-    }
-
-    /// A body written before the bead it mentions existed still says
-    /// `wx-9`. Now that every number is known, edit those bodies once.
-    /// Idempotent, so a resumed run repeats it harmlessly. Comments cannot
-    /// be edited through `gh`, so a forward reference there is a warning.
-    fn rewrite_forward(&mut self, plan: &import::Plan) {
-        let pos: BTreeMap<&str, usize> = plan
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, it)| (it.bead.as_str(), i))
-            .collect();
-        for (i, item) in plan.items.iter().enumerate() {
-            let Some(&number) = self.numbers.get(&item.bead) else {
-                continue;
-            };
-            // Only what comes later in the plan was unknown at creation.
-            let later: BTreeMap<String, u64> = self
-                .numbers
-                .iter()
-                .filter(|(b, _)| pos.get(b.as_str()).is_some_and(|&p| p > i))
-                .map(|(b, n)| (b.clone(), *n))
-                .collect();
-            if later.is_empty() {
-                continue;
-            }
-            if import::rewrite_ids(&item.body, &later) != item.body {
-                let body = import::rewrite_ids(&item.body, &self.numbers);
-                let n = number.to_string();
-                let args = [
-                    "issue",
-                    "edit",
-                    &n,
-                    "-R",
-                    &self.ctx.repo.name_with_owner,
-                    "--body-file",
-                    "-",
-                ];
-                match gh::run_stdin(&args, body.as_bytes()) {
-                    Ok(_) => self.rewritten.push(number),
-                    Err(err) => self.warnings.push(format!(
-                        "{} (#{number}): body still mentions Beads ids; edit failed: {err:#}",
-                        item.bead
-                    )),
-                }
-            }
-            for (k, body) in item.comments.iter().enumerate() {
-                if import::rewrite_ids(body, &later) != *body {
-                    self.warnings.push(format!(
-                        "{} (#{number}): comment {} mentions a bead created later; gh cannot edit comments, use the mapping file",
-                        item.bead,
-                        k + 1
-                    ));
-                }
-            }
-        }
+        self.comments(plan)
     }
 
     /// One mapping line. Its failure is fatal and says exactly what to
     /// add by hand, since the issue exists whether or not the file does.
     fn record(
         &mut self,
-        item: &import::Item,
+        bead: &str,
         number: u64,
         url: &str,
         phase: import::Phase,
         comments: usize,
     ) -> Result<()> {
         let m = import::Mapped {
-            bead: item.bead.clone(),
+            bead: bead.to_string(),
             number,
             url: url.to_string(),
             phase,
@@ -1450,8 +1423,7 @@ impl Run<'_> {
         };
         self.map.record(&m).with_context(|| {
             format!(
-                "{} is #{number} ({url}) but could not be recorded in {}. Add this line to the file before resuming:\n{}",
-                item.bead,
+                "{bead} is #{number} ({url}) but could not be recorded in {}. Add this line to the file before resuming:\n{}",
                 self.map.path().display(),
                 serde_json::to_string(&m).unwrap_or_default()
             )
@@ -1485,25 +1457,26 @@ impl Run<'_> {
             },
         )
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
-        self.record(item, number, &url, import::Phase::Created, 0)?;
+        self.record(&item.bead, number, &url, import::Phase::Created, 0)?;
         self.numbers.insert(item.bead.clone(), number);
         Ok((number, url))
     }
 
-    /// Everything after the create, from `from` onwards. Returns the state
-    /// the issue actually ended in. Any failure keeps the bead off `done`,
-    /// so the next run replays these steps.
-    fn finish(
-        &mut self,
-        item: &import::Item,
-        number: u64,
-        url: &str,
-        from: (import::Phase, usize),
-    ) -> Result<import::State> {
-        let t = self.ctx.target(&number.to_string())?;
+    /// Priority, Start date, assignee, the close, and the card: all
+    /// idempotent, so a resumed bead simply gets them again. Returns the
+    /// state the issue actually ended in and whether every step succeeded.
+    fn place(&mut self, item: &import::Item, number: u64, url: &str) -> (import::State, bool) {
         let mut warnings = Vec::new();
         let warn = |warnings: &mut Vec<String>, what: String| {
             warnings.push(format!("{} (#{number}): {what}", item.bead));
+        };
+        let t = match self.ctx.target(&number.to_string()) {
+            Ok(t) => t,
+            Err(err) => {
+                warn(&mut warnings, format!("{err:#}"));
+                self.warnings.append(&mut warnings);
+                return (item.state.clone(), false);
+            }
         };
         if let Err(err) = fields::option_name(item.priority)
             .and_then(|p| fields::write_value(&self.ctx.repo, number, self.priority.id, p))
@@ -1518,40 +1491,6 @@ impl Run<'_> {
         if let Some(login) = &item.assignee {
             if let Err(err) = t.edit(&["--add-assignee", login]) {
                 warn(&mut warnings, format!("assignee {login} not set: {err:#}"));
-            }
-        }
-        // Comments are the one step that is not idempotent: each one is
-        // checkpointed, a failure stops the rest so the next run retries
-        // from there, and `commented` is recorded only after the last.
-        if from.0 == import::Phase::Created {
-            let mut posted = from.1;
-            for body in item.comments.iter().skip(posted) {
-                let n = number.to_string();
-                let body = import::rewrite_ids(body, &self.numbers);
-                let args = [
-                    "issue",
-                    "comment",
-                    &n,
-                    "-R",
-                    &self.ctx.repo.name_with_owner,
-                    "--body-file",
-                    "-",
-                ];
-                if let Err(err) = gh::run_stdin(&args, body.as_bytes()) {
-                    warn(
-                        &mut warnings,
-                        format!(
-                            "comment {} not added: {err:#}. Run gbd import again to retry",
-                            posted + 1
-                        ),
-                    );
-                    break;
-                }
-                posted += 1;
-                self.record(item, number, url, import::Phase::Created, posted)?;
-            }
-            if posted == item.comments.len() {
-                self.record(item, number, url, import::Phase::Commented, posted)?;
             }
         }
         // What actually happened, not what was planned: a close that failed
@@ -1594,13 +1533,8 @@ impl Run<'_> {
                 status = None;
             }
         }
-        // Done only when every step went through; else the phase stays
-        // where it is and the next run replays from there.
         let clean = warnings.is_empty();
         self.warnings.append(&mut warnings);
-        if clean {
-            self.record(item, number, url, import::Phase::Done, item.comments.len())?;
-        }
         if matches!(state, import::State::Closed { .. }) {
             self.closed_ok += 1;
         }
@@ -1608,7 +1542,99 @@ impl Run<'_> {
             "bead": item.bead, "number": number, "url": url,
             "state": state, "status": status,
         }));
-        Ok(state)
+        (state, clean)
+    }
+
+    /// A body written before the bead it mentions existed still says
+    /// `wx-9`. Now that every number is known, edit those bodies once.
+    /// Idempotent, so a resumed run repeats it harmlessly.
+    fn rewrite_forward(&mut self, plan: &import::Plan) {
+        let pos: BTreeMap<&str, usize> = plan
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (it.bead.as_str(), i))
+            .collect();
+        for (i, item) in plan.items.iter().enumerate() {
+            let Some(&number) = self.numbers.get(&item.bead) else {
+                continue;
+            };
+            // Only what comes later in the plan was unknown at creation.
+            let later: BTreeMap<String, u64> = self
+                .numbers
+                .iter()
+                .filter(|(b, _)| pos.get(b.as_str()).is_some_and(|&p| p > i))
+                .map(|(b, n)| (b.clone(), *n))
+                .collect();
+            if later.is_empty() || import::rewrite_ids(&item.body, &later) == item.body {
+                continue;
+            }
+            let body = import::rewrite_ids(&item.body, &self.numbers);
+            let n = number.to_string();
+            let args = [
+                "issue",
+                "edit",
+                &n,
+                "-R",
+                &self.ctx.repo.name_with_owner,
+                "--body-file",
+                "-",
+            ];
+            match gh::run_stdin(&args, body.as_bytes()) {
+                Ok(_) => self.rewritten.push(number),
+                Err(err) => self.warnings.push(format!(
+                    "{} (#{number}): body still mentions Beads ids; edit failed: {err:#}",
+                    item.bead
+                )),
+            }
+        }
+    }
+
+    /// Comments are the one step that is not idempotent: each one is
+    /// checkpointed in the mapping file, a failure stops that bead's rest
+    /// so the next run retries from there, and `done` follows the last one
+    /// only when everything else on the bead succeeded too.
+    fn comments(&mut self, plan: &import::Plan) -> Result<()> {
+        let touched = std::mem::take(&mut self.touched);
+        for t in &touched {
+            let Some(item) = plan.items.iter().find(|i| i.bead == t.bead) else {
+                continue;
+            };
+            let mut posted = t.comments;
+            let mut clean = t.clean;
+            for body in item.comments.iter().skip(posted) {
+                let n = t.number.to_string();
+                let body = import::rewrite_ids(body, &self.numbers);
+                let args = [
+                    "issue",
+                    "comment",
+                    &n,
+                    "-R",
+                    &self.ctx.repo.name_with_owner,
+                    "--body-file",
+                    "-",
+                ];
+                if let Err(err) = gh::run_stdin(&args, body.as_bytes()) {
+                    self.warnings.push(format!(
+                        "{} (#{}): comment {} not added: {err:#}. Run gbd import again to retry",
+                        t.bead,
+                        t.number,
+                        posted + 1
+                    ));
+                    clean = false;
+                    break;
+                }
+                posted += 1;
+                self.record(&t.bead, t.number, &t.url, import::Phase::Created, posted)?;
+            }
+            if clean {
+                self.record(&t.bead, t.number, &t.url, import::Phase::Done, posted)?;
+                if t.resumed {
+                    self.finished.push(t.bead.clone());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
