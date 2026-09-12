@@ -723,12 +723,31 @@ impl Mapping {
     }
 }
 
+/// Byte length of the line at the start of `s`, newline included.
+fn line_len(s: &str) -> usize {
+    s.find('\n').map_or(s.len(), |i| i + 1)
+}
+
+/// Byte length of a link title at the start of `s`: quoted with `"` or
+/// `'`, or in parentheses, on one line.
+fn title_len(s: &str) -> Option<usize> {
+    let close = match s.chars().next()? {
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        _ => return None,
+    };
+    let end = s[1..].find([close, '\n'])?;
+    s[1 + end..].starts_with(close).then_some(end + 2)
+}
+
 /// The bytes at the start of `rest` that a link reference definition
-/// takes: `[label]:` after up to three spaces, then the destination, which
-/// `CommonMark` lets follow on the next line. None when it is not one.
+/// takes, as `CommonMark` defines one: `[label]:` after up to three spaces,
+/// whitespace with at most one line ending, a destination (`<…>` or a run
+/// of non-whitespace), then optionally a title, on the same line or the
+/// next, with nothing else after either. None when it is not one.
 fn reference_definition_end(rest: &str) -> Option<usize> {
-    let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
-    let line = &rest[..line_end];
+    let line = &rest[..line_len(rest)];
     let trimmed = line.trim_start_matches(' ');
     if line.len() - trimmed.len() > 3 || !trimmed.starts_with('[') {
         return None;
@@ -737,13 +756,48 @@ fn reference_definition_end(rest: &str) -> Option<usize> {
     if close < 2 || !trimmed[close + 1..].starts_with(':') {
         return None;
     }
-    if !trimmed[close + 2..].trim().is_empty() {
-        return Some(line_end);
+    let blanks = |s: &str| s.len() - s.trim_start_matches([' ', '\t']).len();
+    let mut at = line.len() - trimmed.len() + close + 2;
+    at += blanks(&rest[at..]);
+    if rest[at..].starts_with('\n') {
+        at += 1;
+        at += blanks(&rest[at..]);
     }
-    // Nothing after the colon: the destination is the next line, if any.
-    let next = &rest[line_end..];
-    let next_end = next.find('\n').map_or(next.len(), |i| i + 1);
-    (!next[..next_end].trim().is_empty()).then_some(line_end + next_end)
+    let dest = &rest[at..];
+    let dest_len = if dest.starts_with('<') {
+        dest.find(['>', '\n'])
+            .filter(|&i| dest[i..].starts_with('>'))?
+            + 1
+    } else {
+        dest.find(char::is_whitespace).unwrap_or(dest.len())
+    };
+    if dest_len == 0 {
+        return None;
+    }
+    at += dest_len;
+    // The rest of the line is blank, or a title and then blank.
+    at += blanks(&rest[at..]);
+    let title_here = rest[at..].starts_with(['"', '\'', '(']);
+    if title_here {
+        at += title_len(&rest[at..])?;
+        at += blanks(&rest[at..]);
+    }
+    if !(rest[at..].is_empty() || rest[at..].starts_with('\n')) {
+        return None;
+    }
+    at += usize::from(rest[at..].starts_with('\n'));
+    // A title alone on the next line belongs to the definition too.
+    if !title_here {
+        let next = &rest[at..];
+        let lead = blanks(next);
+        if let Some(n) = title_len(&next[lead..]) {
+            let after = lead + n + blanks(&next[lead + n..]);
+            if next[after..].is_empty() || next[after..].starts_with('\n') {
+                at += after + usize::from(next[after..].starts_with('\n'));
+            }
+        }
+    }
+    Some(at)
 }
 
 /// Block-quote markers at the start of a line: how many `>` prefixes (each
@@ -1684,6 +1738,31 @@ mod tests {
             rewrite_ids("<code/> wx-2 <b>wx-2</b>", &known),
             "<code/> #102 <b>#102</b>",
             "a self-closing code tag and other elements are prose"
+        );
+        assert_eq!(
+            rewrite_ids("[note]: See wx-2 for details", &known),
+            "[note]: See #102 for details",
+            "words after the destination make it prose"
+        );
+        assert_eq!(
+            rewrite_ids("[doc]: /issues/wx-2 \"about wx-2\"\nwx-2", &known),
+            "[doc]: /issues/wx-2 \"about wx-2\"\n#102",
+            "a title after the destination"
+        );
+        assert_eq!(
+            rewrite_ids("[doc]: /issues/wx-2\n  'about wx-2'\nwx-2", &known),
+            "[doc]: /issues/wx-2\n  'about wx-2'\n#102",
+            "a title on the next line"
+        );
+        assert_eq!(
+            rewrite_ids("[doc]: </a b/wx-2>\nwx-2", &known),
+            "[doc]: </a b/wx-2>\n#102",
+            "a pointy destination may hold spaces"
+        );
+        assert_eq!(
+            rewrite_ids("[doc]: /issues/wx-2 wx-2", &known),
+            "[doc]: /issues/#102 #102",
+            "a second word that is not a title makes the whole line prose"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }

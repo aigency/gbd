@@ -1244,8 +1244,10 @@ fn import_run(
         };
         ctx.emit(
             &json!({
-                "created": [], "already_imported": plan.already_imported, "memories": memories,
-                "warnings": [], "skipped": plan.skipped, "problems": plan.problems,
+                "created": [], "already_imported": plan.already_imported,
+                "finished": [], "mapping": map.path(), "rewritten": [],
+                "memories": memories, "warnings": [], "error": null,
+                "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
             }),
             || {
                 let issues = if already == 0 {
