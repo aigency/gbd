@@ -1231,11 +1231,15 @@ fn import_run(
         .count();
     if unfinished == 0 {
         let already = plan.items.len();
-        let (issue, added, updated) = memories_for_import(ctx, &plan.memories)?;
+        let memories = if plan.memories.is_empty() {
+            json!(null)
+        } else {
+            let (issue, added, updated) = memories_for_import(ctx, &plan.memories)?;
+            json!({ "issue": issue, "added": added, "updated": updated })
+        };
         ctx.emit(
             &json!({
-                "created": [], "already_imported": plan.already_imported,
-                "memories": { "issue": issue, "added": added, "updated": updated },
+                "created": [], "already_imported": plan.already_imported, "memories": memories,
                 "warnings": [], "skipped": plan.skipped, "problems": plan.problems,
             }),
             || {
@@ -1244,7 +1248,13 @@ fn import_run(
                 } else {
                     format!("no issues left to import ({already} already imported)")
                 };
-                format!("{issues}; memories: {added} new, {updated} updated on #{issue}")
+                match &memories {
+                    Value::Null => format!("{issues}; nothing to do"),
+                    m => format!(
+                        "{issues}; memories: {} new, {} updated on #{}",
+                        m["added"], m["updated"], m["issue"]
+                    ),
+                }
             },
         );
         return Ok(0);
@@ -1283,6 +1293,7 @@ fn import_run(
         finished: Vec::new(),
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
+        unsure_blockers: BTreeSet::new(),
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1373,6 +1384,9 @@ struct Run<'a> {
     /// Beads that are open on GitHub after this run touched or skipped
     /// them. Cards are placed against this, not against the plan.
     open_beads: BTreeSet<String>,
+    /// Finished blockers whose live state could not be read: anything
+    /// placed against them stays unfinished, so the next run looks again.
+    unsure_blockers: BTreeSet<String>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1433,6 +1447,7 @@ impl Run<'_> {
                                     "{} (#{}): could not read its state, using the export's: {err:#}",
                                     item.bead, m.number
                                 ));
+                                self.unsure_blockers.insert(item.bead.clone());
                                 matches!(item.state, import::State::Open)
                             }
                         }
@@ -1693,6 +1708,16 @@ impl Run<'_> {
             }
             (import::State::Open, _, planned) => Some(planned),
         };
+        if let Some(unsure) = item
+            .blocked_by
+            .iter()
+            .find(|b| self.unsure_blockers.contains(b.as_str()))
+        {
+            warn(
+                &mut warnings,
+                format!("placed against {unsure}, whose state could not be read; run gbd import again to settle it"),
+            );
+        }
         if let Some(s) = status {
             if let Err(err) = self.board.set_status(&t.url, s) {
                 warn(

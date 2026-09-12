@@ -697,23 +697,34 @@ impl Mapping {
 /// ending at whitespace or brackets), and a Markdown link destination
 /// (`](…)`); the link's visible text is still rewritten. Anything not in
 /// `known` stays as written.
-/// Track Markdown code state across `literal`: a backtick run of three or
-/// more opens or closes a fence, a shorter run opens or closes a span
-/// (only outside a fence).
-fn note_code(literal: &str, in_fence: &mut bool, in_span: &mut bool) {
+/// Where the scanner is with respect to Markdown code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Code {
+    Prose,
+    /// Inside a span opened by a run of this many backticks; only a run of
+    /// the same length closes it, so a literal backtick inside is fine.
+    Span(usize),
+    /// Inside a fence opened by a run of this many backticks; a run at
+    /// least as long closes it.
+    Fence(usize),
+}
+
+/// Advance the code state across `literal`.
+fn note_code(literal: &str, code: &mut Code) {
     let mut run = 0usize;
     for c in literal.chars().chain(std::iter::once('\0')) {
         if c == '`' {
             run += 1;
             continue;
         }
-        match run {
-            1 | 2 if !*in_fence => *in_span = !*in_span,
-            0..=2 => {}
-            _ => {
-                *in_fence = !*in_fence;
-                *in_span = false;
-            }
+        if run > 0 {
+            *code = match *code {
+                Code::Prose if run >= 3 => Code::Fence(run),
+                Code::Prose => Code::Span(run),
+                Code::Span(n) if n == run => Code::Prose,
+                Code::Fence(n) if run >= n => Code::Prose,
+                same => same,
+            };
         }
         run = 0;
     }
@@ -728,7 +739,7 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    let (mut in_fence, mut in_span) = (false, false);
+    let mut md = Code::Prose;
     while !rest.is_empty() {
         // Inside `](…)`: copy the destination through its closing paren.
         if out.ends_with("](") {
@@ -750,21 +761,23 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
         if let Some(p) = literal.rfind("](") {
             if !literal[p..].contains(')') {
                 let head = &literal[..p + 2];
-                note_code(head, &mut in_fence, &mut in_span);
+                note_code(head, &mut md);
                 out.push_str(head);
                 rest = &rest[head.len()..];
                 continue;
             }
         }
-        note_code(literal, &mut in_fence, &mut in_span);
+        note_code(literal, &mut md);
         out.push_str(literal);
         rest = &rest[start..];
         let end = rest.find(|c: char| !id_char(c)).unwrap_or(rest.len());
         let token = &rest[..end];
         let core = token.trim_end_matches('.');
-        let fenced = in_fence || in_span;
+        let fenced = md != Code::Prose;
         let in_url = {
-            let word_start = out.rfind(boundary).map_or(0, |i| i + 1);
+            let word_start = out
+                .rfind(boundary)
+                .map_or(0, |i| i + out[i..].chars().next().map_or(1, char::len_utf8));
             let word_end = rest[end..].find(boundary).map_or(rest.len(), |i| end + i);
             out[word_start..].contains("://") || rest[..word_end].contains("://")
         };
@@ -1205,6 +1218,21 @@ mod tests {
             rewrite_ids("``wx-2`` wx-2", &known),
             "``wx-2`` #102",
             "double-backtick span"
+        );
+        assert_eq!(
+            rewrite_ids("``a ` b wx-2`` wx-2", &known),
+            "``a ` b wx-2`` #102",
+            "a span closes only on a run of the same length"
+        );
+        assert_eq!(
+            rewrite_ids("````\n```\nwx-2\n````\nwx-2", &known),
+            "````\n```\nwx-2\n````\n#102",
+            "a fence closes only on a run at least as long"
+        );
+        assert_eq!(
+            rewrite_ids("see\u{a0}wx-2.", &known),
+            "see\u{a0}#102.",
+            "multi-byte whitespace"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
     }
