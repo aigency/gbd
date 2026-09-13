@@ -1178,11 +1178,16 @@ fn cmd_import(
     let mapping = mapping.as_path();
     let export = beads::load(from_beads)?;
     let mut plan = import::plan(&export);
-    let logins = import::assignee_map(assignees)?;
-    // The names as the export has them, for the preflight's messages.
-    let raw_assignees = import::assignee_summary(&plan);
-    import::map_assignees(&mut plan, &logins);
     let done = import::read_mapping(mapping)?;
+    let logins = import::assignee_map(assignees)?;
+    // The names as the export has them, for the preflight's messages; only
+    // beads this run will touch, so a finished bead's assignee is history.
+    let raw_assignees = import::assignee_summary_of(plan.items.iter().filter(|i| {
+        !done
+            .get(&i.bead)
+            .is_some_and(|m| m.phase == import::Phase::Done)
+    }));
+    import::map_assignees(&mut plan, &logins);
     import::note_imported(&mut plan, &done);
     let source = from_beads.display().to_string();
     if dry_run {

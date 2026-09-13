@@ -1235,8 +1235,19 @@ pub fn map_assignees(plan: &mut Plan, map: &BTreeMap<String, Option<String>>) {
 /// together, shown as first seen and trimmed) with how many beads carry
 /// each, most first, and whether each can be a GitHub login.
 pub fn assignee_summary(p: &Plan) -> Vec<(String, usize, bool)> {
+    assignee_summary_of(p.items.iter())
+}
+
+/// [`assignee_summary`] over some of the items, for a resume that only
+/// needs the unfinished ones checked. A blank assignee is no assignee.
+pub fn assignee_summary_of<'a>(
+    items: impl Iterator<Item = &'a Item>,
+) -> Vec<(String, usize, bool)> {
     let mut counts: BTreeMap<String, (String, usize)> = BTreeMap::new();
-    for name in p.items.iter().filter_map(|i| i.assignee.as_deref()) {
+    for name in items
+        .filter_map(|i| i.assignee.as_deref())
+        .filter(|n| !n.trim().is_empty())
+    {
         let entry = counts
             .entry(assignee_key(name))
             .or_insert_with(|| (name.trim().to_string(), 0));
@@ -1933,6 +1944,7 @@ mod tests {
 {"_type":"issue","id":"n-3","title":"c","issue_type":"task","status":"open","priority":2,"assignee":"dev1","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-4","title":"d","issue_type":"task","status":"open","priority":2,"assignee":" Pat  Example ","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-5","title":"e","issue_type":"task","status":"open","priority":2,"assignee":" dev2 ","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-6","title":"f","issue_type":"task","status":"open","priority":2,"assignee":"   ","created_at":"2026-04-01T09:00:00Z"}
 "#
             .as_bytes(),
         )
@@ -1945,7 +1957,7 @@ mod tests {
                 ("dev1".to_string(), 1, true),
                 ("dev2".to_string(), 1, true)
             ],
-            "spelling variants of one name count together; a padded login is shown trimmed"
+            "spelling variants of one name count together; a padded login is shown trimmed; a blank one is nothing"
         );
         assert!(render(&p, "x", 5).contains(
             "Assignees:  Pat Example (3) — not a GitHub login; pass --assignee 'Pat Example=LOGIN'"
@@ -1959,9 +1971,10 @@ mod tests {
                 Some("patexample"),
                 Some("dev1"),
                 Some("patexample"),
-                Some("dev2")
+                Some("dev2"),
+                None
             ],
-            "every variant maps; a login stays, trimmed"
+            "every variant maps; a login stays, trimmed; a blank one is dropped"
         );
         assert!(render(&p, "x", 5).contains("Assignees:  patexample (3), dev1 (1), dev2 (1)"));
     }

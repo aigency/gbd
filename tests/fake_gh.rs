@@ -2836,7 +2836,13 @@ fn import_of_memories_alone_needs_no_board() {
 fn import_with_everything_done_only_retries_the_memories() {
     let h = Harness::new(); // no board configured
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
-    h.on("assignable", "repos/acme/widgets/assignees/", "");
+    // wx-2's assignee is history: a finished bead is not checked again,
+    // so a login that stopped being assignable cannot block the resume.
+    h.on_fail(
+        "assignable",
+        "repos/acme/widgets/assignees/dev1",
+        "gh: Not Found (HTTP 404)",
+    );
     fs::write(
         h.cwd.path().join("beads-map.jsonl"),
         concat!(
