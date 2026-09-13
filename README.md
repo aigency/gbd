@@ -220,7 +220,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | --- | --- |
 | type `epic` / `feature` / `bug` / `task` / `chore` / `decision` | issue type of the same name; anything else → Task, reported |
 | priority 0–4 | Priority P0–P4 |
-| `blocks` | dependency (`--blocked-by`), created after its blocker |
+| `blocks`, `blocked-by` | dependency (`--blocked-by`), created after its blocker |
 | `parent-child` | sub-issue (`--parent`), created after its parent |
 | open | board Ready, or Blocked when a blocker is still open |
 | `in_progress` | board In Progress, assignee kept |
@@ -231,7 +231,25 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | description, design, acceptance criteria | the body, as sections |
 | labels, owner, dates, estimate, external ref, the original close reason | an import footer at the end of the body (dates to the day), so nothing becomes a label |
 | `_type: memory` lines | the memories issue, upserted by key |
-| `related`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, edges to beads outside the export, agents, gates, templates | dropped, each one listed with the reason |
+| `related`, `relates-to`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, a second parent | lines in the import footer (`Related: #12, #40`), the ids rewritten to `#n` so each is a link and a cross-reference on the other issue; a closed bead with a `duplicates` edge closes as duplicate |
+| a blocker outside the export, or one dropped to break a cycle | noted in the footer (`Blocked by (not in the export): pl-9`) and listed in the report |
+| agents, gates, templates | dropped, each one listed with the reason |
+| an issue type gbd has no type for (a wisp, say) | imported as a Task, reported |
+
+**What does not survive the move.** Read this before `--yes`; the report lists every instance, this is the shape.
+
+- **Relations other than blocking are text, not edges.** GitHub has two kinds of issue relation, blocked-by and sub-issue. `related`, `discovered-from`, `supersedes`, `duplicates`, and `tracks` become footer lines whose ids link to the right issues, and GitHub shows the back-reference on the other side, but nothing can query them as a graph.
+- **One parent per issue.** GitHub sub-issues allow one; a second Beads parent is a footer line (`Also under: #7`).
+- **Dependency cycles are broken.** GitHub refuses them. A cycle is created with the edges that close it dropped; each dropped edge is listed in the report and noted in the footer of the issue that lost it.
+- **`blocked` is recomputed.** Beads stores it; gbd derives it from open blockers. A bead stored as blocked with no open blocker lands on Ready.
+- **Statuses beyond open, `in_progress`, `blocked`, `deferred`, and `closed`** (a custom status, `pinned`, `hooked`) are reported and imported as open; custom statuses on the board are #29.
+- **Close reasons collapse to GitHub's three.** `completed`, `not planned`, or `duplicate` is chosen from the free text; the text itself stays in the footer.
+- **Comments are posted by whoever runs the import.** GitHub's author is the importer; the original author and date are the first line of each comment.
+- **Labels are never labels.** They are footer text. gbd keeps type, priority, and state out of labels on purpose.
+- **Owner, estimate, due date, external ref** have no GitHub field and stay in the footer; dates are kept to the day.
+- **Memories** become sections of one closed issue, upserted by key; the last value for a repeated key wins.
+- **Agents, gates, and templates** are not issues and are not imported. A bead of a type gbd has no issue type for (a wisp, say) is imported as a Task and reported.
+- **Ids change.** `pl-k8m4.12` becomes `#412`. Mentions inside imported bodies and comments are rewritten; old ids elsewhere resolve through the committed `beads-map.jsonl` (and the footer of every imported issue names its bead).
 
 **The mapping file.** `beads-map.jsonl` (`--mapping` to choose another) records every created issue as it happens, flushed per line: `{"bead":"wx-1","number":101,"url":"…","phase":"created","comments":0}`, one line per step, the last line per bead winning. `phase` is `created` (the issue exists; `comments` says how many of its comments are on, `rewritten` whether its body was already fixed up for references to later beads) or `done`. Keep it: it resolves `bd-xxxx` references in old docs and commit messages, and mentions of a mapped id inside imported bodies and comments are rewritten to `#n`. A body that mentions a bead created later in the run is written with the Beads id first and edited once at the end, when every number is known; comments are posted only after every issue exists. Ids inside code spans, fenced and indented code blocks, URLs, link destinations, and reference definitions are left as they are. Re-running with the same file resumes: done beads are skipped, partially imported ones are finished, and nothing recorded is created twice. Imported comments carry a hidden `<!-- gbd-import bead/k -->` marker, and a resumed bead is reconciled against the comments GitHub already has before any are posted, so a Ctrl-C between a comment and its checkpoint is harmless. A line cut off mid-write is ignored and repaired. The one check left after a Ctrl-C: an issue created in the instant before its line was written is unknown to the file, so look at the newest issue in the repo before resuming, and if it is missing, append its `created` line with `"comments":0` (the format is what the import's own errors print). The file is tied to the repository it was written for and refused elsewhere, and one import holds it at a time: a second `gbd import` on the same file fails at once rather than creating everything twice.
 
