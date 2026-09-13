@@ -406,8 +406,8 @@ fn board_fixtures(h: &Harness) {
          r#"{"id":"PVT_1","number":7,"title":"widgets board","url":"https://github.com/orgs/acme/projects/7"}"#)
      .on("pfields", "project field-list 7 --owner acme --format json",
          r#"{"fields":[{"id":"F_status","name":"Status","type":"ProjectV2SingleSelectField","options":[
-            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
-            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
+            {"id":"O_blocked","name":"Blocked"},{"id":"O_def","name":"Deferred"},{"id":"O_ready","name":"Ready"},
+            {"id":"O_wip","name":"In Progress"},{"id":"O_done","name":"Done"}]}]}"#)
      .on("padd", "project item-add 7 --owner acme --url https://github.com/acme/widgets/issues/12 --format json",
          r#"{"id":"PVTI_12"}"#)
      .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "")
@@ -1134,16 +1134,21 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
         r#"{"id":"PVT_8","number":8,"title":"widgets board","url":"https://github.com/orgs/acme/projects/8"}"#)
     .on("05-pfields", "project field-list 8 --owner acme --format json",
         r#"{"fields":[{"id":"F_status","name":"Status","options":[
-            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
-            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#)
+            {"id":"O_blocked","name":"Blocked"},{"id":"O_def","name":"Deferred"},{"id":"O_ready","name":"Ready"},
+            {"id":"O_wip","name":"In Progress"},{"id":"O_done","name":"Done"}]}]}"#)
     .on("06-options", "updateProjectV2Field", r#"{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_status"}}}}"#)
+    // The stock view on the first run; the shaped one from then on.
+    .on("08-views", "views(first: 50",
+        r#"{"data":{"node":{"views":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PVTV_1","name":"Board","layout":"BOARD_LAYOUT","filter":"-type:Epic"}]}}}}"#)
+    .on("09-view", "updateProjectV2View", r#"{"data":{"updateProjectV2View":{"projectV2View":{"id":"PVTV_1"}}}}"#)
     .on("07-details", "options { id name color description }",
         r#"{"data":{"node":{"options":[
             {"id":"O_ready","name":"Ready","color":"GREEN","description":""},
             {"id":"O_wip","name":"In Progress","color":"BLUE","description":"hands on"},
             {"id":"O_def","name":"Deferred","color":"GRAY","description":null},
             {"id":"O_done","name":"Done","color":"PURPLE","description":""}]}}}"#);
-    // The board predates Blocked: the first read shows four options.
+    // The board predates Blocked and the column order: the first read shows
+    // four options in GitHub's order.
     fs::write(
         h.gh_dir.path().join("05-pfields.out.1"),
         r#"{"fields":[{"id":"F_status","name":"Status","options":[
@@ -1151,11 +1156,19 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
             {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#,
     )
     .unwrap();
+    fs::write(
+        h.gh_dir.path().join("08-views.out.1"),
+        r#"{"data":{"node":{"views":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PVTV_1","name":"View 1","layout":"TABLE_LAYOUT","filter":null}]}}}}"#,
+    )
+    .unwrap();
     h.gbd()
         .args(["init", "--no-memory", "--no-skills"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("board: #8 widgets board"));
+        .stdout(predicate::str::contains("board: #8 widgets board"))
+        .stdout(predicate::str::contains(
+            "view: Board (board layout, -type:Epic)",
+        ));
     let calls = h.calls();
     assert!(
         !calls.contains("project create"),
@@ -1167,9 +1180,15 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
     // board's own colors and descriptions, not gbd's defaults.
     assert!(
         calls.contains(
-            r#"{id: "O_wip", name: "In Progress", color: BLUE, description: "hands on"}, {name: "Blocked", color: RED, description: ""}, {id: "O_def", name: "Deferred", color: GRAY, description: ""}"#
+            r#"{name: "Blocked", color: RED, description: ""}, {id: "O_def", name: "Deferred", color: GRAY, description: ""}, {id: "O_ready", name: "Ready", color: GREEN, description: ""}, {id: "O_wip", name: "In Progress", color: BLUE, description: "hands on"}, {id: "O_done", name: "Done", color: PURPLE, description: ""}"#
         ),
-        "Blocked slotted in between In Progress and Deferred, existing options kept: {calls}"
+        "Blocked added and the five put in column order, existing options kept: {calls}"
+    );
+    assert!(
+        calls.contains("updateProjectV2View")
+            && calls.contains("-F name=Board")
+            && calls.contains("-F filter=-type:Epic"),
+        "the stock view is shaped: {calls}"
     );
     let cfg = fs::read_to_string(h.cwd.path().join(".gbd.yml")).unwrap();
     assert!(cfg.contains("project: 8\n"), "{cfg}");
@@ -1182,9 +1201,59 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
     assert_eq!(
         h.calls().matches("updateProjectV2Field").count(),
         1,
-        "options are complete after the first run: {}",
+        "options are complete and in order after the first run: {}",
         h.calls()
     );
+    assert_eq!(
+        h.calls().matches("updateProjectV2View").count(),
+        1,
+        "the view is shaped once: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn init_and_doctor_leave_a_hand_shaped_view_alone() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
+            {"id":3,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on(
+        "views",
+        "views(first: 50",
+        r#"{"data":{"node":{"views":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"id":"PVTV_1","name":"Sprint","layout":"BOARD_LAYOUT","filter":"is:open"},
+            {"id":"PVTV_2","name":"View 1","layout":"TABLE_LAYOUT","filter":null,"sortByFields":{"totalCount":1}}]}}}}"#,
+    );
+    h.gbd()
+        .args(["init", "--no-memory", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "view: left as is (Sprint (board, is:open), View 1 (table)). By hand: name Board, board layout, filter -type:Epic",
+        ));
+    let calls = h.calls();
+    // The stock-named table is sorted by someone: shaped, so not rewritten.
+    assert!(!calls.contains("updateProjectV2View"), "{calls}");
+    assert!(
+        !calls.contains("updateProjectV2Field"),
+        "options already complete and in order: {calls}"
+    );
+    h.gbd()
+        .args(["doctor", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok    board  #7 widgets board"))
+        .stdout(predicate::str::contains(
+            "!     view  Sprint (board, is:open), View 1 (table); a hand-shaped view is left alone.",
+        ));
 }
 
 #[test]
@@ -1285,8 +1354,8 @@ fn init_pages_linked_projects_before_deciding_to_create() {
         r#"{"id":"PVT_8","number":8,"title":"widgets board","url":"https://github.com/orgs/acme/projects/8"}"#)
     .on("06-pfields", "project field-list 8 --owner acme --format json",
         r#"{"fields":[{"id":"F_status","name":"Status","options":[
-            {"id":"O_ready","name":"Ready"},{"id":"O_wip","name":"In Progress"},{"id":"O_blocked","name":"Blocked"},
-            {"id":"O_def","name":"Deferred"},{"id":"O_done","name":"Done"}]}]}"#);
+            {"id":"O_blocked","name":"Blocked"},{"id":"O_def","name":"Deferred"},{"id":"O_ready","name":"Ready"},
+            {"id":"O_wip","name":"In Progress"},{"id":"O_done","name":"Done"}]}]}"#);
     h.gbd()
         .args(["init", "--no-memory", "--no-skills"])
         .assert()
