@@ -414,8 +414,10 @@ fn board_fixtures(h: &Harness) {
      // The importer's check for an issue an earlier run created but never recorded.
      .on("no-unrecorded", "issue list -R acme/widgets --search", "[]")
      .on("no-newest", "issue list -R acme/widgets --state all --limit 20 --json number,url,body", "[]")
-     // The importer's preflight: any login can be assigned here.
-     .on("assignable", "repos/acme/widgets/assignees/", "");
+     // The importer's preflights: any login can be assigned here, and the
+     // org has every type.
+     .on("assignable", "repos/acme/widgets/assignees/", "")
+     .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#);
 }
 
 #[test]
@@ -939,7 +941,7 @@ fn init_creates_the_missing_org_vocabulary() {
             "issue field Priority: P0, P1, P2, P3, P4",
         ))
         .stdout(predicate::str::contains(
-            "issue types: Epic, Feature, Bug, Task, Chore — created Epic, Chore",
+            "issue types: Epic, Feature, Bug, Task, Chore, Decision — created Epic, Chore, Decision",
         ));
     let calls = h.calls();
     assert!(
@@ -984,7 +986,7 @@ fn doctor_reports_missing_types_and_fields_as_warnings() {
             "!     start-date  no Start date issue field",
         ))
         .stdout(predicate::str::contains(
-            "!     types  missing issue types Epic, Feature, Bug, Chore",
+            "!     types  missing issue types Epic, Feature, Bug, Chore, Decision",
         ));
 }
 
@@ -1124,7 +1126,7 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
             {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
             {"id":3,"name":"Start date","data_type":"date"}]"#,
     )
-    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
     .on(
         "03-linked",
         "projectsV2(first: 100",
@@ -1226,7 +1228,7 @@ fn init_and_doctor_leave_a_hand_shaped_view_alone() {
             {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
             {"id":3,"name":"Start date","data_type":"date"}]"#,
     )
-    .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
     .on(
         "views",
         "views(first: 50",
@@ -1338,7 +1340,7 @@ fn init_pages_linked_projects_before_deciding_to_create() {
             {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
             {"id":3,"name":"Start date","data_type":"date"}]"#,
     )
-    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
     // Page two (matched first because the call carries the cursor) holds the board.
     .on(
         "03-linked-page2",
@@ -2084,7 +2086,8 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
 fn import_needs_a_board_before_it_creates_anything() {
     let h = Harness::new(); // .gbd.yml without project:
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
-    h.on("assignable", "repos/acme/widgets/assignees/", "");
+    h.on("assignable", "repos/acme/widgets/assignees/", "")
+        .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#);
     h.on(
         "create",
         "issue create -R acme/widgets",
@@ -3211,4 +3214,38 @@ fn import_finishes_a_bead_whose_assignee_github_rejects() {
         last_wx2.contains("\"phase\":\"created\""),
         "a transient failure keeps the bead resumable: {map}"
     );
+}
+
+#[test]
+fn import_refuses_when_the_org_lacks_a_type_the_plan_needs() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-export.jsonl");
+    // An org set up by an earlier gbd: five types, no Decision.
+    h.on(
+        "types",
+        TYPES_GET,
+        r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#,
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "issue type Decision missing on acme: run gbd init (org admin) first",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    // Not being able to read the types is a stop, not a pass.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on_fail("types", TYPES_GET, "gh: Not Found (HTTP 404)");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "reading the issue types of acme; they live on an organization, which gbd needs",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
 }

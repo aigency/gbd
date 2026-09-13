@@ -26,7 +26,7 @@ Do not use `bd`, Dolt, or TodoWrite for surviving work.
 
 One command. Type, priority, parent, blocked-by together:
 
-`gbd create "Title" -t Task|Bug|Feature|Epic|Chore -p P1 --parent <n> --deps <n,n>`
+`gbd create "Title" -t Task|Bug|Feature|Epic|Chore|Decision -p P1 --parent <n> --deps <n,n>`
 
 ## Where things live (never labels)
 

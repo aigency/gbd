@@ -57,7 +57,7 @@ Do not use `bd`, Dolt, or TodoWrite for surviving work.
 
 One command. Type, priority, parent, blocked-by together:
 
-`gbd create "Title" -t Task|Bug|Feature|Epic|Chore -p P1 --parent <n> --deps <n,n>`
+`gbd create "Title" -t Task|Bug|Feature|Epic|Chore|Decision -p P1 --parent <n> --deps <n,n>`
 
 ## Where things live (never labels)
 
@@ -90,7 +90,7 @@ Afterwards retire Beads (`bd hooks uninstall`, `bd setup <editor>
 Beads*.
 "#;
 
-pub const ISSUE_TYPES: [&str; 5] = ["Epic", "Feature", "Bug", "Task", "Chore"];
+pub const ISSUE_TYPES: [&str; 6] = ["Epic", "Feature", "Bug", "Task", "Chore", "Decision"];
 
 /// One SKILL.md, written to every agent's project-skill location:
 /// Codex / GPT Astra (`.agents`), Claude Code (`.claude`), Cursor (`.cursor`).
@@ -282,7 +282,7 @@ pub fn missing_issue_types(existing: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Ensure the five gbd issue types exist on the org. One GET, then a POST
+/// Ensure the six gbd issue types exist on the org. One GET, then a POST
 /// per missing type. Returns a single log line.
 pub fn ensure_issue_types(repo: &Repo) -> String {
     let org = repo.owner();
@@ -296,7 +296,7 @@ pub fn ensure_issue_types(repo: &Repo) -> String {
             )
         }
     };
-    let colors = ["purple", "blue", "red", "yellow", "gray"];
+    let colors = ["purple", "blue", "red", "yellow", "gray", "orange"];
     let mut created = Vec::new();
     let mut failed = Vec::new();
     let missing = missing_issue_types(&existing);

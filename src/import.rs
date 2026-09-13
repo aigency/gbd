@@ -83,7 +83,7 @@ pub enum State {
 pub struct Item {
     pub bead: String,
     pub title: String,
-    /// Epic / Feature / Bug / Task / Chore.
+    /// Epic / Feature / Bug / Task / Chore / Decision.
     pub issue_type: &'static str,
     /// 0–4, written as P0–P4.
     pub priority: u8,
@@ -141,7 +141,8 @@ fn issue_type(kind: &Kind) -> (&'static str, bool) {
         Kind::Bug => ("Bug", true),
         Kind::Task => ("Task", true),
         Kind::Chore => ("Chore", true),
-        Kind::Decision | Kind::Other(_) => ("Task", false),
+        Kind::Decision => ("Decision", true),
+        Kind::Other(_) => ("Task", false),
     }
 }
 
@@ -1521,7 +1522,7 @@ mod tests {
         assert_eq!(closed.status, project::STATUS_DONE);
 
         let decision = item(&p, "wx-5");
-        assert_eq!(decision.issue_type, "Task");
+        assert_eq!(decision.issue_type, "Decision");
         assert!(decision.body.contains("## Design\n\nTwo options"));
         assert!(decision
             .body
@@ -1544,8 +1545,8 @@ mod tests {
             .collect();
         let has = |s: &str| what.iter().any(|w| w.contains(s));
         assert!(
-            has("wx-5: type \"decision\" has no issue type; created as Task"),
-            "{what:?}"
+            !has("wx-5: type \"decision\""),
+            "a decision is a Decision, nothing to report: {what:?}"
         );
         assert!(
             has("wx-7: type \"wisp\" has no issue type; created as Task"),
@@ -1559,7 +1560,7 @@ mod tests {
             has("wx-5: related edge to wx-1 has no GitHub relation"),
             "{what:?}"
         );
-        assert_eq!(p.skipped.len(), 4, "{what:?}");
+        assert_eq!(p.skipped.len(), 3, "{what:?}");
         assert_eq!(p.problems.len(), 6);
     }
 
@@ -2125,7 +2126,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("By type:    Bug 1, Chore 1, Epic 1, Feature 1, Task 4\n"),
+            text.contains("By type:    Bug 1, Chore 1, Decision 1, Epic 1, Feature 1, Task 3\n"),
             "{text}"
         );
         assert!(
@@ -2148,7 +2149,7 @@ mod tests {
             text.contains("       … 5 more (--json for all)\n"),
             "{text}"
         );
-        assert!(text.contains("Cannot map (4):\n"), "{text}");
+        assert!(text.contains("Cannot map (3):\n"), "{text}");
         assert!(text.contains("Export problems (6):\n"), "{text}");
         assert!(text.ends_with("Nothing written (--dry-run).\n"), "{text}");
         assert!(

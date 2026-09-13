@@ -174,7 +174,7 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 
 | Beads | GitHub | Set with |
 | --- | --- | --- |
-| type (`task`, `bug`, `feature`, `epic`) | org **issue type** Epic / Feature / Bug / Task / Chore | `create -t`, `update --type` |
+| type (`task`, `bug`, `feature`, `epic`, `chore`, `decision`) | org **issue type** Epic / Feature / Bug / Task / Chore / Decision | `create -t`, `update --type` |
 | priority 0–4 | org issue field **Priority** with options P0–P4 | `create -p`, `priority`, `update --priority` |
 | `blocks` / blocked-by | native issue **dependencies** | `create --deps`, `dep add` |
 | parent / epic children | **sub-issues** | `create --parent`, `parent --set` |
@@ -218,7 +218,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 
 | Beads | GitHub |
 | --- | --- |
-| type `epic` / `feature` / `bug` / `task` / `chore` | issue type; `decision` and anything unknown → Task, reported |
+| type `epic` / `feature` / `bug` / `task` / `chore` / `decision` | issue type of the same name; anything else → Task, reported |
 | priority 0–4 | Priority P0–P4 |
 | `blocks` | dependency (`--blocked-by`), created after its blocker |
 | `parent-child` | sub-issue (`--parent`), created after its parent |
@@ -260,7 +260,7 @@ GitHub [issue types](https://docs.github.com/en/issues/tracking-your-work-with-i
 
 | Prerequisite | Exactly | Used by |
 | --- | --- | --- |
-| Issue types | **Epic**, **Feature**, **Bug**, **Task**, **Chore** | `create -t`, `ready` (skips Epics) |
+| Issue types | **Epic**, **Feature**, **Bug**, **Task**, **Chore**, **Decision** | `create -t`, `ready` (skips Epics) |
 | Issue field **Priority** | single-select, options **P0 P1 P2 P3 P4** | `-p`, `priority`, `ready` ranking |
 | Issue field **Start date** | date (GitHub's default; recreated if deleted) | `defer --until`, `ready` |
 | Issue field **gbd Role** | single-select, option **Memory** | the memories issue, excluded from `ready` |
@@ -272,7 +272,7 @@ If the org still has GitHub's default Priority (Urgent / High / Medium / Low), i
 
 Init still writes the repo files and says what it could not create. An owner does the rest once, in Organization → **Settings** → **Planning** (replace `ORG`):
 
-- Issue types: `https://github.com/organizations/ORG/settings/issue-types` — enable the five above (GitHub ships Task, Bug, Feature; add Epic purple and Chore gray; disable Enhancement).
+- Issue types: `https://github.com/organizations/ORG/settings/issue-types` — enable the six above (GitHub ships Task, Bug, Feature; add Epic purple, Chore gray, and Decision orange; disable Enhancement).
 - Issue fields: `https://github.com/organizations/ORG/settings/issue-fields` — Priority options P0 red, P1 orange, P2 yellow, P3 green, P4 gray; a **date** field named exactly `Start date`; a single-select `gbd Role` with option `Memory`.
 - Projects: create `<repo> board` under the org, set Status to Blocked / Deferred / Ready / In Progress / Done, link the repo, then `gbd config set project <number>`.
 
@@ -284,7 +284,7 @@ Pinned fields show in the create form and sidebar for that type; unpinned fields
 
 | Field | Pin to |
 | --- | --- |
-| Priority | Epic, Feature, Bug, Task, Chore |
+| Priority | Epic, Feature, Bug, Task, Chore, Decision |
 | Start date | Feature, Task, Chore |
 | Target date | Epic, Feature |
 | Effort | Feature, Bug, Task, Chore — not Epic |
