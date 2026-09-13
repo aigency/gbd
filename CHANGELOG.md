@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-09-13
+
+### Fixed
+
+- fix(gh): wait out GitHub's primary rate limit; the importer checks its budget before a create (#55)
+
 ## [1.8.2] - 2026-09-13
 
 ### Fixed
