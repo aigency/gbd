@@ -1253,14 +1253,22 @@ fn check_assignees(
             None => name.clone(),
         };
         let beads = format!("{n} bead{}", if *n == 1 { "" } else { "s" });
-        if !import::is_login(&login) {
-            problems.push(format!("  {name} ({beads}): not a GitHub login"));
-        } else if gh::api("GET", &format!("repos/{repo}/assignees/{login}"), None).is_err() {
-            problems.push(format!(
-                "  {name} ({beads}): {login} cannot be assigned in {repo}"
-            ));
+        if import::is_login(&login) {
+            // 204 means assignable, 404 means not; anything else is not an
+            // answer about the login and is reported as what it is.
+            match gh::api("GET", &format!("repos/{repo}/assignees/{login}"), None) {
+                Ok(_) => continue,
+                Err(err) if format!("{err:#}").contains("HTTP 404") => problems.push(format!(
+                    "  {name} ({beads}): {login} cannot be assigned in {repo}"
+                )),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("could not check whether {login} can be assigned in {repo}")
+                    });
+                }
+            }
         } else {
-            continue;
+            problems.push(format!("  {name} ({beads}): not a GitHub login"));
         }
         names.push(name.as_str());
     }

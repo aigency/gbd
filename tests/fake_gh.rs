@@ -3042,6 +3042,37 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
         ));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
 
+    // The preflight failing for any other reason is that reason, not
+    // advice about the mapping.
+    fs::write(
+        h.gh_dir.path().join("00-someone.args"),
+        "repos/acme/widgets/assignees/someone",
+    )
+    .unwrap();
+    fs::write(
+        h.gh_dir.path().join("00-someone.out"),
+        "gh: Bad Gateway (HTTP 502)",
+    )
+    .unwrap();
+    fs::write(h.gh_dir.path().join("00-someone.code"), "1").unwrap();
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--yes",
+            "--assignee",
+            "Pat Example=someone",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not check whether someone can be assigned in acme/widgets",
+        ))
+        .stderr(predicate::str::contains("HTTP 502"))
+        .stderr(predicate::str::contains("assignees to map").not());
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
     // Mapped: the login is assigned.
     h.on(
         "fields",
