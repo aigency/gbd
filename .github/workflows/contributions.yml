@@ -9,7 +9,7 @@ name: contributions
 # out or executed here; the job only comments and closes.
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, reopened]
 
 permissions:
   pull-requests: write
