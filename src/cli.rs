@@ -1414,6 +1414,7 @@ fn import_run(
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
         unsure_blockers: BTreeSet::new(),
+        budget: None,
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1507,6 +1508,10 @@ struct Run<'a> {
     /// Finished blockers whose live state could not be read: anything
     /// placed against them stays unfinished, so the next run looks again.
     unsure_blockers: BTreeSet<String>,
+    /// GraphQL points believed left, read from `/rate_limit` when it runs
+    /// low. A create is several mutations that cannot be retried, so the
+    /// run waits for the reset rather than let a create trip the limit.
+    budget: Option<u64>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1748,6 +1753,7 @@ impl Run<'_> {
             .map(|b| edge(b))
             .collect::<Result<_>>()?;
         let body = import::rewrite_ids(&item.body, &self.numbers);
+        self.ensure_budget();
         let (number, url) = create_issue(
             self.ctx,
             &NewIssue {
@@ -1760,6 +1766,8 @@ impl Run<'_> {
             },
         )
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
+        // A create with its edges is up to about ten points.
+        self.budget = self.budget.map(|b| b.saturating_sub(10));
         let t = Touched {
             bead: item.bead.clone(),
             number,
@@ -1772,6 +1780,30 @@ impl Run<'_> {
         self.record(&t, import::Phase::Created)?;
         self.numbers.insert(item.bead.clone(), number);
         Ok((number, url))
+    }
+
+    /// Before a create: with fewer than a comfortable reserve of GraphQL
+    /// points left, wait for the hourly reset. `/rate_limit` is free, but
+    /// it is read only when the running estimate says it matters; if it
+    /// cannot be read, the create goes ahead and the read is tried again
+    /// a little later.
+    fn ensure_budget(&mut self) {
+        const RESERVE: u64 = 60;
+        if self.budget.is_some_and(|b| b > RESERVE) {
+            return;
+        }
+        let Ok((remaining, reset)) = gh::budget("graphql") else {
+            // Unreadable this time: try again a couple of dozen creates on.
+            self.budget = Some(RESERVE + 200);
+            return;
+        };
+        self.budget = Some(if remaining < RESERVE {
+            gh::wait_for_reset("graphql", reset);
+            // Fresh after the reset; a stale read must not wait again.
+            gh::budget("graphql").map_or(RESERVE + 1, |(r, _)| r.max(RESERVE + 1))
+        } else {
+            remaining
+        });
     }
 
     /// Priority, Start date, assignee, the close, and the card: all
