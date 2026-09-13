@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-13
+
+### Added
+
+- feat: Decision, a sixth org issue type (#46)
+
+### Documentation
+
+- docs: getting gbd into a cloud or CI session (#42)
+
 ## [1.6.1] - 2026-09-13
 
 ### Fixed
