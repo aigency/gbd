@@ -209,7 +209,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | open | board Ready, or Blocked when a blocker is still open |
 | `in_progress` | board In Progress, assignee kept |
 | `deferred`, or any `defer_until` | board Deferred, Start date |
-| `assignee` | the assignee, by GitHub login. Beads usually holds a display name, so the dry run lists the names it found and the real run refuses to start while one that cannot be a login is unmapped: `--assignee 'Pat Example=patexample'` maps it, `--assignee 'Pat Example='` imports without it |
+| `assignee` | the assignee, by GitHub login. Beads usually holds a display name, so the dry run lists the names it found, and the real run checks every one, mapped or not, can be assigned in the repository before creating anything, refusing with the list otherwise: `--assignee 'Pat Example=patexample'` maps a name, `--assignee 'Pat Example='` imports without it |
 | closed | closed with a reason read from the free-text `close_reason` (duplicate / not planned / else completed), board Done |
 | `notes`, comments | comments, with author and date |
 | description, design, acceptance criteria | the body, as sections |

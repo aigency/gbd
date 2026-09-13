@@ -413,7 +413,9 @@ fn board_fixtures(h: &Harness) {
      .on("pedit", "project item-edit --id PVTI_12 --project-id PVT_1 --field-id F_status --single-select-option-id", "")
      // The importer's check for an issue an earlier run created but never recorded.
      .on("no-unrecorded", "issue list -R acme/widgets --search", "[]")
-     .on("no-newest", "issue list -R acme/widgets --state all --limit 20 --json number,url,body", "[]");
+     .on("no-newest", "issue list -R acme/widgets --state all --limit 20 --json number,url,body", "[]")
+     // The importer's preflight: any login can be assigned here.
+     .on("assignable", "repos/acme/widgets/assignees/", "");
 }
 
 #[test]
@@ -2082,6 +2084,7 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
 fn import_needs_a_board_before_it_creates_anything() {
     let h = Harness::new(); // .gbd.yml without project:
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on("assignable", "repos/acme/widgets/assignees/", "");
     h.on(
         "create",
         "issue create -R acme/widgets",
@@ -2833,6 +2836,7 @@ fn import_of_memories_alone_needs_no_board() {
 fn import_with_everything_done_only_retries_the_memories() {
     let h = Harness::new(); // no board configured
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on("assignable", "repos/acme/widgets/assignees/", "");
     fs::write(
         h.cwd.path().join("beads-map.jsonl"),
         concat!(
@@ -3000,7 +3004,35 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "assignee Pat Example (1 bead) is not a GitHub login. Pass --assignee 'Pat Example=LOGIN' to map it, or --assignee 'Pat Example=' to import without it",
+            "assignees to map before the import can start:\n  Pat Example (1 bead): not a GitHub login\nPass --assignee 'Pat Example=LOGIN' to map them, or NAME= to import without one",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    // Mapped to a login the repo cannot assign: refused, naming the login.
+    fs::write(
+        h.gh_dir.path().join("00-nobody.args"),
+        "repos/acme/widgets/assignees/nobody",
+    )
+    .unwrap();
+    fs::write(
+        h.gh_dir.path().join("00-nobody.out"),
+        "gh: Not Found (HTTP 404)",
+    )
+    .unwrap();
+    fs::write(h.gh_dir.path().join("00-nobody.code"), "1").unwrap();
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--yes",
+            "--assignee",
+            "Pat Example=nobody",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "  Pat Example (1 bead): nobody cannot be assigned in acme/widgets",
         ));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
 
@@ -3104,5 +3136,42 @@ fn import_finishes_a_bead_whose_assignee_github_rejects() {
     assert!(
         last_wx2.contains("\"phase\":\"done\""),
         "a rejected login is not retried, the bead is finished: {map}"
+    );
+
+    // Any other failure on the assignee is retried like every step: the
+    // bead stays at `created`.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    .on_fail("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "HTTP 502: bad gateway")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("assignee dev1 not set: "))
+        .stderr(predicate::str::contains("Run gbd import again to retry"));
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last_wx2 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-2\""))
+        .unwrap();
+    assert!(
+        last_wx2.contains("\"phase\":\"created\""),
+        "a transient failure keeps the bead resumable: {map}"
     );
 }
