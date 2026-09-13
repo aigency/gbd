@@ -939,7 +939,7 @@ fn init_creates_the_missing_org_vocabulary() {
             "issue field Priority: P0, P1, P2, P3, P4",
         ))
         .stdout(predicate::str::contains(
-            "issue types: Epic, Feature, Bug, Task, Chore — created Epic, Chore",
+            "issue types: Epic, Feature, Bug, Task, Chore, Decision — created Epic, Chore, Decision",
         ));
     let calls = h.calls();
     assert!(
@@ -984,7 +984,7 @@ fn doctor_reports_missing_types_and_fields_as_warnings() {
             "!     start-date  no Start date issue field",
         ))
         .stdout(predicate::str::contains(
-            "!     types  missing issue types Epic, Feature, Bug, Chore",
+            "!     types  missing issue types Epic, Feature, Bug, Chore, Decision",
         ));
 }
 
@@ -1124,7 +1124,7 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
             {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
             {"id":3,"name":"Start date","data_type":"date"}]"#,
     )
-    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
     .on(
         "03-linked",
         "projectsV2(first: 100",
@@ -1226,7 +1226,7 @@ fn init_and_doctor_leave_a_hand_shaped_view_alone() {
             {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
             {"id":3,"name":"Start date","data_type":"date"}]"#,
     )
-    .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
     .on(
         "views",
         "views(first: 50",
@@ -1338,7 +1338,7 @@ fn init_pages_linked_projects_before_deciding_to_create() {
             {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
             {"id":3,"name":"Start date","data_type":"date"}]"#,
     )
-    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
     // Page two (matched first because the call carries the cursor) holds the board.
     .on(
         "03-linked-page2",
