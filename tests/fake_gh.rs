@@ -2975,3 +2975,134 @@ fn import_refuses_a_mapping_file_another_import_holds() {
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
     drop(other);
 }
+
+#[test]
+fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-named.jsonl");
+    // The dry run says what it found and what to pass.
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Assignees:  Glenn Scott (1) — not a GitHub login; pass --assignee 'Glenn Scott=LOGIN'",
+        ));
+    // The real run refuses before creating anything.
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "assignee Glenn Scott (1 bead) is not a GitHub login. Pass --assignee 'Glenn Scott=LOGIN' to map it, or --assignee 'Glenn Scott=' to import without it",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    // Mapped: the login is assigned.
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create", "--title Wire the thing", "https://github.com/acme/widgets/issues/201")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("assign", "issue edit 201 -R acme/widgets --add-assignee glennsc", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--yes",
+            "--assignee",
+            "Glenn Scott=glennsc",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("imported 1 issues"))
+        .stdout(predicate::str::contains("0 warnings"));
+    assert!(
+        h.calls()
+            .contains("issue edit 201 -R acme/widgets --add-assignee glennsc"),
+        "{}",
+        h.calls()
+    );
+
+    // Dropped: no assignee call at all, and no warning.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create", "--title Wire the thing", "https://github.com/acme/widgets/issues/201")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--yes",
+            "--assignee",
+            "Glenn Scott=",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 warnings"));
+    assert!(!h.calls().contains("--add-assignee"), "{}", h.calls());
+}
+
+#[test]
+fn import_finishes_a_bead_whose_assignee_github_rejects() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create-1", "--title Widget API v2", "https://github.com/acme/widgets/issues/101")
+    .on("create-2", "--title Auth refresh drops the session", "https://github.com/acme/widgets/issues/102")
+    .on("create-3", "--title Rename the endpoints", "https://github.com/acme/widgets/issues/103")
+    .on("values", "issue-field-values --input -", "{}")
+    // dev1 looks like a login but is not one on this GitHub.
+    .on_fail("assign", "issue edit 102 -R acme/widgets --add-assignee dev1", "GraphQL: Could not resolve to a user or bot with the login 'dev1'.")
+    .on("close", "issue close 102 -R acme/widgets --reason duplicate", "")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "")
+    .on("edit-101", "issue edit 101 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("; 1 warning;"))
+        .stderr(predicate::str::contains(
+            "wx-2 (#102): assignee dev1 not set: ",
+        ))
+        .stderr(predicate::str::contains(
+            "Set it by hand, or re-run with --assignee 'dev1=LOGIN'",
+        ));
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last_wx2 = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-2\""))
+        .unwrap();
+    assert!(
+        last_wx2.contains("\"phase\":\"done\""),
+        "a rejected login is not retried, the bead is finished: {map}"
+    );
+}

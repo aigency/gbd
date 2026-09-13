@@ -149,7 +149,7 @@ Memories live in one closed, untyped issue with org field **gbd Role = Memory**.
 | --- | --- |
 | `init [--no-project] [--no-memory] [--no-skills]` | See [Quick start](#quick-start). |
 | `doctor` (`info`) | One row per prerequisite with a copy-paste fix. Exit 1 only when gbd cannot work. |
-| `import --from-beads FILE [--dry-run \| --yes] [--mapping FILE]` | Move a Beads tracker onto GitHub, once. See [Migrating from Beads](#migrating-from-beads). |
+| `import --from-beads FILE [--dry-run \| --yes] [--mapping FILE] [--assignee NAME=LOGIN…]` | Move a Beads tracker onto GitHub, once. See [Migrating from Beads](#migrating-from-beads). |
 | `where`, `ping`, `config get\|set`, `onboard`, `open <id>`, `completion <shell>`, `upgrade` | Utilities. |
 
 ## Data model
@@ -209,6 +209,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | open | board Ready, or Blocked when a blocker is still open |
 | `in_progress` | board In Progress, assignee kept |
 | `deferred`, or any `defer_until` | board Deferred, Start date |
+| `assignee` | the assignee, by GitHub login. Beads usually holds a display name, so the dry run lists the names it found and the real run refuses to start while one that cannot be a login is unmapped: `--assignee 'Glenn Scott=glennsc'` maps it, `--assignee 'Glenn Scott='` imports without it |
 | closed | closed with a reason read from the free-text `close_reason` (duplicate / not planned / else completed), board Done |
 | `notes`, comments | comments, with author and date |
 | description, design, acceptance criteria | the body, as sections |

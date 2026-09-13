@@ -230,6 +230,10 @@ pub enum Commands {
         /// beads-map.jsonl next to .gbd.yml
         #[arg(long, value_name = "FILE")]
         mapping: Option<PathBuf>,
+        /// Beads assignee → GitHub login (`'Glenn Scott=glennsc'`); `'Name='`
+        /// drops that assignee. Repeatable. The dry run lists the names.
+        #[arg(long = "assignee", value_name = "NAME=LOGIN")]
+        assignee: Vec<String>,
     },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
@@ -597,7 +601,16 @@ fn dispatch(cli: Cli) -> Result<u8> {
             dry_run,
             yes,
             mapping,
-        } => cmd_import(explicit, json, &from_beads, dry_run, yes, mapping),
+            assignee,
+        } => cmd_import(
+            explicit,
+            json,
+            &from_beads,
+            dry_run,
+            yes,
+            mapping,
+            &assignee,
+        ),
         Commands::Ready {
             claim,
             explain,
@@ -1152,6 +1165,7 @@ fn cmd_import(
     dry_run: bool,
     yes: bool,
     mapping: Option<PathBuf>,
+    assignees: &[String],
 ) -> Result<u8> {
     // The default lives beside .gbd.yml, so a resume from any directory
     // of the repo finds the same file.
@@ -1164,6 +1178,7 @@ fn cmd_import(
     let mapping = mapping.as_path();
     let export = beads::load(from_beads)?;
     let mut plan = import::plan(&export);
+    import::map_assignees(&mut plan, &import::assignee_map(assignees)?);
     let done = import::read_mapping(mapping)?;
     import::note_imported(&mut plan, &done);
     let source = from_beads.display().to_string();
@@ -1196,6 +1211,11 @@ fn cmd_import(
             ctx.repo.name_with_owner,
             plan.memories.len()
         );
+    }
+    // A name GitHub cannot assign would fail on every bead that carries it;
+    // better one refusal that says which flag to pass.
+    if let Some(problem) = import::unmapped_assignees(&plan) {
+        bail!("{problem}");
     }
     // The state a run starts from is read under the file's lock, held until
     // the run ends: two resumes at once would otherwise both start from the
@@ -1694,9 +1714,14 @@ impl Run<'_> {
                 warn(&mut warnings, format!("Start date not set: {err:#}"));
             }
         }
+        // A login GitHub rejects will not work on a retry either: say so,
+        // and let the bead finish.
         if let Some(login) = &item.assignee {
             if let Err(err) = target.edit(&["--add-assignee", login]) {
-                warn(&mut warnings, format!("assignee {login} not set: {err:#}"));
+                self.warnings.push(format!(
+                    "{} (#{number}): assignee {login} not set: {err:#}. Set it by hand, or re-run with --assignee '{login}=LOGIN'",
+                    item.bead
+                ));
             }
         }
         // What actually happened, not what was planned: a close that failed
