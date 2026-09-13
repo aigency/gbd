@@ -3247,3 +3247,31 @@ fn import_refuses_when_the_org_lacks_a_type_the_plan_needs() {
         ));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
 }
+
+#[test]
+fn init_says_which_scope_an_org_create_needs() {
+    let h = Harness::new();
+    h.on(
+        "01-fields",
+        FIELDS_GET,
+        r#"[{"id":1,"name":"Priority","data_type":"single_select","options":[
+            {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+            {"id":2,"name":"gbd Role","data_type":"single_select","options":[{"id":9,"name":"Memory"}]},
+            {"id":3,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("02-types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
+    // GitHub answers 404 to a write the token cannot make; gh says which
+    // scope on the next line.
+    .on_fail(
+        "03-create-type",
+        "--method POST -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 orgs/acme/issue-types",
+        "gh: Not Found (HTTP 404)\ngh: This API operation needs the \"admin:org\" scope. To request it, run:  gh auth refresh -h github.com -s admin:org",
+    );
+    h.gbd()
+        .args(["init", "--no-memory", "--no-project", "--no-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "could not create Decision (Not Found (HTTP 404). This API operation needs the \"admin:org\" scope. To request it, run:  gh auth refresh -h github.com -s admin:org)",
+        ));
+}
