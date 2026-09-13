@@ -1217,16 +1217,17 @@ pub fn is_login(s: &str) -> bool {
         && !s.contains("--")
 }
 
-/// Replace every mapped assignee on the plan.
+/// Replace every mapped assignee on the plan; an unmapped one is kept
+/// trimmed, since `--add-assignee` takes a login, not padding.
 pub fn map_assignees(plan: &mut Plan, map: &BTreeMap<String, Option<String>>) {
     for item in &mut plan.items {
-        if let Some(login) = item
-            .assignee
-            .as_ref()
-            .and_then(|n| map.get(&assignee_key(n)))
-        {
-            item.assignee.clone_from(login);
-        }
+        let Some(name) = item.assignee.take() else {
+            continue;
+        };
+        item.assignee = match map.get(&assignee_key(&name)) {
+            Some(login) => login.clone(),
+            None => Some(name.trim().to_string()).filter(|n| !n.is_empty()),
+        };
     }
 }
 
@@ -1931,6 +1932,7 @@ mod tests {
 {"_type":"issue","id":"n-2","title":"b","issue_type":"task","status":"open","priority":2,"assignee":"pat example","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-3","title":"c","issue_type":"task","status":"open","priority":2,"assignee":"dev1","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-4","title":"d","issue_type":"task","status":"open","priority":2,"assignee":" Pat  Example ","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-5","title":"e","issue_type":"task","status":"open","priority":2,"assignee":" dev2 ","created_at":"2026-04-01T09:00:00Z"}
 "#
             .as_bytes(),
         )
@@ -1940,9 +1942,10 @@ mod tests {
             assignee_summary(&p),
             vec![
                 ("Pat Example".to_string(), 3, false),
-                ("dev1".to_string(), 1, true)
+                ("dev1".to_string(), 1, true),
+                ("dev2".to_string(), 1, true)
             ],
-            "spelling variants of one name count together"
+            "spelling variants of one name count together; a padded login is shown trimmed"
         );
         assert!(render(&p, "x", 5).contains(
             "Assignees:  Pat Example (3) — not a GitHub login; pass --assignee 'Pat Example=LOGIN'"
@@ -1955,11 +1958,12 @@ mod tests {
                 Some("patexample"),
                 Some("patexample"),
                 Some("dev1"),
-                Some("patexample")
+                Some("patexample"),
+                Some("dev2")
             ],
-            "every variant maps; a login stays"
+            "every variant maps; a login stays, trimmed"
         );
-        assert!(render(&p, "x", 5).contains("Assignees:  patexample (3), dev1 (1)"));
+        assert!(render(&p, "x", 5).contains("Assignees:  patexample (3), dev1 (1), dev2 (1)"));
     }
 
     #[test]
