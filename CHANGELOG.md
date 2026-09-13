@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-13
+
+### Fixed
+
+- fix(import): map Beads assignees to GitHub logins; a rejected login no longer holds a bead open (#38)
+
+### Other
+
+- ci: an outside pull request is one from a fork, not one by a private member (#43)
+
 ## [1.6.0] - 2026-09-13
 
 ### Added
