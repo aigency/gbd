@@ -1459,13 +1459,18 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
         );
     }
     if !p.memories.is_empty() {
-        let keys: Vec<&str> = p.memories.iter().map(|m| m.key.as_str()).collect();
-        let _ = writeln!(
-            out,
-            "\nMemories ({}), upserted by key: {}",
-            keys.len(),
-            keys.join(" ")
-        );
+        // One key per line, capped like the order: a corpus has dozens.
+        let _ = writeln!(out, "\nMemories ({}), upserted by key:", p.memories.len());
+        for m in p.memories.iter().take(order_lines) {
+            let _ = writeln!(out, "  {}", m.key);
+        }
+        if p.memories.len() > order_lines {
+            let _ = writeln!(
+                out,
+                "  … {} more (--json for all)",
+                p.memories.len() - order_lines
+            );
+        }
     }
     out.push_str(&render_diagnostics(p));
     out.push_str("\nNothing written (--dry-run).\n");
@@ -1776,7 +1781,12 @@ mod tests {
             "{:?}",
             p.skipped
         );
-        assert!(render(&p, "x", 5).contains("Memories (2), upserted by key: k k"));
+        assert!(render(&p, "x", 5).contains("Memories (2), upserted by key:\n  k\n  k\n"));
+        assert!(
+            render(&p, "x", 1)
+                .contains("Memories (2), upserted by key:\n  k\n  … 1 more (--json for all)\n"),
+            "capped like the order"
+        );
     }
 
     #[test]
