@@ -364,7 +364,9 @@ fn resolve(raw: Vec<(usize, RawIssue)>, export: &mut Export) {
                 "parent-child" => {
                     if parent.is_some() {
                         // GitHub has one parent; the other stays as a relation.
-                        note(format!("second parent {target} ignored"));
+                        note(format!(
+                            "second parent {target} kept as a relation; GitHub has one parent"
+                        ));
                         other_deps.push(Edge {
                             kind: d.kind.clone(),
                             from: r.id.clone(),
@@ -519,7 +521,10 @@ mod tests {
             has("wx-5: blocks edge to wx-9, which is not in the export"),
             "{what:?}"
         );
-        assert!(has("wx-6: second parent wx-3 ignored"), "{what:?}");
+        assert!(
+            has("wx-6: second parent wx-3 kept as a relation; GitHub has one parent"),
+            "{what:?}"
+        );
         assert!(
             has("wx-6: dependency edge belongs to wx-2, not this record"),
             "{what:?}"
