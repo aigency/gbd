@@ -1188,8 +1188,9 @@ pub fn assignee_key(name: &str) -> String {
 pub fn assignee_map(flags: &[String]) -> Result<BTreeMap<String, Option<String>>> {
     let mut map = BTreeMap::new();
     for flag in flags {
+        // The last `=`: a login never contains one, a display name might.
         let (name, login) = flag
-            .split_once('=')
+            .rsplit_once('=')
             .with_context(|| format!("--assignee {flag}: expected NAME=LOGIN"))?;
         let (name, login) = (name.trim(), login.trim());
         if name.is_empty() {
@@ -1929,6 +1930,13 @@ mod tests {
             "the name is matched case and whitespace aside"
         );
         assert_eq!(map["bot"], None, "an empty login drops the assignee");
+        let split = assignee_map(&flags(&["Team = Backend=backend-user", "A=B="])).unwrap();
+        assert_eq!(
+            split["team = backend"].as_deref(),
+            Some("backend-user"),
+            "the split is at the last equals sign"
+        );
+        assert_eq!(split["a=b"], None);
         assert!(assignee_map(&flags(&["no-equals"])).is_err());
         assert!(assignee_map(&flags(&["=x"])).is_err());
         assert!(
