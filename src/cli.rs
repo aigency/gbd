@@ -1224,23 +1224,28 @@ fn cmd_import(
     // and a login it can assign might be the wrong person: check each one
     // against the repo first, one refusal naming every flag to pass.
     check_assignees(&ctx, &raw_assignees, &logins)?;
-    // Every type the run will create must exist on the org: an org set up
-    // by an earlier gbd lacks Decision. When the list cannot be read (a
-    // personal account), the create itself says so.
-    if let Ok(existing) = init::list_issue_types(ctx.repo.owner()) {
-        let mut missing: Vec<&str> = plan
-            .items
+    // Every type the run will create must exist on the org (an org set up
+    // by an earlier gbd lacks Decision); a bead the file already records
+    // exists and needs no create. Issue types live on an organization, so
+    // not being able to read them is a stop, not a shrug.
+    let needed: BTreeSet<&str> = plan
+        .items
+        .iter()
+        .filter(|i| !done.contains_key(&i.bead))
+        .map(|i| i.issue_type)
+        .collect();
+    if !needed.is_empty() {
+        let existing = init::list_issue_types(ctx.repo.owner()).with_context(|| {
+            format!(
+                "reading the issue types of {}; they live on an organization, which gbd needs",
+                ctx.repo.owner()
+            )
+        })?;
+        let missing: Vec<&str> = needed
             .iter()
-            .filter(|i| {
-                !done
-                    .get(&i.bead)
-                    .is_some_and(|m| m.phase == import::Phase::Done)
-            })
-            .map(|i| i.issue_type)
+            .copied()
             .filter(|t| !existing.iter().any(|e| e.eq_ignore_ascii_case(t)))
             .collect();
-        missing.sort_unstable();
-        missing.dedup();
         if !missing.is_empty() {
             bail!(
                 "issue type{} {} missing on {}: run gbd init (org admin) first",

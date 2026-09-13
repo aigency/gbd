@@ -414,8 +414,10 @@ fn board_fixtures(h: &Harness) {
      // The importer's check for an issue an earlier run created but never recorded.
      .on("no-unrecorded", "issue list -R acme/widgets --search", "[]")
      .on("no-newest", "issue list -R acme/widgets --state all --limit 20 --json number,url,body", "[]")
-     // The importer's preflight: any login can be assigned here.
-     .on("assignable", "repos/acme/widgets/assignees/", "");
+     // The importer's preflights: any login can be assigned here, and the
+     // org has every type.
+     .on("assignable", "repos/acme/widgets/assignees/", "")
+     .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#);
 }
 
 #[test]
@@ -2084,7 +2086,8 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
 fn import_needs_a_board_before_it_creates_anything() {
     let h = Harness::new(); // .gbd.yml without project:
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
-    h.on("assignable", "repos/acme/widgets/assignees/", "");
+    h.on("assignable", "repos/acme/widgets/assignees/", "")
+        .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#);
     h.on(
         "create",
         "issue create -R acme/widgets",
@@ -3230,6 +3233,19 @@ fn import_refuses_when_the_org_lacks_a_type_the_plan_needs() {
         .failure()
         .stderr(predicate::str::contains(
             "issue type Decision missing on acme: run gbd init (org admin) first",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+
+    // Not being able to read the types is a stop, not a pass.
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on_fail("types", TYPES_GET, "gh: Not Found (HTTP 404)");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "reading the issue types of acme; they live on an organization, which gbd needs",
         ));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
 }
