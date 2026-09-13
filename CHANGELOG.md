@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-13
+
+### Added
+
+- feat(init): shape a new board's default view and put the columns in order (#36)
+
+### Documentation
+
+- docs: retiring Beads is the last migration step (#35)
+- docs: export from Beads right before the import, with Dolt pulled and frozen (#32)
+
 ## [1.5.0] - 2026-09-12
 
 ### Added
