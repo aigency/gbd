@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-13
+
+### Documentation
+
+- docs: cargo binstall needs cargo-binstall installed first (#49)
+
+### Fixed
+
+- fix(init): keep gh's scope hint when an org create fails (#51)
+
 ## [1.8.0] - 2026-09-13
 
 ### Added
