@@ -1175,6 +1175,96 @@ pub fn rewrite_ids(text: &str, known: &BTreeMap<String, u64>) -> String {
 // ---------------------------------------------------------------------------
 // Report
 
+/// How a Beads assignee is matched: case and runs of whitespace aside.
+pub fn assignee_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// `NAME=LOGIN` flags as [`assignee_key`] → login; `None` when the login
+/// is empty, which drops that assignee.
+pub fn assignee_map(flags: &[String]) -> Result<BTreeMap<String, Option<String>>> {
+    let mut map = BTreeMap::new();
+    for flag in flags {
+        // The last `=`: a login never contains one, a display name might.
+        let (name, login) = flag
+            .rsplit_once('=')
+            .with_context(|| format!("--assignee {flag}: expected NAME=LOGIN"))?;
+        let (name, login) = (name.trim(), login.trim());
+        if name.is_empty() {
+            anyhow::bail!("--assignee {flag}: the Beads name is empty");
+        }
+        if !login.is_empty() && !is_login(login) {
+            anyhow::bail!("--assignee {flag}: {login} is not a GitHub login");
+        }
+        map.insert(
+            assignee_key(name),
+            (!login.is_empty()).then(|| login.to_string()),
+        );
+    }
+    Ok(map)
+}
+
+/// The shape of a GitHub login: letters, digits, and single hyphens not at
+/// either end, at most 39 of them.
+pub fn is_login(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 39
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && !s.contains("--")
+}
+
+/// Replace every mapped assignee on the plan; an unmapped one is kept
+/// trimmed, since `--add-assignee` takes a login, not padding.
+pub fn map_assignees(plan: &mut Plan, map: &BTreeMap<String, Option<String>>) {
+    for item in &mut plan.items {
+        let Some(name) = item.assignee.take() else {
+            continue;
+        };
+        item.assignee = match map.get(&assignee_key(&name)) {
+            Some(login) => login.clone(),
+            None => Some(name.trim().to_string()).filter(|n| !n.is_empty()),
+        };
+    }
+}
+
+/// Distinct assignees on the plan (spelling variants of one name counted
+/// together, shown as first seen and trimmed) with how many beads carry
+/// each, most first, and whether each can be a GitHub login.
+pub fn assignee_summary(p: &Plan) -> Vec<(String, usize, bool)> {
+    assignee_summary_of(p.items.iter())
+}
+
+/// [`assignee_summary`] over some of the items, for a resume that only
+/// needs the unfinished ones checked. A blank assignee is no assignee.
+pub fn assignee_summary_of<'a>(
+    items: impl Iterator<Item = &'a Item>,
+) -> Vec<(String, usize, bool)> {
+    let mut counts: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for name in items
+        .filter_map(|i| i.assignee.as_deref())
+        .filter(|n| !n.trim().is_empty())
+    {
+        let entry = counts
+            .entry(assignee_key(name))
+            .or_insert_with(|| (name.trim().to_string(), 0));
+        entry.1 += 1;
+    }
+    let mut out: Vec<(String, usize, bool)> = counts
+        .into_values()
+        .map(|(name, n)| {
+            let ok = is_login(&name);
+            (name, n, ok)
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 /// The dry-run text: counts, the order, and everything dropped.
 pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
     let mut out = format!(
@@ -1222,6 +1312,20 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
         "Also:",
         labels.len()
     );
+    let assignees = assignee_summary(p);
+    if !assignees.is_empty() {
+        let parts: Vec<String> = assignees
+            .iter()
+            .map(|(name, n, ok)| {
+                if *ok {
+                    format!("{name} ({n})")
+                } else {
+                    format!("{name} ({n}) — not a GitHub login; pass --assignee '{name}=LOGIN'")
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "{:<11} {}", "Assignees:", parts.join(", "));
+    }
     let _ = writeln!(
         out,
         "\nOrder ({} of {}):",
@@ -1814,6 +1918,73 @@ mod tests {
             "a reference definition inside a block quote"
         );
         assert_eq!(rewrite_ids("no ids here.", &known), "no ids here.");
+    }
+
+    #[test]
+    fn assignee_flags_map_names_to_logins() {
+        let flags = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let map = assignee_map(&flags(&["  Pat   Example =patexample", "Bot="])).unwrap();
+        assert_eq!(
+            map["pat example"].as_deref(),
+            Some("patexample"),
+            "the name is matched case and whitespace aside"
+        );
+        assert_eq!(map["bot"], None, "an empty login drops the assignee");
+        let split = assignee_map(&flags(&["Team = Backend=backend-user", "A=B="])).unwrap();
+        assert_eq!(
+            split["team = backend"].as_deref(),
+            Some("backend-user"),
+            "the split is at the last equals sign"
+        );
+        assert_eq!(split["a=b"], None);
+        assert!(assignee_map(&flags(&["no-equals"])).is_err());
+        assert!(assignee_map(&flags(&["=x"])).is_err());
+        assert!(
+            assignee_map(&flags(&["A=not a login"])).is_err(),
+            "the login side must be a login"
+        );
+        assert!(is_login("patexample") && is_login("a-b1"));
+        assert!(!is_login("Pat Example") && !is_login("-x") && !is_login("a--b") && !is_login(""));
+
+        let export = crate::beads::parse(
+            r#"{"_type":"issue","id":"n-1","title":"a","issue_type":"task","status":"open","priority":2,"assignee":"Pat Example","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-2","title":"b","issue_type":"task","status":"open","priority":2,"assignee":"pat example","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-3","title":"c","issue_type":"task","status":"open","priority":2,"assignee":"dev1","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-4","title":"d","issue_type":"task","status":"open","priority":2,"assignee":" Pat  Example ","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-5","title":"e","issue_type":"task","status":"open","priority":2,"assignee":" dev2 ","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-6","title":"f","issue_type":"task","status":"open","priority":2,"assignee":"   ","created_at":"2026-04-01T09:00:00Z"}
+"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut p = plan(&export);
+        assert_eq!(
+            assignee_summary(&p),
+            vec![
+                ("Pat Example".to_string(), 3, false),
+                ("dev1".to_string(), 1, true),
+                ("dev2".to_string(), 1, true)
+            ],
+            "spelling variants of one name count together; a padded login is shown trimmed; a blank one is nothing"
+        );
+        assert!(render(&p, "x", 5).contains(
+            "Assignees:  Pat Example (3) — not a GitHub login; pass --assignee 'Pat Example=LOGIN'"
+        ));
+        map_assignees(&mut p, &map);
+        let logins: Vec<Option<&str>> = p.items.iter().map(|i| i.assignee.as_deref()).collect();
+        assert_eq!(
+            logins,
+            vec![
+                Some("patexample"),
+                Some("patexample"),
+                Some("dev1"),
+                Some("patexample"),
+                Some("dev2"),
+                None
+            ],
+            "every variant maps; a login stays, trimmed; a blank one is dropped"
+        );
+        assert!(render(&p, "x", 5).contains("Assignees:  patexample (3), dev1 (1), dev2 (1)"));
     }
 
     #[test]

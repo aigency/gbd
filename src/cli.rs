@@ -230,6 +230,10 @@ pub enum Commands {
         /// beads-map.jsonl next to .gbd.yml
         #[arg(long, value_name = "FILE")]
         mapping: Option<PathBuf>,
+        /// Beads assignee → GitHub login (`'Pat Example=patexample'`); `'Name='`
+        /// drops that assignee. Repeatable. The dry run lists the names.
+        #[arg(long = "assignee", value_name = "NAME=LOGIN")]
+        assignee: Vec<String>,
     },
     /// Store an insight (positional arg is CONTENT; key is derived)
     Remember {
@@ -597,7 +601,16 @@ fn dispatch(cli: Cli) -> Result<u8> {
             dry_run,
             yes,
             mapping,
-        } => cmd_import(explicit, json, &from_beads, dry_run, yes, mapping),
+            assignee,
+        } => cmd_import(
+            explicit,
+            json,
+            &from_beads,
+            dry_run,
+            yes,
+            mapping,
+            &assignee,
+        ),
         Commands::Ready {
             claim,
             explain,
@@ -1152,6 +1165,7 @@ fn cmd_import(
     dry_run: bool,
     yes: bool,
     mapping: Option<PathBuf>,
+    assignees: &[String],
 ) -> Result<u8> {
     // The default lives beside .gbd.yml, so a resume from any directory
     // of the repo finds the same file.
@@ -1165,6 +1179,15 @@ fn cmd_import(
     let export = beads::load(from_beads)?;
     let mut plan = import::plan(&export);
     let done = import::read_mapping(mapping)?;
+    let logins = import::assignee_map(assignees)?;
+    // The names as the export has them, for the preflight's messages; only
+    // beads this run will touch, so a finished bead's assignee is history.
+    let raw_assignees = import::assignee_summary_of(plan.items.iter().filter(|i| {
+        !done
+            .get(&i.bead)
+            .is_some_and(|m| m.phase == import::Phase::Done)
+    }));
+    import::map_assignees(&mut plan, &logins);
     import::note_imported(&mut plan, &done);
     let source = from_beads.display().to_string();
     if dry_run {
@@ -1197,6 +1220,10 @@ fn cmd_import(
             plan.memories.len()
         );
     }
+    // A name GitHub cannot assign would fail on every bead that carries it,
+    // and a login it can assign might be the wrong person: check each one
+    // against the repo first, one refusal naming every flag to pass.
+    check_assignees(&ctx, &raw_assignees, &logins)?;
     // The state a run starts from is read under the file's lock, held until
     // the run ends: two resumes at once would otherwise both start from the
     // same state and create everything twice.
@@ -1207,6 +1234,56 @@ fn cmd_import(
     refuse_foreign(&done)?;
     import::note_imported(&mut plan, &done);
     import_run(&ctx, &plan, map, &done)
+}
+
+/// Every distinct Beads assignee, after `--assignee` mapping, must be a
+/// login the repository can assign; one `gh api` per distinct name.
+fn check_assignees(
+    ctx: &Ctx,
+    raw: &[(String, usize, bool)],
+    logins: &BTreeMap<String, Option<String>>,
+) -> Result<()> {
+    let repo = &ctx.repo.name_with_owner;
+    let mut problems = Vec::new();
+    let mut names = Vec::new();
+    for (name, n, _) in raw {
+        let login = match logins.get(&import::assignee_key(name)) {
+            Some(Some(login)) => login.clone(),
+            Some(None) => continue,
+            None => name.clone(),
+        };
+        let beads = format!("{n} bead{}", if *n == 1 { "" } else { "s" });
+        if import::is_login(&login) {
+            // 204 means assignable, 404 means not; anything else is not an
+            // answer about the login and is reported as what it is.
+            match gh::api("GET", &format!("repos/{repo}/assignees/{login}"), None) {
+                Ok(_) => continue,
+                Err(err) if format!("{err:#}").contains("HTTP 404") => problems.push(format!(
+                    "  {name} ({beads}): {login} cannot be assigned in {repo}"
+                )),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("could not check whether {login} can be assigned in {repo}")
+                    });
+                }
+            }
+        } else {
+            problems.push(format!("  {name} ({beads}): not a GitHub login"));
+        }
+        names.push(name.as_str());
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let flags: Vec<String> = names
+        .iter()
+        .map(|name| format!("--assignee '{name}=LOGIN'"))
+        .collect();
+    bail!(
+        "assignees to map before the import can start:\n{}\nPass {} to map them, or NAME= to import without one",
+        problems.join("\n"),
+        flags.join(" ")
+    )
 }
 
 /// Execute the plan top to bottom: one `gh issue create` per bead, its
@@ -1694,9 +1771,23 @@ impl Run<'_> {
                 warn(&mut warnings, format!("Start date not set: {err:#}"));
             }
         }
+        // A login GitHub cannot resolve will not work on a retry either:
+        // say so and let the bead finish. Anything else (a timeout, a limit)
+        // is retried like every other step.
         if let Some(login) = &item.assignee {
             if let Err(err) = target.edit(&["--add-assignee", login]) {
-                warn(&mut warnings, format!("assignee {login} not set: {err:#}"));
+                let msg = format!("{err:#}");
+                if msg.contains("Could not resolve to a user") {
+                    self.warnings.push(format!(
+                        "{} (#{number}): assignee {login} not set: {msg}. Set it by hand, or re-run with --assignee '{login}=LOGIN'",
+                        item.bead
+                    ));
+                } else {
+                    warn(
+                        &mut warnings,
+                        format!("assignee {login} not set: {msg}. Run gbd import again to retry"),
+                    );
+                }
             }
         }
         // What actually happened, not what was planned: a close that failed
