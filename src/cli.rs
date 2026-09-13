@@ -230,7 +230,7 @@ pub enum Commands {
         /// beads-map.jsonl next to .gbd.yml
         #[arg(long, value_name = "FILE")]
         mapping: Option<PathBuf>,
-        /// Beads assignee → GitHub login (`'Glenn Scott=glennsc'`); `'Name='`
+        /// Beads assignee → GitHub login (`'Pat Example=patexample'`); `'Name='`
         /// drops that assignee. Repeatable. The dry run lists the names.
         #[arg(long = "assignee", value_name = "NAME=LOGIN")]
         assignee: Vec<String>,

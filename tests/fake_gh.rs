@@ -2992,7 +2992,7 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Assignees:  Glenn Scott (1) — not a GitHub login; pass --assignee 'Glenn Scott=LOGIN'",
+            "Assignees:  Pat Example (1) — not a GitHub login; pass --assignee 'Pat Example=LOGIN'",
         ));
     // The real run refuses before creating anything.
     h.gbd()
@@ -3000,7 +3000,7 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "assignee Glenn Scott (1 bead) is not a GitHub login. Pass --assignee 'Glenn Scott=LOGIN' to map it, or --assignee 'Glenn Scott=' to import without it",
+            "assignee Pat Example (1 bead) is not a GitHub login. Pass --assignee 'Pat Example=LOGIN' to map it, or --assignee 'Pat Example=' to import without it",
         ));
     assert!(!h.calls().contains("issue create"), "{}", h.calls());
 
@@ -3012,7 +3012,7 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
     )
     .on("create", "--title Wire the thing", "https://github.com/acme/widgets/issues/201")
     .on("values", "issue-field-values --input -", "{}")
-    .on("assign", "issue edit 201 -R acme/widgets --add-assignee glennsc", "")
+    .on("assign", "issue edit 201 -R acme/widgets --add-assignee patexample", "")
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
     .on("anyedit", "project item-edit --id PVTI_new", "");
     h.gbd()
@@ -3022,7 +3022,7 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
             fixture.to_str().unwrap(),
             "--yes",
             "--assignee",
-            "Glenn Scott=glennsc",
+            "Pat Example=patexample",
         ])
         .assert()
         .success()
@@ -3030,7 +3030,7 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
         .stdout(predicate::str::contains("0 warnings"));
     assert!(
         h.calls()
-            .contains("issue edit 201 -R acme/widgets --add-assignee glennsc"),
+            .contains("issue edit 201 -R acme/widgets --add-assignee patexample"),
         "{}",
         h.calls()
     );
@@ -3054,7 +3054,7 @@ fn import_refuses_an_assignee_that_is_not_a_login_until_mapped() {
             fixture.to_str().unwrap(),
             "--yes",
             "--assignee",
-            "Glenn Scott=",
+            "Pat Example=",
         ])
         .assert()
         .success()

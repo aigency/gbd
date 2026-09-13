@@ -1921,8 +1921,8 @@ mod tests {
     #[test]
     fn assignee_flags_map_names_to_logins() {
         let flags = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let map = assignee_map(&flags(&["Glenn Scott=glennsc", "Bot="])).unwrap();
-        assert_eq!(map["glenn scott"].as_deref(), Some("glennsc"));
+        let map = assignee_map(&flags(&["Pat Example=patexample", "Bot="])).unwrap();
+        assert_eq!(map["pat example"].as_deref(), Some("patexample"));
         assert_eq!(map["bot"], None, "an empty login drops the assignee");
         assert!(assignee_map(&flags(&["no-equals"])).is_err());
         assert!(assignee_map(&flags(&["=x"])).is_err());
@@ -1930,12 +1930,12 @@ mod tests {
             assignee_map(&flags(&["A=not a login"])).is_err(),
             "the login side must be a login"
         );
-        assert!(is_login("glennsc") && is_login("a-b1"));
-        assert!(!is_login("Glenn Scott") && !is_login("-x") && !is_login("a--b") && !is_login(""));
+        assert!(is_login("patexample") && is_login("a-b1"));
+        assert!(!is_login("Pat Example") && !is_login("-x") && !is_login("a--b") && !is_login(""));
 
         let export = crate::beads::parse(
-            r#"{"_type":"issue","id":"n-1","title":"a","issue_type":"task","status":"open","priority":2,"assignee":"Glenn Scott","created_at":"2026-04-01T09:00:00Z"}
-{"_type":"issue","id":"n-2","title":"b","issue_type":"task","status":"open","priority":2,"assignee":"glenn scott","created_at":"2026-04-01T09:00:00Z"}
+            r#"{"_type":"issue","id":"n-1","title":"a","issue_type":"task","status":"open","priority":2,"assignee":"Pat Example","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-2","title":"b","issue_type":"task","status":"open","priority":2,"assignee":"pat example","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-3","title":"c","issue_type":"task","status":"open","priority":2,"assignee":"dev1","created_at":"2026-04-01T09:00:00Z"}
 "#
             .as_bytes(),
@@ -1944,20 +1944,20 @@ mod tests {
         let mut p = plan(&export);
         assert_eq!(
             unmapped_assignees(&p).as_deref(),
-            Some("assignee Glenn Scott (1 bead), glenn scott (1 bead) is not a GitHub login. Pass --assignee 'Glenn Scott=LOGIN' --assignee 'glenn scott=LOGIN' to map it, or --assignee 'Glenn Scott=' to import without it")
+            Some("assignee Pat Example (1 bead), pat example (1 bead) is not a GitHub login. Pass --assignee 'Pat Example=LOGIN' --assignee 'pat example=LOGIN' to map it, or --assignee 'Pat Example=' to import without it")
         );
         assert!(render(&p, "x", 5).contains(
-            "Assignees:  Glenn Scott (1) — not a GitHub login; pass --assignee 'Glenn Scott=LOGIN'"
+            "Assignees:  Pat Example (1) — not a GitHub login; pass --assignee 'Pat Example=LOGIN'"
         ));
         map_assignees(&mut p, &map);
         let logins: Vec<Option<&str>> = p.items.iter().map(|i| i.assignee.as_deref()).collect();
         assert_eq!(
             logins,
-            vec![Some("glennsc"), Some("glennsc"), Some("dev1")],
+            vec![Some("patexample"), Some("patexample"), Some("dev1")],
             "names match without regard to case; a login stays"
         );
         assert!(unmapped_assignees(&p).is_none());
-        assert!(render(&p, "x", 5).contains("Assignees:  glennsc (2), dev1 (1)"));
+        assert!(render(&p, "x", 5).contains("Assignees:  patexample (2), dev1 (1)"));
     }
 
     #[test]
