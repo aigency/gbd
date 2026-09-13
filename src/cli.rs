@@ -1785,14 +1785,16 @@ impl Run<'_> {
     /// Before a create: with fewer than a comfortable reserve of GraphQL
     /// points left, wait for the hourly reset. `/rate_limit` is free, but
     /// it is read only when the running estimate says it matters; if it
-    /// cannot be read at all, the create goes ahead as before.
+    /// cannot be read, the create goes ahead and the read is tried again
+    /// a little later.
     fn ensure_budget(&mut self) {
         const RESERVE: u64 = 60;
         if self.budget.is_some_and(|b| b > RESERVE) {
             return;
         }
         let Ok((remaining, reset)) = gh::budget("graphql") else {
-            self.budget = Some(u64::MAX);
+            // Unreadable this time: try again a couple of dozen creates on.
+            self.budget = Some(RESERVE + 200);
             return;
         };
         self.budget = Some(if remaining < RESERVE {
