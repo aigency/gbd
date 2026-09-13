@@ -176,7 +176,7 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 
 ## The board
 
-`gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Ready / In Progress / Blocked / Deferred / Done**, links the repo, and writes `project: N` to `.gbd.yml`. On a board from an earlier gbd, re-running `init` adds the missing option in place. From then on `create` adds new issues as Ready (Blocked when `--deps` names an open issue), and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` skips In Progress and Deferred. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
+`gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Blocked / Deferred / Ready / In Progress / Done** in that column order, names the default view **Board** in board layout with the filter `-type:Epic` (epics are containers, not work), links the repo, and writes `project: N` to `.gbd.yml`. On a board from an earlier gbd, re-running `init` adds any missing option and puts the five in that order with their ids kept, so no card loses its value; the view is rewritten only while it is still GitHub's untouched "View 1" table, and `gbd doctor` says when a hand-shaped view differs. From then on `create` adds new issues as Ready (Blocked when `--deps` names an open issue), and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` skips In Progress and Deferred. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
 
 **Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back. `update --status ready`, `reopen`, and `undefer` land on Blocked instead when a blocker is still open. Only Ready and Blocked ever swap; In Progress, Deferred, and Done are someone's decision. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
 
@@ -247,7 +247,7 @@ GitHub [issue types](https://docs.github.com/en/issues/tracking-your-work-with-i
 | Issue field **Priority** | single-select, options **P0 P1 P2 P3 P4** | `-p`, `priority`, `ready` ranking |
 | Issue field **Start date** | date (GitHub's default; recreated if deleted) | `defer --until`, `ready` |
 | Issue field **gbd Role** | single-select, option **Memory** | the memories issue, excluded from `ready` |
-| Project **`<repo> board`** | Status options **Ready / In Progress / Blocked / Deferred / Done**, linked to the repo | `claim`, `update --status`, `close`, `dep add`, `board` |
+| Project **`<repo> board`** | Status options **Blocked / Deferred / Ready / In Progress / Done**, a **Board** view filtered `-type:Epic`, linked to the repo | `claim`, `update --status`, `close`, `dep add`, `board` |
 
 If the org still has GitHub's default Priority (Urgent / High / Medium / Low), init **renames those options in place** (Urgent→P0 … Low→P3) and adds P4, so existing values survive. Init never maps P0 onto "High" at read or write time.
 
@@ -257,7 +257,7 @@ Init still writes the repo files and says what it could not create. An owner doe
 
 - Issue types: `https://github.com/organizations/ORG/settings/issue-types` — enable the five above (GitHub ships Task, Bug, Feature; add Epic purple and Chore gray; disable Enhancement).
 - Issue fields: `https://github.com/organizations/ORG/settings/issue-fields` — Priority options P0 red, P1 orange, P2 yellow, P3 green, P4 gray; a **date** field named exactly `Start date`; a single-select `gbd Role` with option `Memory`.
-- Projects: create `<repo> board` under the org, set Status to Ready / In Progress / Blocked / Deferred / Done, link the repo, then `gbd config set project <number>`.
+- Projects: create `<repo> board` under the org, set Status to Blocked / Deferred / Ready / In Progress / Done, link the repo, then `gbd config set project <number>`.
 
 Then re-run `gbd init` in the repo. Note that a GitHub App installation token (the kind some cloud agents run with) usually cannot edit org settings even for an admin; use an org-owner's own login for this step.
 

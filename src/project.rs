@@ -17,15 +17,38 @@ pub const STATUS_BLOCKED: &str = "Blocked";
 pub const STATUS_DEFERRED: &str = "Deferred";
 pub const STATUS_DONE: &str = "Done";
 
-/// The five options `gbd init` puts on the Status field, in column order,
-/// with colors.
+/// The five options `gbd init` puts on the Status field, in column order
+/// (what needs attention first, then what is parked, then the work), with
+/// colors. Board columns follow the field's option order.
 pub const STATUSES: [(&str, &str); 5] = [
-    (STATUS_READY, "GREEN"),
-    (STATUS_IN_PROGRESS, "YELLOW"),
     (STATUS_BLOCKED, "RED"),
     (STATUS_DEFERRED, "GRAY"),
+    (STATUS_READY, "GREEN"),
+    (STATUS_IN_PROGRESS, "YELLOW"),
     (STATUS_DONE, "PURPLE"),
 ];
+
+/// The default view `gbd init` shapes on a new board: named Board, board
+/// layout (columns are the Status options), epics filtered out since they
+/// are containers, not work.
+pub const VIEW_NAME: &str = "Board";
+pub const VIEW_FILTER: &str = "-type:Epic";
+const VIEW_LAYOUT: &str = "BOARD_LAYOUT";
+/// What a new project ships with, and the only view gbd will rewrite.
+const STOCK_VIEW_NAME: &str = "View 1";
+const STOCK_VIEW_LAYOUT: &str = "TABLE_LAYOUT";
+
+/// What the board's views say about the one gbd shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewState {
+    /// A view named Board, board layout, filtered to `-type:Epic`.
+    Configured,
+    /// Still GitHub's stock "View 1" table, untouched: safe to rewrite.
+    /// Carries the view's node id.
+    Untouched(String),
+    /// Shaped by hand; gbd leaves it alone. Says what is there.
+    Custom(String),
+}
 
 pub const SCOPE_HINT: &str = "gh auth refresh -s project";
 
@@ -295,16 +318,110 @@ impl Board {
             .collect())
     }
 
-    /// Make sure every option in [`STATUSES`] exists on Status.
+    /// The board's views, as `(id, name, layout, filter)`.
+    fn views(&self) -> Result<Vec<(String, String, String, String)>> {
+        const QUERY: &str = r"query($id: ID!) {
+  node(id: $id) { ... on ProjectV2 { views(first: 20) { nodes { id name layout filter } } } }
+}";
+        let data = gh::graphql(QUERY, &[("id", &self.id)]).map_err(scope_error)?;
+        if let Some(errors) = data.get("errors") {
+            bail!("reading views: {errors}");
+        }
+        let nodes = data
+            .pointer("/data/node/views/nodes")
+            .and_then(Value::as_array)
+            .context("reading the board's views")?;
+        Ok(nodes
+            .iter()
+            .filter_map(|v| {
+                let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                let id = v.get("id")?.as_str()?.to_string();
+                Some((id, field("name"), field("layout"), field("filter")))
+            })
+            .collect())
+    }
+
+    /// Whether the board has the view gbd shapes, still has the stock one,
+    /// or has been shaped by hand.
+    pub fn view_state(&self) -> Result<ViewState> {
+        let views = self.views()?;
+        if views.iter().any(|(_, name, layout, filter)| {
+            name.eq_ignore_ascii_case(VIEW_NAME)
+                && layout == VIEW_LAYOUT
+                && filter.trim() == VIEW_FILTER
+        }) {
+            return Ok(ViewState::Configured);
+        }
+        if let Some((id, _, _, _)) = views.iter().find(|(_, name, layout, filter)| {
+            name == STOCK_VIEW_NAME && layout == STOCK_VIEW_LAYOUT && filter.trim().is_empty()
+        }) {
+            return Ok(ViewState::Untouched(id.clone()));
+        }
+        let listed: Vec<String> = views
+            .iter()
+            .map(|(_, name, layout, filter)| {
+                let layout = layout.trim_end_matches("_LAYOUT").to_ascii_lowercase();
+                if filter.trim().is_empty() {
+                    format!("{name} ({layout})")
+                } else {
+                    format!("{name} ({layout}, {})", filter.trim())
+                }
+            })
+            .collect();
+        Ok(ViewState::Custom(if listed.is_empty() {
+            "no views".to_string()
+        } else {
+            listed.join(", ")
+        }))
+    }
+
+    /// Rename the stock view to Board, board layout, epics filtered out.
+    fn configure_view(view_id: &str) -> Result<()> {
+        const MUTATION: &str = r"mutation($view: ID!, $name: String!, $filter: String!) {
+  updateProjectV2View(input: { viewId: $view, name: $name, layout: BOARD_LAYOUT, filter: $filter }) {
+    projectV2View { id }
+  }
+}";
+        let data = gh::graphql(
+            MUTATION,
+            &[
+                ("view", view_id),
+                ("name", VIEW_NAME),
+                ("filter", VIEW_FILTER),
+            ],
+        )
+        .map_err(scope_error)?;
+        if let Some(errors) = data.get("errors") {
+            bail!("configuring the view: {errors}");
+        }
+        Ok(())
+    }
+
+    /// Shape the default view if it is still the stock one. `Ok(None)`
+    /// when the board has the view (already, or now); `Ok(Some(what))`
+    /// when a hand-shaped view was left alone, saying what is there.
+    pub fn ensure_view(&self) -> Result<Option<String>> {
+        match self.view_state()? {
+            ViewState::Configured => Ok(None),
+            ViewState::Untouched(id) => {
+                Self::configure_view(&id)?;
+                Ok(None)
+            }
+            ViewState::Custom(what) => Ok(Some(what)),
+        }
+    }
+
+    /// Make sure every option in [`STATUSES`] exists on Status, in column
+    /// order.
     ///
     /// `updateProjectV2Field` replaces the option list wholesale. Existing
     /// options are carried over with their ids, colors, and descriptions:
     /// GitHub keeps an option's identity, and so every card's value, only
-    /// when the id is sent. A missing option is slotted in after the nearest
-    /// earlier gbd status the board has (Blocked lands between In Progress
-    /// and Deferred on a pre-1.2 board). On a board `gbd init` just created,
-    /// GitHub's default `Todo` is renamed to `Ready`; on an existing board
-    /// it is kept, so no item silently loses its status.
+    /// when the id is sent. A missing option is added, and the five are put
+    /// in the order of [`STATUSES`]; any other option keeps its place after
+    /// them. On a board `gbd init` just created, GitHub's default `Todo` is
+    /// renamed to `Ready`; on an existing board it is kept, so no item
+    /// silently loses its status.
     pub fn ensure_statuses(&mut self, fresh: bool) -> Result<bool> {
         struct Opt {
             /// None for an option that does not exist yet.
@@ -333,29 +450,27 @@ impl Board {
                 changed = true;
             }
         }
-        for (pos, (want, color)) in STATUSES.iter().enumerate() {
-            if options.iter().any(|o| o.name.eq_ignore_ascii_case(want)) {
-                continue;
-            }
-            let at = STATUSES[..pos]
-                .iter()
-                .rev()
-                .find_map(|(prev, _)| {
-                    options
-                        .iter()
-                        .position(|o| o.name.eq_ignore_ascii_case(prev))
-                })
-                .map_or(options.len(), |i| i + 1);
-            options.insert(
-                at,
-                Opt {
+        for (want, color) in STATUSES {
+            if !options.iter().any(|o| o.name.eq_ignore_ascii_case(want)) {
+                options.push(Opt {
                     id: None,
-                    name: (*want).to_string(),
+                    name: want.to_string(),
                     color: Some(color),
-                },
-            );
-            changed = true;
+                });
+                changed = true;
+            }
         }
+        // Column order: the gbd statuses as STATUSES lists them, then any
+        // other option in the order the board had them (the sort is stable).
+        let column = |o: &Opt| {
+            STATUSES
+                .iter()
+                .position(|(n, _)| o.name.eq_ignore_ascii_case(n))
+                .unwrap_or(STATUSES.len())
+        };
+        let before: Vec<String> = options.iter().map(|o| o.name.clone()).collect();
+        options.sort_by_key(column);
+        changed |= options.iter().map(|o| &o.name).ne(before.iter());
         if !changed {
             return Ok(false);
         }

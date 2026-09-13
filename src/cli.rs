@@ -2931,13 +2931,8 @@ fn cmd_board(ctx: &Ctx) -> Result<u8> {
             .or_default()
             .push(it);
     }
-    let order = [
-        project::STATUS_READY,
-        project::STATUS_IN_PROGRESS,
-        project::STATUS_BLOCKED,
-        project::STATUS_DEFERRED,
-        project::STATUS_DONE,
-    ];
+    // The board's column order.
+    let order: Vec<&str> = project::STATUSES.iter().map(|(n, _)| *n).collect();
     let mut keys: Vec<&String> = by_status.keys().collect();
     keys.sort_by_key(|k| {
         order

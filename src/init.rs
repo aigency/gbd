@@ -338,8 +338,8 @@ fn first_line(err: &anyhow::Error) -> String {
 
 /// Use the configured board; else adopt a `<repo> board` already linked to
 /// the repo; else create one. Either way the Status field ends up with
-/// Ready / In Progress / Blocked / Deferred / Done. Re-running never makes
-/// a second board.
+/// Blocked / Deferred / Ready / In Progress / Done, in that order.
+/// Re-running never makes a second board.
 fn ensure_board(repo: &Repo, cfg: &mut Config) -> Result<Board> {
     let title = format!("{} board", repo.name());
     let number = match cfg.project_number() {
@@ -424,7 +424,23 @@ pub fn init(root: &Path, repo: &Repo, opts: &InitOpts) -> Result<Vec<String>> {
 
     if !opts.no_project {
         match ensure_board(repo, &mut cfg) {
-            Ok(board) => log.push(format!("board: #{} {} {}", board.number, board.title, board.url)),
+            Ok(board) => {
+                log.push(format!("board: #{} {} {}", board.number, board.title, board.url));
+                let by_hand = format!(
+                    "By hand: name {}, board layout, filter {}",
+                    project::VIEW_NAME,
+                    project::VIEW_FILTER
+                );
+                log.push(match board.ensure_view() {
+                    Ok(None) => format!(
+                        "view: {} (board layout, {})",
+                        project::VIEW_NAME,
+                        project::VIEW_FILTER
+                    ),
+                    Ok(Some(what)) => format!("view: left as is ({what}). {by_hand}"),
+                    Err(err) => format!("view: not configured ({err:#}). {by_hand}"),
+                });
+            }
             Err(err) => log.push(format!(
                 "board: skipped ({err:#}). Needs the `project` scope ({}) — re-run gbd init, or set `project: N` in .gbd.yml.",
                 project::SCOPE_HINT
@@ -741,6 +757,45 @@ pub fn doctor(
                             ),
                             true,
                         );
+                    }
+                    let by_hand = format!(
+                        "By hand: name {}, board layout, filter {}",
+                        project::VIEW_NAME,
+                        project::VIEW_FILTER
+                    );
+                    match b.view_state() {
+                        Ok(project::ViewState::Configured) => push(
+                            &mut lines,
+                            "view",
+                            true,
+                            format!(
+                                "{} (board layout, {})",
+                                project::VIEW_NAME,
+                                project::VIEW_FILTER
+                            ),
+                            false,
+                        ),
+                        Ok(project::ViewState::Untouched(_)) => push(
+                            &mut lines,
+                            "view",
+                            true,
+                            "still GitHub's stock View 1 table. Run: gbd init".into(),
+                            true,
+                        ),
+                        Ok(project::ViewState::Custom(what)) => push(
+                            &mut lines,
+                            "view",
+                            true,
+                            format!("{what}; a hand-shaped view is left alone. {by_hand}"),
+                            true,
+                        ),
+                        Err(err) => push(
+                            &mut lines,
+                            "view",
+                            true,
+                            format!("could not read the views ({err:#})"),
+                            true,
+                        ),
                     }
                 }
                 Err(err) => {
