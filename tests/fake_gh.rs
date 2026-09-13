@@ -2476,7 +2476,8 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         h.calls()
     );
 
-    // The primary hourly quota is not retried either: it will not clear in time.
+    // The primary hourly quota is waited out until the reset GitHub names,
+    // twice at most; when /rate_limit cannot be read, a short wait stands in.
     let h = Harness::new();
     h.on_fail(
         "search",
@@ -2487,13 +2488,36 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         .env("GBD_BACKOFF_MS", "1")
         .arg("list")
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains(
+            "gh: primary rate limit on graphql; could not read the reset time",
+        ));
     assert_eq!(
         h.calls().matches("search(query: $q").count(),
-        1,
-        "{}",
+        3,
+        "one hit and two waits, then the error stands: {}",
         h.calls()
     );
+    // With /rate_limit readable, the wait is until its reset.
+    let h = Harness::new();
+    h.on(
+        "rl",
+        "api rate_limit",
+        r#"{"resources":{"graphql":{"remaining":0,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+    )
+    .on_fail(
+        "search",
+        "search(query: $q",
+        "HTTP 403: API rate limit exceeded for user ID 1.",
+    );
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+        ));
 
     // A plain failure is not retried: a create behind a 502 may have gone through.
     let h = Harness::new();
@@ -3274,4 +3298,96 @@ fn init_says_which_scope_an_org_create_needs() {
         .stdout(predicate::str::contains(
             "could not create Decision (Not Found (HTTP 404). This API operation needs the \"admin:org\" scope. To request it, run:  gh auth refresh -h github.com -s admin:org)",
         ));
+}
+
+#[test]
+fn a_primary_rate_limit_is_waited_out_until_the_reset() {
+    let h = Harness::new();
+    // The memories issue read fails once on the hourly quota, then works.
+    h.on(
+        "rl",
+        "api rate_limit",
+        r#"{"resources":{"graphql":{"remaining":0,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+    );
+    fs::write(
+        h.gh_dir.path().join("view.args"),
+        "issue view 3 -R acme/widgets --json body",
+    )
+    .unwrap();
+    fs::write(
+        h.gh_dir.path().join("view.out.1"),
+        "GraphQL: API rate limit already exceeded for user ID 1",
+    )
+    .unwrap();
+    fs::write(h.gh_dir.path().join("view.code.1"), "1").unwrap();
+    fs::write(
+        h.gh_dir.path().join("view.out.2"),
+        "{\"body\":\"<!-- gbd-memories v1 -->\\n\\n## k\\nv\\n\"}",
+    )
+    .unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["recall", "k"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("v"))
+        .stderr(predicate::str::contains(
+            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+        ));
+    assert_eq!(
+        h.calls()
+            .matches("issue view 3 -R acme/widgets --json body")
+            .count(),
+        2,
+        "once to hit the limit, once after the reset: {}",
+        h.calls()
+    );
+}
+
+#[test]
+fn import_waits_for_graphql_budget_before_a_create() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-named.jsonl");
+    // Ten points left before the first create; plenty after the reset.
+    h.on(
+        "rl",
+        "api rate_limit",
+        r#"{"resources":{"graphql":{"remaining":4990,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+    );
+    fs::write(
+        h.gh_dir.path().join("rl.out.1"),
+        r#"{"resources":{"graphql":{"remaining":10,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("create", "--title Wire the thing", "https://github.com/acme/widgets/issues/201")
+    .on("values", "issue-field-values --input -", "{}")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "");
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args([
+            "import",
+            "--from-beads",
+            fixture.to_str().unwrap(),
+            "--yes",
+            "--assignee",
+            "Pat Example=",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("imported 1 issues"))
+        .stderr(predicate::str::contains(
+            "gh: primary rate limit on graphql; waiting",
+        ));
+    let calls = h.calls();
+    assert!(
+        calls.find("api rate_limit").unwrap() < calls.find("issue create").unwrap(),
+        "the budget is read before the create: {calls}"
+    );
 }

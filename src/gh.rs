@@ -46,11 +46,35 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
     // record was lost on its next run.
     let composite = args.first() == Some(&"issue") && args.get(1) == Some(&"create");
     let mut wait = base;
+    let mut primary_waits = 0u32;
     for attempt in 1..=RETRIES {
         let output = spawn(args, stdin)?;
         // Classified on what gh printed, never on the command line: a body
         // that happens to say "rate limit" must not turn a 502 into a retry.
-        if composite || output.status.success() || !rate_limited(&output) {
+        if composite || output.status.success() {
+            return finish(args, &output);
+        }
+        // The primary hourly quota clears at a known time, not after a
+        // doubling wait: read it and sleep until then, twice at most.
+        if primary_limited(&output) {
+            if primary_waits >= 2 {
+                return finish(args, &output);
+            }
+            primary_waits += 1;
+            let pool = pool_of(args);
+            match budget(pool) {
+                Ok((_, reset)) => wait_for_reset(pool, reset),
+                Err(err) => {
+                    eprintln!(
+                        "gh: primary rate limit on {pool}; could not read the reset time ({err:#}), waiting {}s",
+                        wait.div_ceil(1000)
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                }
+            }
+            continue;
+        }
+        if !rate_limited(&output) {
             return finish(args, &output);
         }
         let ms = retry_after_ms(&output).unwrap_or(wait);
@@ -85,6 +109,58 @@ fn rate_limited(output: &Output) -> bool {
     // "abuse" wording needs the status to back it up.
     let status = msg.contains("http 429") || msg.contains("http 403");
     msg.contains("secondary rate limit") || (status && msg.contains("abuse"))
+}
+
+/// The primary hourly quota, as opposed to the secondary limit: GitHub says
+/// the limit is exceeded and does not say "secondary".
+fn primary_limited(output: &Output) -> bool {
+    let msg = failure_text(output);
+    msg.contains("rate limit") && msg.contains("exceeded") && !msg.contains("secondary")
+}
+
+/// The pool a call draws on: GraphQL for `gh api graphql` and for the
+/// `issue` and `project` subcommands (GraphQL underneath), core otherwise.
+fn pool_of(args: &[&str]) -> &'static str {
+    match args {
+        ["api", "graphql", ..] | ["issue" | "project", ..] => "graphql",
+        _ => "core",
+    }
+}
+
+/// A pool's remaining points and reset time (Unix seconds), from
+/// `GET /rate_limit`, which does not count against any pool.
+pub fn budget(pool: &str) -> Result<(u64, u64)> {
+    let args = ["api", "rate_limit"];
+    let text = finish(&args, &spawn(&args, None)?)?;
+    let v: Value = serde_json::from_str(&text).context("reading /rate_limit")?;
+    let pool = v
+        .pointer(&format!("/resources/{pool}"))
+        .with_context(|| format!("/rate_limit has no {pool} pool"))?;
+    let field = |k: &str| {
+        pool.get(k)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("/rate_limit: no {k}"))
+    };
+    Ok((field("remaining")?, field("reset")?))
+}
+
+/// Sleep until `reset` (Unix seconds) plus a few seconds, saying so.
+/// `GBD_BACKOFF_MS`, when set, caps the margin so tests do not wait.
+pub fn wait_for_reset(pool: &str, reset: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let margin_ms: u64 = std::env::var("GBD_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(5_000, |ms| ms.min(5_000));
+    let secs = reset.saturating_sub(now).min(3_700);
+    eprintln!(
+        "gh: primary rate limit on {pool}; waiting {}m{:02}s for the reset",
+        secs / 60,
+        secs % 60
+    );
+    std::thread::sleep(std::time::Duration::from_millis(secs * 1000 + margin_ms));
 }
 
 /// `retry-after: 30` → 30 000 ms, when gh relays the header.
