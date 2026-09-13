@@ -1,6 +1,16 @@
 # Contributing to gbd
 
-Thanks for helping. gbd is small on purpose; the best contributions keep it that way.
+## Open source, not open contribution
+
+gbd is open source under MIT/Apache, and you can do anything those licenses allow: use it, fork it, ship your fork. It is **not open to code contributions**. It is built by one person with a specific design, and reviewing outside changes is the one thing that does not scale. Pull requests from outside the project are closed automatically with this explanation; nothing personal, and no reflection on the change.
+
+What is welcome:
+
+- **Bug reports.** Use the issue template; `gbd --version`, `gh --version`, and the command with `--json` are usually enough to reproduce.
+- **Forks.** If yours goes somewhere good, open an issue with the link and it will be listed here.
+- **An issue first.** If you think a change belongs in gbd itself, describe it in an issue and you will get an honest answer about whether it would be taken and in what shape.
+
+The rest of this file is how gbd is built, kept for the maintainer and for anyone reading the code or running a fork.
 
 ## Ground rules
 
@@ -28,7 +38,7 @@ Tests never touch the network. `tests/fake_gh/gh` is a fake `gh` placed first on
 
 ### Pull requests
 
-- Branch from `main`, open a PR. The title must be a [conventional commit](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:`, `chore:`); it becomes the squash commit and decides the next version (`feat` → minor, `fix` → patch, `!` or a `BREAKING CHANGE:` footer → major). Docs-only merges do not cut a release.
+- Branch from `main`, open a PR (see the policy above: this is the maintainer's loop). The title must be a [conventional commit](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:`, `chore:`); it becomes the squash commit and decides the next version (`feat` → minor, `fix` → patch, `!` or a `BREAKING CHANGE:` footer → major). Docs-only merges do not cut a release.
 - Required checks: `fmt`, `clippy`, `test (ubuntu-latest)`, `test (macos-latest)`. PRs merge through a merge queue.
 - Keep the README truthful: it describes the current binary. If you change a command, change its row.
 - The PR title and body become the squash commit message. Never put the CI skip marker (the bracketed "skip ci" token) in either, even to talk about it: GitHub honours it anywhere in a pushed commit message and would skip CI and the release for that merge. It belongs only in the release commit the workflow writes.
@@ -36,4 +46,4 @@ Tests never touch the network. `tests/fake_gh/gh` is a fake `gh` placed first on
 
 ## Reporting bugs and proposing features
 
-Use the issue templates. For bugs, include `gbd --version`, `gh --version`, and the command with `--json` if it has one; gbd's `--json` output and the `gh` error text are usually enough to reproduce.
+Use the issue templates. For bugs, include `gbd --version`, `gh --version`, and the command with `--json` if it has one; gbd's `--json` output and the `gh` error text are usually enough to reproduce. For features, say what you are trying to do rather than how; the answer may be a fork.
