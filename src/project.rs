@@ -50,6 +50,16 @@ pub enum ViewState {
     Custom(String),
 }
 
+/// One project view, as much of it as the stock-or-not question needs.
+struct View {
+    id: String,
+    name: String,
+    layout: String,
+    filter: String,
+    /// Sorted or grouped by someone.
+    shaped: bool,
+}
+
 pub const SCOPE_HINT: &str = "gh auth refresh -s project";
 
 #[derive(Debug, Clone)]
@@ -318,53 +328,109 @@ impl Board {
             .collect())
     }
 
-    /// The board's views, as `(id, name, layout, filter)`.
-    fn views(&self) -> Result<Vec<(String, String, String, String)>> {
-        const QUERY: &str = r"query($id: ID!) {
-  node(id: $id) { ... on ProjectV2 { views(first: 20) { nodes { id name layout filter } } } }
+    /// The board's views, every page.
+    fn views(&self) -> Result<Vec<View>> {
+        const QUERY: &str = r"query($id: ID!, $cursor: String) {
+  node(id: $id) { ... on ProjectV2 { views(first: 50, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id name layout filter
+      sortByFields(first: 1) { totalCount }
+      groupByFields(first: 1) { totalCount }
+      verticalGroupByFields(first: 1) { totalCount }
+    }
+  } } }
 }";
-        let data = gh::graphql(QUERY, &[("id", &self.id)]).map_err(scope_error)?;
-        if let Some(errors) = data.get("errors") {
-            bail!("reading views: {errors}");
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut previous: Option<String> = None;
+        loop {
+            let mut vars: Vec<(&str, &str)> = vec![("id", &self.id)];
+            if let Some(c) = &cursor {
+                vars.push(("cursor", c));
+            }
+            let data = gh::graphql(QUERY, &vars).map_err(scope_error)?;
+            if let Some(errors) = data.get("errors") {
+                bail!("reading the views of project #{}: {errors}", self.number);
+            }
+            let conn = data
+                .pointer("/data/node/views")
+                .context("GraphQL response missing node.views")?;
+            all.extend(
+                conn.get("nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| {
+                        let text =
+                            |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                        let count = |k: &str| {
+                            v.pointer(&format!("/{k}/totalCount"))
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0)
+                        };
+                        Some(View {
+                            id: v.get("id")?.as_str()?.to_string(),
+                            name: text("name"),
+                            layout: text("layout"),
+                            filter: text("filter"),
+                            shaped: count("sortByFields")
+                                + count("groupByFields")
+                                + count("verticalGroupByFields")
+                                > 0,
+                        })
+                    }),
+            );
+            let more = conn
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            cursor = if more {
+                conn.pointer("/pageInfo/endCursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            if cursor.is_none() {
+                return Ok(all);
+            }
+            if cursor == previous {
+                bail!("pagination did not advance (cursor {cursor:?} repeated)");
+            }
+            previous.clone_from(&cursor);
         }
-        let nodes = data
-            .pointer("/data/node/views/nodes")
-            .and_then(Value::as_array)
-            .context("reading the board's views")?;
-        Ok(nodes
-            .iter()
-            .filter_map(|v| {
-                let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-                let id = v.get("id")?.as_str()?.to_string();
-                Some((id, field("name"), field("layout"), field("filter")))
-            })
-            .collect())
     }
 
     /// Whether the board has the view gbd shapes, still has the stock one,
-    /// or has been shaped by hand.
+    /// or has been shaped by hand. Untouched means the stock name and table
+    /// layout with no filter, sort, or grouping; which fields a view shows
+    /// survives the change of layout, so that alone does not hold gbd back.
     pub fn view_state(&self) -> Result<ViewState> {
         let views = self.views()?;
-        if views.iter().any(|(_, name, layout, filter)| {
-            name.eq_ignore_ascii_case(VIEW_NAME)
-                && layout == VIEW_LAYOUT
-                && filter.trim() == VIEW_FILTER
+        if views.iter().any(|v| {
+            v.name.eq_ignore_ascii_case(VIEW_NAME)
+                && v.layout == VIEW_LAYOUT
+                && v.filter.trim() == VIEW_FILTER
         }) {
             return Ok(ViewState::Configured);
         }
-        if let Some((id, _, _, _)) = views.iter().find(|(_, name, layout, filter)| {
-            name == STOCK_VIEW_NAME && layout == STOCK_VIEW_LAYOUT && filter.trim().is_empty()
+        if let Some(v) = views.iter().find(|v| {
+            v.name == STOCK_VIEW_NAME
+                && v.layout == STOCK_VIEW_LAYOUT
+                && v.filter.trim().is_empty()
+                && !v.shaped
         }) {
-            return Ok(ViewState::Untouched(id.clone()));
+            return Ok(ViewState::Untouched(v.id.clone()));
         }
         let listed: Vec<String> = views
             .iter()
-            .map(|(_, name, layout, filter)| {
-                let layout = layout.trim_end_matches("_LAYOUT").to_ascii_lowercase();
-                if filter.trim().is_empty() {
-                    format!("{name} ({layout})")
+            .map(|v| {
+                let layout = v.layout.trim_end_matches("_LAYOUT").to_ascii_lowercase();
+                if v.filter.trim().is_empty() {
+                    format!("{} ({layout})", v.name)
                 } else {
-                    format!("{name} ({layout}, {})", filter.trim())
+                    format!("{} ({layout}, {})", v.name, v.filter.trim())
                 }
             })
             .collect();

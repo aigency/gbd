@@ -1138,8 +1138,8 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
             {"id":"O_wip","name":"In Progress"},{"id":"O_done","name":"Done"}]}]}"#)
     .on("06-options", "updateProjectV2Field", r#"{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_status"}}}}"#)
     // The stock view on the first run; the shaped one from then on.
-    .on("08-views", "views(first: 20",
-        r#"{"data":{"node":{"views":{"nodes":[{"id":"PVTV_1","name":"Board","layout":"BOARD_LAYOUT","filter":"-type:Epic"}]}}}}"#)
+    .on("08-views", "views(first: 50",
+        r#"{"data":{"node":{"views":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PVTV_1","name":"Board","layout":"BOARD_LAYOUT","filter":"-type:Epic"}]}}}}"#)
     .on("09-view", "updateProjectV2View", r#"{"data":{"updateProjectV2View":{"projectV2View":{"id":"PVTV_1"}}}}"#)
     .on("07-details", "options { id name color description }",
         r#"{"data":{"node":{"options":[
@@ -1158,7 +1158,7 @@ fn init_adopts_a_board_already_linked_to_the_repo() {
     .unwrap();
     fs::write(
         h.gh_dir.path().join("08-views.out.1"),
-        r#"{"data":{"node":{"views":{"nodes":[{"id":"PVTV_1","name":"View 1","layout":"TABLE_LAYOUT","filter":null}]}}}}"#,
+        r#"{"data":{"node":{"views":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PVTV_1","name":"View 1","layout":"TABLE_LAYOUT","filter":null}]}}}}"#,
     )
     .unwrap();
     h.gbd()
@@ -1227,19 +1227,20 @@ fn init_and_doctor_leave_a_hand_shaped_view_alone() {
     .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#)
     .on(
         "views",
-        "views(first: 20",
-        r#"{"data":{"node":{"views":{"nodes":[
+        "views(first: 50",
+        r#"{"data":{"node":{"views":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
             {"id":"PVTV_1","name":"Sprint","layout":"BOARD_LAYOUT","filter":"is:open"},
-            {"id":"PVTV_2","name":"Table","layout":"TABLE_LAYOUT","filter":null}]}}}}"#,
+            {"id":"PVTV_2","name":"View 1","layout":"TABLE_LAYOUT","filter":null,"sortByFields":{"totalCount":1}}]}}}}"#,
     );
     h.gbd()
         .args(["init", "--no-memory", "--no-skills"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "view: left as is (Sprint (board, is:open), Table (table)). By hand: name Board, board layout, filter -type:Epic",
+            "view: left as is (Sprint (board, is:open), View 1 (table)). By hand: name Board, board layout, filter -type:Epic",
         ));
     let calls = h.calls();
+    // The stock-named table is sorted by someone: shaped, so not rewritten.
     assert!(!calls.contains("updateProjectV2View"), "{calls}");
     assert!(
         !calls.contains("updateProjectV2Field"),
@@ -1251,7 +1252,7 @@ fn init_and_doctor_leave_a_hand_shaped_view_alone() {
         .success()
         .stdout(predicate::str::contains("ok    board  #7 widgets board"))
         .stdout(predicate::str::contains(
-            "!     view  Sprint (board, is:open), Table (table); a hand-shaped view is left alone.",
+            "!     view  Sprint (board, is:open), View 1 (table); a hand-shaped view is left alone.",
         ));
 }
 
