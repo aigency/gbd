@@ -311,7 +311,7 @@ Releases are cut on merge to `main` in two stages. `release.yml` decides the sem
 
 ### Contributing
 
-Open a pull request against `main` with a conventional-commit title; it is squash-merged through a merge queue once `fmt`, `clippy`, and the tests pass on Linux and macOS. `bash scripts/check.sh` runs the same gates locally. Add a fake-`gh` test for any new call to `gh`.
+gbd is open source, not open contribution: fork it freely, report bugs, open an issue to talk about a change, but pull requests from outside the project are closed automatically. [CONTRIBUTING.md](CONTRIBUTING.md) says why, and how gbd is built and released.
 
 ## Non-goals
 

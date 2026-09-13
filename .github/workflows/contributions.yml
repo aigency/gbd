@@ -1,0 +1,37 @@
+name: contributions
+
+# gbd is open source, not open contribution (CONTRIBUTING.md). A pull
+# request from outside the project is answered at once with the policy
+# and closed, instead of sitting open until someone notices.
+#
+# `pull_request_target` runs in the base repo with a write token, which a
+# fork's `pull_request` event does not get. Nothing from the PR is checked
+# out or executed here; the job only comments and closes.
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  policy:
+    name: outside pull request
+    # Members, collaborators, and bots (Dependabot) are the project's own.
+    if: >-
+      github.event.pull_request.user.type != 'Bot' &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr close "$NUMBER" --repo "$REPO" --comment "$(cat <<'EOF'
+          Thank you for taking the time. gbd is open source but not open to code contributions: it is built by one person with a specific design, and reviewing outside changes is the one thing that does not scale, so this pull request is closed automatically. That is not a judgment on the change.
+
+          Bug reports are welcome as issues, forks are welcome (open an issue with the link and it will be listed), and if you think this change belongs in gbd itself, describe it in an issue and you will get an honest answer. See CONTRIBUTING.md.
+          EOF
+          )"
