@@ -27,6 +27,8 @@ curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh
 ```
 
 ```bash
+# If you already use cargo-binstall (`brew install cargo-binstall` or `cargo install cargo-binstall`;
+# it is not part of cargo):
 cargo binstall gbd
 ```
 
@@ -35,7 +37,7 @@ cargo binstall gbd
 cargo install --locked gbd
 ```
 
-Both download the release tarball for your OS and architecture (linux x86_64/arm64, macOS arm64). `install.sh` also verifies the tarball against the release's `SHA256SUMS` and installs `~/.local/bin/gbd` (override with `GBD_INSTALL_DIR`), so put `~/.local/bin` on your `PATH`; `cargo binstall` does no checksum verification of its own.
+The first two download the release tarball for your OS and architecture (linux x86_64/arm64, macOS arm64). `install.sh` also verifies the tarball against the release's `SHA256SUMS` and installs `~/.local/bin/gbd` (override with `GBD_INSTALL_DIR`), so put `~/.local/bin` on your `PATH`; `cargo binstall` does no checksum verification of its own.
 
 `gbd --version` prints the crate version and the git commit it was built from, e.g. `gbd 1.0.0 (1a2b3c4)`, so you can tell a release from a local build.
 
