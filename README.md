@@ -226,7 +226,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 bd dolt stop                        # the embedded Dolt server, if it is running
 bd hooks uninstall                  # the git hooks
 bd setup codex --remove             # each editor integration you installed: codex, claude, cursor, …
-git rm -r .beads && rm -rf .beads   # the tracked files, then the ignored database and backups
+git rm -r --ignore-unmatch .beads && rm -rf .beads   # the tracked files (if any), then the ignored database and backups
 ```
 
 Check `AGENTS.md` and `CLAUDE.md` for a leftover Beads block (`gbd init` writes its own), `.codex/hooks.json` and `.claude/settings.json` for `bd` hooks, and `.agents/skills` for the Beads skill. If Beads synced to a DoltHub database, archive or delete it there: it is a frozen copy now, and a second tracker only diverges. Older Beads versions synced through a `refs/dolt/data` git ref; delete it locally and on origin if `git for-each-ref refs/dolt` shows one.
