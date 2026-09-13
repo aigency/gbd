@@ -154,9 +154,9 @@ pub fn budget(pool: &str) -> Result<(u64, u64)> {
 }
 
 /// The pool a failed call ran out of, and its reset time: whichever of
-/// graphql and core is at zero, the one the command draws on first; when
-/// neither is (the quota came back meanwhile), that one, so the wait is
-/// short.
+/// graphql and core is at zero, the one the command draws on first. When
+/// neither is, the quota came back between the failure and this read, so
+/// the reset is now and the retry follows at once.
 fn exhausted(args: &[&str]) -> Result<(&'static str, u64)> {
     let limits = rate_limits()?;
     let guess = pool_of(args);
@@ -171,7 +171,7 @@ fn exhausted(args: &[&str]) -> Result<(&'static str, u64)> {
             return Ok((pool, reset));
         }
     }
-    Ok((guess, pool_budget(&limits, guess)?.1))
+    Ok((guess, 0))
 }
 
 /// Sleep until `reset` (Unix seconds) plus a few seconds, saying so.

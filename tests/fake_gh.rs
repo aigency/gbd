@@ -2498,12 +2498,14 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         "one hit and two waits, then the error stands: {}",
         h.calls()
     );
-    // With /rate_limit readable, the wait is until its reset.
+    // With /rate_limit readable and the quota already back (the window
+    // rolled over between the failure and the read), the retry is at once,
+    // not at the end of the new window.
     let h = Harness::new();
     h.on(
         "rl",
         "api rate_limit",
-        r#"{"resources":{"graphql":{"remaining":0,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+        r#"{"resources":{"graphql":{"remaining":4999,"reset":9999999999},"core":{"remaining":5000,"reset":9999999999}}}"#,
     )
     .on_fail(
         "search",
