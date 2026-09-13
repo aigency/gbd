@@ -3212,3 +3212,24 @@ fn import_finishes_a_bead_whose_assignee_github_rejects() {
         "a transient failure keeps the bead resumable: {map}"
     );
 }
+
+#[test]
+fn import_refuses_when_the_org_lacks_a_type_the_plan_needs() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-export.jsonl");
+    // An org set up by an earlier gbd: five types, no Decision.
+    h.on(
+        "types",
+        TYPES_GET,
+        r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"}]"#,
+    );
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "issue type Decision missing on acme: run gbd init (org admin) first",
+        ));
+    assert!(!h.calls().contains("issue create"), "{}", h.calls());
+}

@@ -1224,6 +1224,32 @@ fn cmd_import(
     // and a login it can assign might be the wrong person: check each one
     // against the repo first, one refusal naming every flag to pass.
     check_assignees(&ctx, &raw_assignees, &logins)?;
+    // Every type the run will create must exist on the org: an org set up
+    // by an earlier gbd lacks Decision. When the list cannot be read (a
+    // personal account), the create itself says so.
+    if let Ok(existing) = init::list_issue_types(ctx.repo.owner()) {
+        let mut missing: Vec<&str> = plan
+            .items
+            .iter()
+            .filter(|i| {
+                !done
+                    .get(&i.bead)
+                    .is_some_and(|m| m.phase == import::Phase::Done)
+            })
+            .map(|i| i.issue_type)
+            .filter(|t| !existing.iter().any(|e| e.eq_ignore_ascii_case(t)))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            bail!(
+                "issue type{} {} missing on {}: run gbd init (org admin) first",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", "),
+                ctx.repo.owner()
+            );
+        }
+    }
     // The state a run starts from is read under the file's lock, held until
     // the run ends: two resumes at once would otherwise both start from the
     // same state and create everything twice.
