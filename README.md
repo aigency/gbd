@@ -220,6 +220,19 @@ The dry run prints counts by type, board column, state, and priority; the creati
 
 **Rate limits and time.** Each bead is several `gh` calls (create, Priority, comments, close, card). GitHub's secondary limit on content-creating requests is a few hundred per hour, so a corpus of thousands takes hours. gbd backs off and retries when GitHub says to wait (a minute first, doubling, as GitHub documents for its secondary limit; the retry line on stderr says how long), with one exception: the create call itself is never repeated, because `gh issue create` is several mutations in one and a repeat could duplicate the issue. A limit hit right there stops the run with the report and the mapping path; run the same command again and it resumes, adopting an issue that was created but not yet recorded (it reads the newest issues directly, so it does not wait on GitHub's search index). gbd looks Priority and Start date up once per run, and the mapping file lets you interrupt and continue whenever you like.
 
+**Retiring Beads.** The last step, per repo, once the import has finished and a few issues have been checked on GitHub. Keep two things: the export file and `beads-map.jsonl` (commit it), the only durable record of what each old id became. Then remove Beads so nothing keeps writing to a tracker no one reads:
+
+```bash
+bd dolt stop                        # the embedded Dolt server, if it is running
+bd hooks uninstall                  # the git hooks
+bd setup codex --remove             # each editor integration you installed: codex, claude, cursor, …
+git rm -r .beads && rm -rf .beads   # the tracked files, then the ignored database and backups
+```
+
+Check `AGENTS.md` and `CLAUDE.md` for a leftover Beads block (`gbd init` writes its own), `.codex/hooks.json` and `.claude/settings.json` for `bd` hooks, and `.agents/skills` for the Beads skill. If Beads synced to a DoltHub database, archive or delete it there: it is a frozen copy now, and a second tracker only diverges. Older Beads versions synced through a `refs/dolt/data` git ref; delete it locally and on origin if `git for-each-ref refs/dolt` shows one.
+
+Once no repository on the machine uses Beads: `brew uninstall beads dolt`, remove `~/.beads` (the global registry), and delete any Beads skills under `~/.claude/skills`.
+
 ## Organization setup
 
 GitHub [issue types](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/managing-issue-types-in-an-organization) and [issue fields](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/managing-issue-fields-in-your-organization) live on the **organization**, not on a repository, and every repo in the org shares them. Set them up once per organization; every repo then benefits.
