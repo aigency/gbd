@@ -43,7 +43,7 @@ Both download the release tarball for your OS and architecture (linux x86_64/arm
 
 An agent in a cloud session (Claude Code on the web, Codex, a CI runner) starts from an image with nothing installed and, often, a `gh` with no token. Two things make gbd work there.
 
-**Install it in the environment's setup step.** The installer is POSIX `sh` and needs only `curl` and `tar`:
+**Install it in the environment's setup step.** The installer is POSIX `sh` and needs `curl` (or `gh`), `tar`, `shasum` or `sha256sum` for the checksum, and the usual coreutils (`uname`, `grep`, `cut`, `head`, `mktemp`, `chmod`, `mkdir`); it names whatever is missing and stops before downloading:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh
 
 `GBD_VERSION=v1.6.0` pins a release; `GBD_INSTALL_DIR=/usr/local/bin` puts it somewhere already on `PATH`. If the environment restricts egress, allow `github.com`, `api.github.com`, `raw.githubusercontent.com`, and `release-assets.githubusercontent.com`, which the release downloads redirect to. A `SessionStart` hook that runs the same line when `gbd` is missing does the job from inside a repository instead of the environment, at the cost of a few seconds per fresh session; whether that belongs in a repository is each project's choice, and this one does not carry it.
 
-**Give `gh` a token.** gbd talks to GitHub only through `gh`, and `gh` reads `GH_TOKEN` with no login step, so an environment secret of that name is enough. A classic token needs `repo` and `project`, plus `read:org` for the org's issue types and fields; a fine-grained token needs Issues and Contents on the repositories, Projects on the organization, and read access to the organization. The token a cloud session already holds for git is usually a GitHub App installation token: fine for issues and the board, but it cannot change org settings even for an admin, so `gbd init` on a new organization stays a laptop task.
+**Give `gh` a token.** gbd talks to GitHub only through `gh`, and `gh` reads `GH_TOKEN` with no login step, so an environment secret of that name is enough. A classic token needs `repo` and `project`, plus `read:org` for the org's issue types and fields; a fine-grained token needs Issues and Contents on the repositories, Projects on the organization, and read access to the organization. The token a cloud session already holds for git is usually a GitHub App installation token, and it carries only the permissions the app was granted: one granted Contents alone gets 403s from every gbd command. For gbd it needs Issues (read and write) on the repositories and Projects (read and write) on the organization; even then it cannot change organization settings, so `gbd init` on a new organization stays a laptop task. When in doubt, the `GH_TOKEN` secret above is the simpler path.
 
 The `project` scope is required whenever `.gbd.yml` names a board: the snapshot asks for each issue's card and anything that moves a card loads the board, so without the scope even `gbd prime` stops with the scope hint. Assignee-only mode (an assignee means in progress, `defer --until` means deferred, no Blocked or Done column) is what a repository with no `project:` in `.gbd.yml` gets; it follows from the config, not from the token. `gbd doctor` in the session says which you have; `gbd prime` is the first command either way.
 
