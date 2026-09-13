@@ -17,10 +17,12 @@ permissions:
 jobs:
   policy:
     name: outside pull request
-    # Members, collaborators, and bots (Dependabot) are the project's own.
-    if: >-
-      github.event.pull_request.user.type != 'Bot' &&
-      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    # Outside means from a fork. Only collaborators can push a branch to
+    # this repository, so a pull request whose head lives here is the
+    # project's own (a person's or Dependabot's). `author_association` is
+    # not used: it reads as CONTRIBUTOR for a member whose org membership
+    # is private, and closed the maintainer's own PR once.
+    if: github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Explain and close
