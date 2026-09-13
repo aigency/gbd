@@ -61,12 +61,12 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
                 return finish(args, &output);
             }
             primary_waits += 1;
-            let pool = pool_of(args);
-            match budget(pool) {
-                Ok((_, reset)) => wait_for_reset(pool, reset),
+            match exhausted(args) {
+                Ok((pool, reset)) => wait_for_reset(pool, reset),
                 Err(err) => {
                     eprintln!(
-                        "gh: primary rate limit on {pool}; could not read the reset time ({err:#}), waiting {}s",
+                        "gh: primary rate limit on {}; could not read the reset time ({err:#}), waiting {}s",
+                        pool_of(args),
                         wait.div_ceil(1000)
                     );
                     std::thread::sleep(std::time::Duration::from_millis(wait));
@@ -118,22 +118,26 @@ fn primary_limited(output: &Output) -> bool {
     msg.contains("rate limit") && msg.contains("exceeded") && !msg.contains("secondary")
 }
 
-/// The pool a call draws on: GraphQL for `gh api graphql` and for the
-/// `issue` and `project` subcommands (GraphQL underneath), core otherwise.
+/// The pool a call most likely draws on: GraphQL for `gh api graphql` and
+/// for the `issue`, `project`, and `repo` subcommands (GraphQL
+/// underneath), core otherwise. A guess; `exhausted` checks the numbers.
 fn pool_of(args: &[&str]) -> &'static str {
     match args {
-        ["api", "graphql", ..] | ["issue" | "project", ..] => "graphql",
+        ["api", "graphql", ..] | ["issue" | "project" | "repo", ..] => "graphql",
         _ => "core",
     }
 }
 
-/// A pool's remaining points and reset time (Unix seconds), from
 /// `GET /rate_limit`, which does not count against any pool.
-pub fn budget(pool: &str) -> Result<(u64, u64)> {
+fn rate_limits() -> Result<Value> {
     let args = ["api", "rate_limit"];
     let text = finish(&args, &spawn(&args, None)?)?;
-    let v: Value = serde_json::from_str(&text).context("reading /rate_limit")?;
-    let pool = v
+    serde_json::from_str(&text).context("reading /rate_limit")
+}
+
+/// A pool's remaining points and reset time (Unix seconds).
+fn pool_budget(limits: &Value, pool: &str) -> Result<(u64, u64)> {
+    let pool = limits
         .pointer(&format!("/resources/{pool}"))
         .with_context(|| format!("/rate_limit has no {pool} pool"))?;
     let field = |k: &str| {
@@ -142,6 +146,32 @@ pub fn budget(pool: &str) -> Result<(u64, u64)> {
             .with_context(|| format!("/rate_limit: no {k}"))
     };
     Ok((field("remaining")?, field("reset")?))
+}
+
+/// A pool's remaining points and reset time, freshly read.
+pub fn budget(pool: &str) -> Result<(u64, u64)> {
+    pool_budget(&rate_limits()?, pool)
+}
+
+/// The pool a failed call ran out of, and its reset time: whichever of
+/// graphql and core is at zero, the one the command draws on first; when
+/// neither is (the quota came back meanwhile), that one, so the wait is
+/// short.
+fn exhausted(args: &[&str]) -> Result<(&'static str, u64)> {
+    let limits = rate_limits()?;
+    let guess = pool_of(args);
+    let other = if guess == "graphql" {
+        "core"
+    } else {
+        "graphql"
+    };
+    for pool in [guess, other] {
+        let (remaining, reset) = pool_budget(&limits, pool)?;
+        if remaining == 0 {
+            return Ok((pool, reset));
+        }
+    }
+    Ok((guess, pool_budget(&limits, guess)?.1))
 }
 
 /// Sleep until `reset` (Unix seconds) plus a few seconds, saying so.
