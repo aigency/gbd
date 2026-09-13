@@ -39,6 +39,22 @@ Both download the release tarball for your OS and architecture (linux x86_64/arm
 
 `gbd --version` prints the crate version and the git commit it was built from, e.g. `gbd 1.0.0 (1a2b3c4)`, so you can tell a release from a local build.
 
+### In a cloud or CI session
+
+An agent in a cloud session (Claude Code on the web, Codex, a CI runner) starts from an image with nothing installed and, often, a `gh` with no token. Two things make gbd work there.
+
+**Install it in the environment's setup step.** The installer is POSIX `sh` and needs only `curl` and `tar`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aigency/gbd/main/scripts/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+```
+
+`GBD_VERSION=v1.6.0` pins a release; `GBD_INSTALL_DIR=/usr/local/bin` puts it somewhere already on `PATH`. If the environment restricts egress, allow `github.com`, `api.github.com`, `raw.githubusercontent.com`, and `objects.githubusercontent.com` (release assets). A `SessionStart` hook that runs the same line when `gbd` is missing does the job from inside a repository instead of the environment, at the cost of a few seconds per fresh session; whether that belongs in a repository is each project's choice, and this one does not carry it.
+
+**Give `gh` a token.** gbd talks to GitHub only through `gh`, and `gh` reads `GH_TOKEN` with no login step, so an environment secret of that name is enough. A classic token needs `repo` and `project`, plus `read:org` for the org's issue types and fields; a fine-grained token needs Issues and Contents on the repositories, Projects on the organization, and read access to the organization. The token a cloud session already holds for git is usually a GitHub App installation token: fine for issues and the board, but it cannot change org settings even for an admin, so `gbd init` on a new organization stays a laptop task.
+
+Without the `project` scope gbd still runs, in assignee-only mode (an assignee means in progress, `defer --until` means deferred, no Blocked or Done column). `gbd doctor` in the session says which mode you are in; `gbd prime` is the first command either way.
+
 ### Verifying a download
 
 Every release asset is signed with [minisign](https://jedisct1.github.io/minisign/) and carries a GitHub build-provenance attestation.
