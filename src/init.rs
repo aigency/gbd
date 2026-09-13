@@ -329,11 +329,20 @@ pub fn ensure_issue_types(repo: &Repo) -> String {
     line
 }
 
-/// gh errors echo the whole command; keep the part a human acts on.
+/// gh errors echo the whole command; keep the part a human acts on: the
+/// first line of gh's message and, when gh names a missing scope on a
+/// later line (GitHub answers 404 to an org write the token may not
+/// make), that line too.
 fn first_line(err: &anyhow::Error) -> String {
     let msg = format!("{err:#}");
     let tail = msg.rsplit("failed: ").next().unwrap_or(&msg);
-    tail.lines().next().unwrap_or(tail).trim().to_string()
+    let clean = |l: &str| l.trim().trim_start_matches("gh: ").to_string();
+    let mut lines = tail.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().map(clean).unwrap_or_default();
+    match lines.map(clean).find(|l| l.contains("scope")) {
+        Some(hint) => format!("{first}. {hint}"),
+        None => first,
+    }
 }
 
 /// Use the configured board; else adopt a `<repo> board` already linked to
