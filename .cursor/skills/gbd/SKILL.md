@@ -54,3 +54,6 @@ a sync: after it, `bd` is retired for the repo. Export right before the
 run (`bd dolt pull`, `bd dolt commit`, then `bd export
 --include-memories`) and write nothing to Beads until it finishes: the
 JSONL is a snapshot, and later Beads changes never come over.
+Afterwards retire Beads (`bd hooks uninstall`, `bd setup <editor>
+--remove`, remove `.beads/`; keep `beads-map.jsonl`): README, *Retiring
+Beads*.
