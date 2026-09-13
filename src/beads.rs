@@ -358,10 +358,18 @@ fn resolve(raw: Vec<(usize, RawIssue)>, export: &mut Export) {
                 ));
             }
             match d.kind.as_str() {
-                "blocks" => blocked_by.push(target),
+                // Beads writes both spellings; either way `issue_id` is the
+                // one that waits.
+                "blocks" | "blocked-by" => blocked_by.push(target),
                 "parent-child" => {
                     if parent.is_some() {
+                        // GitHub has one parent; the other stays as a relation.
                         note(format!("second parent {target} ignored"));
+                        other_deps.push(Edge {
+                            kind: d.kind.clone(),
+                            from: r.id.clone(),
+                            to: target,
+                        });
                     } else {
                         parent = Some(target);
                     }
@@ -478,6 +486,25 @@ mod tests {
                 kind: "related".into(),
                 from: "wx-5".into(),
                 to: "wx-1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn blocked_by_is_the_other_spelling_of_blocks() {
+        let lines = "{\"id\":\"x-1\",\"title\":\"first\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"t\"}\n\
+                     {\"id\":\"x-2\",\"title\":\"second\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"t\",\"dependencies\":[{\"issue_id\":\"x-2\",\"depends_on_id\":\"x-1\",\"type\":\"blocked-by\"}]}\n";
+        let e = parse(lines.as_bytes()).unwrap();
+        assert_eq!(e.get("x-2").unwrap().blocked_by, vec!["x-1"]);
+        assert!(e.get("x-2").unwrap().other_deps.is_empty());
+        // A second parent is kept as a relation, not lost.
+        let f = fixture();
+        assert_eq!(
+            f.get("wx-6").unwrap().other_deps,
+            vec![Edge {
+                kind: "parent-child".into(),
+                from: "wx-6".into(),
+                to: "wx-3".into()
             }]
         );
     }

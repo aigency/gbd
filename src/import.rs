@@ -118,6 +118,9 @@ pub struct Plan {
     /// at the end, with the edges that close the cycle dropped.
     pub cycles: Vec<Vec<String>>,
     pub skipped: Vec<Skip>,
+    /// Relations GitHub has no edge for, kept as footer text with links.
+    #[serde(default)]
+    pub relations: usize,
     /// Parse-time problems, rendered.
     pub problems: Vec<String>,
     /// Beads the mapping file has as done; the run skips them.
@@ -160,7 +163,66 @@ fn date_of(ts: &str) -> Option<String> {
     ok.then(|| d.to_string())
 }
 
-fn body_of(b: &Bead) -> String {
+/// A relation GitHub cannot hold as an edge, kept in the footer as text.
+/// Beads kinds map to a label; a kind not listed keeps its own name.
+const RELATIONS: [(&str, &[&str]); 6] = [
+    ("Related", &["related", "relates-to"]),
+    ("Discovered from", &["discovered-from"]),
+    ("Supersedes", &["supersedes"]),
+    ("Duplicates", &["duplicates"]),
+    ("Tracks", &["tracks"]),
+    ("Also under", &["parent-child"]),
+];
+
+/// `Relates-to` for a kind the table does not name.
+fn relation_label(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().replace('-', " "),
+        None => String::new(),
+    }
+}
+
+/// The footer lines for `b`'s relations: `(label, ids)` in table order,
+/// then any other kind by name, ids unique and in file order.
+fn relation_lines(b: &Bead) -> Vec<(String, Vec<String>)> {
+    let mut lines: Vec<(String, Vec<String>)> = Vec::new();
+    let mut add = |label: String, id: &str| {
+        let at = if let Some(at) = lines.iter().position(|(l, _)| *l == label) {
+            at
+        } else {
+            lines.push((label, Vec::new()));
+            lines.len() - 1
+        };
+        let ids = &mut lines[at].1;
+        if !ids.iter().any(|i| i == id) {
+            ids.push(id.to_string());
+        }
+    };
+    for (label, kinds) in RELATIONS {
+        for e in b
+            .other_deps
+            .iter()
+            .filter(|e| kinds.contains(&e.kind.as_str()))
+        {
+            add(label.to_string(), &e.to);
+        }
+    }
+    for e in &b.other_deps {
+        if !RELATIONS
+            .iter()
+            .any(|(_, kinds)| kinds.contains(&e.kind.as_str()))
+        {
+            add(relation_label(&e.kind), &e.to);
+        }
+    }
+    lines
+}
+
+/// An edge the plan could not keep: what it was, the id, and why.
+type Dropped = (&'static str, String, &'static str);
+
+fn body_of(b: &Bead, dropped: &[Dropped]) -> String {
     let mut body = b.description.trim_end().to_string();
     for (heading, text) in [
         ("Design", &b.design),
@@ -213,6 +275,23 @@ fn body_of(b: &Bead) -> String {
         if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
             let _ = write!(body, " {label}: {}.", v.trim());
         }
+    }
+    // Relations GitHub has no edge for, and edges it could not have: text
+    // here, with the ids rewritten to #n like the rest of the body, so each
+    // is a link and a cross-reference on the other issue.
+    for (label, ids) in relation_lines(b) {
+        let _ = write!(body, " {label}: {}.", ids.join(", "));
+    }
+    let mut noted: Vec<(String, Vec<&str>)> = Vec::new();
+    for (what, id, why) in dropped {
+        let label = format!("{what} ({why})");
+        match noted.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, ids)) => ids.push(id),
+            None => noted.push((label, vec![id])),
+        }
+    }
+    for (label, ids) in noted {
+        let _ = write!(body, " {label}: {}.", ids.join(", "));
     }
     body
 }
@@ -418,6 +497,7 @@ pub fn plan(export: &Export) -> Plan {
     let mut skipped: Vec<Skip> = Vec::new();
     let mut items = Vec::new();
     let mut done: BTreeSet<&str> = BTreeSet::new();
+    let mut relations = 0;
     for id in placed.iter().chain(&behind) {
         let b = by_id[id.as_str()];
         let (issue_type, native) = issue_type(&b.kind);
@@ -431,8 +511,10 @@ pub fn plan(export: &Export) -> Plan {
             });
         }
         // Edges must point at something created earlier. A target outside
-        // the export, or one still unplaced (a cycle), is dropped.
-        let mut keep = |target: &String, kind: &str| -> bool {
+        // the export, or one still unplaced (a cycle), is dropped: reported,
+        // and noted in the issue's footer so the reader sees it there too.
+        let mut dropped: Vec<Dropped> = Vec::new();
+        let mut keep = |target: &String, kind: &str, what: &'static str| -> bool {
             if done.contains(target.as_str()) {
                 return true;
             }
@@ -445,30 +527,35 @@ pub fn plan(export: &Export) -> Plan {
                 bead: b.id.clone(),
                 what: format!("{kind} {target} dropped: {why}"),
             });
+            dropped.push((what, target.clone(), why));
             false
         };
-        let parent = b.parent.iter().find(|p| keep(p, "parent")).cloned();
+        let parent = b
+            .parent
+            .iter()
+            .find(|p| keep(p, "parent", "Parent"))
+            .cloned();
         let blocked_by: Vec<String> = b
             .blocked_by
             .iter()
-            .filter(|t| keep(t, "blocked-by"))
+            .filter(|t| keep(t, "blocked-by", "Blocked by"))
             .cloned()
             .collect();
-        for e in &b.other_deps {
-            skipped.push(Skip {
-                bead: b.id.clone(),
-                what: format!("{} edge to {} has no GitHub relation", e.kind, e.to),
-            });
-        }
+        relations += b.other_deps.len();
         // From the edges that survived, so a card never says Blocked when
         // the issue behind it has no blocker.
         let open_blocker = blocked_by
             .iter()
             .filter_map(|t| by_id.get(t.as_str()))
             .any(|t| t.status != Status::Closed);
+        // A `duplicates` edge is the reason itself; otherwise the free text.
         let state = match b.status {
             Status::Closed => State::Closed {
-                reason: CloseReason::guess(b.close_reason.as_deref()),
+                reason: if b.other_deps.iter().any(|e| e.kind == "duplicates") {
+                    CloseReason::Duplicate
+                } else {
+                    CloseReason::guess(b.close_reason.as_deref())
+                },
             },
             _ => State::Open,
         };
@@ -491,7 +578,7 @@ pub fn plan(export: &Export) -> Plan {
             status: board_status(b, open_blocker),
             start_date,
             labels: b.labels.clone(),
-            body: body_of(b),
+            body: body_of(b, &dropped),
             comments: comments_of(b),
         });
         done.insert(&b.id);
@@ -513,6 +600,7 @@ pub fn plan(export: &Export) -> Plan {
         memories: export.memories.clone(),
         cycles: cycle_groups,
         skipped,
+        relations,
         problems: export.problems.iter().map(ToString::to_string).collect(),
         already_imported: Vec::new(),
         partially_imported: Vec::new(),
@@ -1309,9 +1397,10 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
     );
     let _ = writeln!(
         out,
-        "{:<11} {comments} comments, {} distinct Beads labels kept in the body footer (never labels)",
+        "{:<11} {comments} comments, {} distinct Beads labels and {} relations kept in the body footer (never labels or edges)",
         "Also:",
-        labels.len()
+        labels.len(),
+        p.relations
     );
     let assignees = assignee_summary(p);
     if !assignees.is_empty() {
@@ -1557,10 +1646,21 @@ mod tests {
             "{what:?}"
         );
         assert!(
-            has("wx-5: related edge to wx-1 has no GitHub relation"),
-            "{what:?}"
+            !has("related edge"),
+            "a relation is kept in the footer, not reported: {what:?}"
         );
-        assert_eq!(p.skipped.len(), 3, "{what:?}");
+        assert_eq!(p.skipped.len(), 2, "{what:?}");
+        let body = &item(&p, "wx-5").body;
+        assert!(
+            body.ends_with(" Related: wx-1. Blocked by (not in the export): wx-9."),
+            "{body}"
+        );
+        assert!(
+            item(&p, "wx-6").body.contains(" Also under: wx-3."),
+            "{}",
+            item(&p, "wx-6").body
+        );
+        assert_eq!(p.relations, 2, "wx-5's related and wx-6's second parent");
         assert_eq!(p.problems.len(), 6);
     }
 
@@ -1601,6 +1701,36 @@ mod tests {
             "{:?}",
             p.skipped
         );
+        assert!(
+            item(&p, "c-1")
+                .body
+                .ends_with(" Blocked by (part of a dependency cycle): c-2."),
+            "the dropped edge is noted where it was dropped: {}",
+            item(&p, "c-1").body
+        );
+    }
+
+    #[test]
+    fn a_duplicates_edge_is_the_close_reason() {
+        let lines = "{\"id\":\"k-1\",\"title\":\"keeper\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"t\"}\n\
+                     {\"id\":\"k-2\",\"title\":\"again\",\"issue_type\":\"task\",\"status\":\"closed\",\"priority\":2,\"created_at\":\"t\",\"closed_at\":\"2026-03-04T09:00:00Z\",\"close_reason\":\"see k-1\",\"dependencies\":[{\"issue_id\":\"k-2\",\"depends_on_id\":\"k-1\",\"type\":\"duplicates\"},{\"issue_id\":\"k-2\",\"depends_on_id\":\"k-1\",\"type\":\"duplicates\"},{\"issue_id\":\"k-2\",\"depends_on_id\":\"k-0\",\"type\":\"fixed-by\"}]}\n";
+        let e = beads::parse(lines.as_bytes()).unwrap();
+        let p = plan(&e);
+        let dup = item(&p, "k-2");
+        assert_eq!(
+            dup.state,
+            State::Closed {
+                reason: CloseReason::Duplicate
+            },
+            "the edge says duplicate although the text does not"
+        );
+        assert!(
+            dup.body.ends_with(" Duplicates: k-1. Fixed by: k-0."),
+            "ids once each, an unlisted kind by its own name: {}",
+            dup.body
+        );
+        assert_eq!(p.relations, 3);
+        assert!(render(&p, "x", 5).contains("3 relations kept in the body footer"));
     }
 
     #[test]
@@ -2149,7 +2279,7 @@ mod tests {
             text.contains("       … 5 more (--json for all)\n"),
             "{text}"
         );
-        assert!(text.contains("Cannot map (3):\n"), "{text}");
+        assert!(text.contains("Cannot map (2):\n"), "{text}");
         assert!(text.contains("Export problems (6):\n"), "{text}");
         assert!(text.ends_with("Nothing written (--dry-run).\n"), "{text}");
         assert!(

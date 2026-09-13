@@ -2132,15 +2132,13 @@ fn import_reports_what_it_could_not_map_and_a_failed_close() {
         .assert()
         .success()
         // The plan's losses are shown before anything is created.
-        .stdout(predicate::str::contains(
-            "Cannot map (1):\n  wx-1.1: related edge to wx-2 has no GitHub relation\n",
-        ))
+        .stdout(predicate::str::contains("related edge").not())
         .stdout(predicate::str::contains(
             "2/3  wx-2 → #102  [Bug] Auth refresh drops the session\n",
         ))
         .stdout(predicate::str::contains("imported 3 issues (0 closed)"))
         .stdout(predicate::str::contains(
-            "2 warnings; 1 could not map (listed above)",
+            "2 warnings; 0 could not map (listed above)",
         ))
         .stderr(predicate::str::contains("wx-2 (#102): not closed: "))
         .stderr(predicate::str::contains("Run gbd import again to retry"));
