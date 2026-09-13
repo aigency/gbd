@@ -227,13 +227,13 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | open | board Ready, or Blocked when a blocker is still open |
 | `in_progress` | board In Progress, assignee kept |
 | `deferred`, or any `defer_until` | board Deferred, Start date |
-| `assignee` | the assignee, by GitHub login. Beads usually holds a display name, so the dry run lists the names it found, and the real run checks every one, mapped or not, can be assigned in the repository before creating anything, refusing with the list otherwise: `--assignee 'Pat Example=patexample'` maps a name, `--assignee 'Pat Example='` imports without it |
+| `assignee` | the assignee, by GitHub login. Beads usually holds a display name, so the dry run lists the names it found, and the real run checks every one, mapped or not, can be assigned in the repository before creating anything, refusing with the list otherwise: `--assignee 'Pat Example=patexample'` maps a name, `--assignee 'Pat Example='` imports without it and leaves `Beads assignee: Pat Example` in the footer |
 | closed | closed with a reason read from the free-text `close_reason` (duplicate / not planned / else completed), board Done |
 | `notes`, comments | comments, with author and date |
 | description, design, acceptance criteria | the body, as sections |
 | labels, owner, dates, estimate, external ref, the original close reason | an import footer at the end of the body (dates to the day), so nothing becomes a label |
 | `_type: memory` lines | the memories issue, upserted by key |
-| `related`, `relates-to`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, a second parent | lines in the import footer (`Related: #12, #40`), the ids rewritten to `#n` so each is a link and a cross-reference on the other issue; a closed bead with a `duplicates` edge closes as duplicate |
+| `related`, `relates-to`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, a second parent | lines in the import footer (`Related: #12, #40`), the ids rewritten to `#n` so each is a link and a cross-reference on the other issue; a closed bead with a `duplicates` edge closes as duplicate. A `blocks` target Beads wrote as `discovered-from:pl-9` is read as that relation |
 | a blocker outside the export, or one dropped to break a cycle | noted in the footer (`Blocked by (not in the export): pl-9`) and listed in the report |
 | agents, gates, templates | dropped, each one listed with the reason |
 | an issue type gbd has no type for (a wisp, say) | imported as a Task, reported |

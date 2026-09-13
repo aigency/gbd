@@ -113,6 +113,16 @@ impl fmt::Display for Status {
 
 /// A dependency edge gbd cannot turn into a GitHub relation. Kept so the
 /// dry run can list what is dropped.
+/// Beads relation kinds GitHub has no edge for; kept as footer text.
+pub const RELATION_KINDS: [&str; 6] = [
+    "related",
+    "relates-to",
+    "discovered-from",
+    "supersedes",
+    "duplicates",
+    "tracks",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {
     /// Beads dependency type, e.g. `related`, `discovered-from`.
@@ -350,6 +360,21 @@ fn resolve(raw: Vec<(usize, RawIssue)>, export: &mut Export) {
                 ));
                 continue;
             }
+            // Beads sometimes folds a relation into a `blocks` target as
+            // `kind:id`; that is the relation, not a blocker.
+            if let Some((kind, id)) = d.depends_on_id.split_once(':') {
+                if RELATION_KINDS.contains(&kind) && !id.is_empty() {
+                    if !ids.contains(id) {
+                        note(format!("{kind} edge to {id}, which is not in the export"));
+                    }
+                    other_deps.push(Edge {
+                        kind: kind.to_string(),
+                        from: r.id.clone(),
+                        to: id.to_string(),
+                    });
+                    continue;
+                }
+            }
             let target = d.depends_on_id.clone();
             if !ids.contains(&target) {
                 note(format!(
@@ -508,6 +533,36 @@ mod tests {
                 from: "wx-6".into(),
                 to: "wx-3".into()
             }]
+        );
+    }
+
+    #[test]
+    fn a_relation_folded_into_a_blocks_target_is_that_relation() {
+        let lines = "{\"id\":\"x-1\",\"title\":\"first\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"t\"}\n\
+                     {\"id\":\"x-2\",\"title\":\"second\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"t\",\"dependencies\":[{\"issue_id\":\"x-2\",\"depends_on_id\":\"discovered-from:x-1\",\"type\":\"blocks\"},{\"issue_id\":\"x-2\",\"depends_on_id\":\"tracks:x-9\",\"type\":\"blocks\"}]}\n";
+        let e = parse(lines.as_bytes()).unwrap();
+        let second = e.get("x-2").unwrap();
+        assert!(second.blocked_by.is_empty(), "not a blocker");
+        assert_eq!(
+            second.other_deps,
+            vec![
+                Edge {
+                    kind: "discovered-from".into(),
+                    from: "x-2".into(),
+                    to: "x-1".into()
+                },
+                Edge {
+                    kind: "tracks".into(),
+                    from: "x-2".into(),
+                    to: "x-9".into()
+                }
+            ]
+        );
+        let what: Vec<String> = e.problems.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            what,
+            vec!["line 2: x-2: tracks edge to x-9, which is not in the export"],
+            "the folded relation itself is not a problem, a missing target still is"
         );
     }
 

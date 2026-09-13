@@ -1308,14 +1308,20 @@ pub fn is_login(s: &str) -> bool {
 }
 
 /// Replace every mapped assignee on the plan; an unmapped one is kept
-/// trimmed, since `--add-assignee` takes a login, not padding.
+/// trimmed, since `--add-assignee` takes a login, not padding. A dropped
+/// one (`NAME=`) leaves its name in the footer, so the issue still says
+/// who had it.
 pub fn map_assignees(plan: &mut Plan, map: &BTreeMap<String, Option<String>>) {
     for item in &mut plan.items {
         let Some(name) = item.assignee.take() else {
             continue;
         };
         item.assignee = match map.get(&assignee_key(&name)) {
-            Some(login) => login.clone(),
+            Some(Some(login)) => Some(login.clone()),
+            Some(None) => {
+                let _ = write!(item.body, " Beads assignee: {}.", name.trim());
+                None
+            }
             None => Some(name.trim().to_string()).filter(|n| !n.is_empty()),
         };
     }
@@ -1453,13 +1459,18 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
         );
     }
     if !p.memories.is_empty() {
-        let keys: Vec<&str> = p.memories.iter().map(|m| m.key.as_str()).collect();
-        let _ = writeln!(
-            out,
-            "\nMemories ({}), upserted by key: {}",
-            keys.len(),
-            keys.join(" ")
-        );
+        // One key per line, capped like the order: a corpus has dozens.
+        let _ = writeln!(out, "\nMemories ({}), upserted by key:", p.memories.len());
+        for m in p.memories.iter().take(order_lines) {
+            let _ = writeln!(out, "  {}", m.key);
+        }
+        if p.memories.len() > order_lines {
+            let _ = writeln!(
+                out,
+                "  … {} more (--json for all)",
+                p.memories.len() - order_lines
+            );
+        }
     }
     out.push_str(&render_diagnostics(p));
     out.push_str("\nNothing written (--dry-run).\n");
@@ -1770,7 +1781,12 @@ mod tests {
             "{:?}",
             p.skipped
         );
-        assert!(render(&p, "x", 5).contains("Memories (2), upserted by key: k k"));
+        assert!(render(&p, "x", 5).contains("Memories (2), upserted by key:\n  k\n  k\n"));
+        assert!(
+            render(&p, "x", 1)
+                .contains("Memories (2), upserted by key:\n  k\n  … 1 more (--json for all)\n"),
+            "capped like the order"
+        );
     }
 
     #[test]
@@ -2084,6 +2100,7 @@ mod tests {
 {"_type":"issue","id":"n-4","title":"d","issue_type":"task","status":"open","priority":2,"assignee":" Pat  Example ","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-5","title":"e","issue_type":"task","status":"open","priority":2,"assignee":" dev2 ","created_at":"2026-04-01T09:00:00Z"}
 {"_type":"issue","id":"n-6","title":"f","issue_type":"task","status":"open","priority":2,"assignee":"   ","created_at":"2026-04-01T09:00:00Z"}
+{"_type":"issue","id":"n-7","title":"g","issue_type":"task","status":"open","priority":2,"assignee":"Bot","created_at":"2026-04-01T09:00:00Z"}
 "#
             .as_bytes(),
         )
@@ -2093,6 +2110,7 @@ mod tests {
             assignee_summary(&p),
             vec![
                 ("Pat Example".to_string(), 3, false),
+                ("Bot".to_string(), 1, true),
                 ("dev1".to_string(), 1, true),
                 ("dev2".to_string(), 1, true)
             ],
@@ -2111,9 +2129,15 @@ mod tests {
                 Some("dev1"),
                 Some("patexample"),
                 Some("dev2"),
+                None,
                 None
             ],
-            "every variant maps; a login stays, trimmed; a blank one is dropped"
+            "every variant maps; a login stays, trimmed; a blank one is dropped; Bot= drops"
+        );
+        assert!(
+            p.items[6].body.ends_with(" Beads assignee: Bot."),
+            "a dropped assignee's name stays in the footer: {}",
+            p.items[6].body
         );
         assert!(render(&p, "x", 5).contains("Assignees:  patexample (3), dev1 (1), dev2 (1)"));
     }
