@@ -2478,8 +2478,8 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         h.calls()
     );
 
-    // The primary hourly quota is waited out until the reset GitHub names,
-    // twice at most; when /rate_limit cannot be read, a short wait stands in.
+    // The primary hourly quota is waited out until the reset GitHub names;
+    // when /rate_limit cannot be read, blind waits stand in, eight at most.
     let h = Harness::new();
     h.on_fail(
         "search",
@@ -2496,13 +2496,13 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         ));
     assert_eq!(
         h.calls().matches("search(query: $q").count(),
-        3,
-        "one hit and two waits, then the error stands: {}",
+        9,
+        "one hit and eight waits, then the error stands: {}",
         h.calls()
     );
-    // With /rate_limit readable and the quota already back (the window
-    // rolled over between the failure and the read), the retry is at once,
-    // not at the end of the new window.
+    // /rate_limit reporting the quota as back is not believed while GraphQL
+    // goes on refusing: that is what it says for the rest of the real
+    // window once the wall is hit. A blind wait stands in.
     let h = Harness::new();
     h.on(
         "rl",
@@ -2520,7 +2520,7 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+            "gh: primary rate limit on graphql; GitHub reports no reset ahead, waiting 0m00s (1 of 8)",
         ));
 
     // A plain failure is not retried: a create behind a 502 may have gone through.
@@ -3336,14 +3336,52 @@ fn a_primary_rate_limit_is_waited_out_until_the_reset() {
         .success()
         .stdout(predicate::str::contains("v"))
         .stderr(predicate::str::contains(
-            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+            "gh: primary rate limit on graphql; GitHub reports no reset ahead, waiting 0m00s (1 of 8)",
         ));
     assert_eq!(
         h.calls()
             .matches("issue view 3 -R acme/widgets --json body")
             .count(),
         2,
-        "once to hit the limit, once after the reset: {}",
+        "once to hit the limit, once after the wait: {}",
+        h.calls()
+    );
+
+    // /rate_limit says the pool is untouched while GraphQL keeps refusing:
+    // blind waits, doubling, until it answers.
+    let h = Harness::new();
+    h.on(
+        "rl",
+        "api rate_limit",
+        r#"{"resources":{"graphql":{"remaining":5000,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+    )
+    .on_seq(
+        "view",
+        "issue view 3 -R acme/widgets --json body",
+        &[
+            "GraphQL: API rate limit already exceeded for user ID 1",
+            "GraphQL: API rate limit already exceeded for user ID 1",
+            "GraphQL: API rate limit already exceeded for user ID 1",
+            "{\"body\":\"<!-- gbd-memories v1 -->\\n\\n## k\\nv\\n\"}",
+        ],
+    );
+    for n in 1..=3 {
+        fs::write(h.gh_dir.path().join(format!("view.code.{n}")), "1").unwrap();
+    }
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["recall", "k"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("v"))
+        .stderr(predicate::str::contains("waiting 0m00s (1 of 8)"))
+        .stderr(predicate::str::contains("waiting 0m00s (3 of 8)"));
+    assert_eq!(
+        h.calls()
+            .matches("issue view 3 -R acme/widgets --json body")
+            .count(),
+        4,
+        "{}",
         h.calls()
     );
 }
