@@ -25,10 +25,10 @@ pub fn run(args: &[&str]) -> Result<String> {
 /// Run, and when GitHub answers with its secondary rate limit (HTTP 403 or
 /// 429 saying "secondary rate limit" or "abuse"), wait and try again: that
 /// answer means the request was rejected, so repeating it is safe. The
-/// primary hourly quota is not retried (it will not clear in time), and
-/// neither is anything else, 5xx included, since a create behind a 502
-/// may have gone through; `gh issue create` is never retried at all, being
-/// several mutations in one. gh does not relay the `Retry-After` header for
+/// primary hourly quota is waited out too (`wait_out_primary`). Nothing
+/// else is retried, 5xx included, since a create behind a 502 may have
+/// gone through; `gh issue create` is never retried at all, being several
+/// mutations in one. gh does not relay the `Retry-After` header for
 /// these commands, so the wait is what GitHub documents for that case:
 /// at least a minute, doubling on each retry (`GBD_BACKOFF_MS` sets the
 /// first wait; five retries). A `retry-after: N` in the message, when gh
@@ -46,46 +46,93 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
     // record was lost on its next run.
     let composite = args.first() == Some(&"issue") && args.get(1) == Some(&"create");
     let mut wait = base;
-    let mut primary_waits = 0u32;
-    for attempt in 1..=RETRIES {
+    let mut secondary = 0u32;
+    let mut primary = 0u32;
+    loop {
         let output = spawn(args, stdin)?;
         // Classified on what gh printed, never on the command line: a body
         // that happens to say "rate limit" must not turn a 502 into a retry.
         if composite || output.status.success() {
             return finish(args, &output);
         }
-        // The primary hourly quota clears at a known time, not after a
-        // doubling wait: read it and sleep until then, twice at most.
-        if primary_limited(&output) {
-            if primary_waits >= 2 {
+        // gh does not always relay the refusal: `gh project view` reports
+        // the quota as "unknown owner type". A failure that is neither
+        // limit by its text is checked against GraphQL directly.
+        if primary_limited(&output) || (!rate_limited(&output) && graphql_refusing()) {
+            if primary >= PRIMARY_WAITS {
                 return finish(args, &output);
             }
-            primary_waits += 1;
-            match exhausted(args) {
-                Ok((pool, reset)) => wait_for_reset(pool, reset),
-                Err(err) => {
-                    eprintln!(
-                        "gh: primary rate limit on {}; could not read the reset time ({err:#}), waiting {}s",
-                        pool_of(args),
-                        wait.div_ceil(1000)
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(wait));
-                }
-            }
+            primary += 1;
+            wait_out_primary(args, primary);
             continue;
         }
-        if !rate_limited(&output) {
+        if !rate_limited(&output) || secondary >= RETRIES {
             return finish(args, &output);
         }
+        secondary += 1;
         let ms = retry_after_ms(&output).unwrap_or(wait);
         eprintln!(
-            "gh: rate limited; retrying in {}s ({attempt} of {RETRIES})",
+            "gh: rate limited; retrying in {}s ({secondary} of {RETRIES})",
             ms.div_ceil(1000)
         );
         std::thread::sleep(std::time::Duration::from_millis(ms));
         wait = wait.saturating_mul(2);
     }
-    finish(args, &spawn(args, stdin)?)
+}
+
+/// Whether GraphQL is refusing on the primary quota right now: one
+/// one-point query, read for the refusal alone. Asked only after a failure
+/// whose text names no limit, since gh swallows the refusal in places.
+pub fn graphql_refusing() -> bool {
+    let args = ["api", "graphql", "-f", "query={viewer{login}}"];
+    spawn(&args, None).is_ok_and(|output| !output.status.success() && primary_limited(&output))
+}
+
+/// How many times in a row the primary quota is waited out for one call.
+/// Blind waits run a minute, doubling to fifteen, so eight of them outlast
+/// any hour.
+const PRIMARY_WAITS: u32 = 8;
+
+/// The primary quota, hit for the `n`th time in a row on this call. When
+/// `/rate_limit` knows a reset ahead, sleep until it. It often does not:
+/// once GraphQL has begun refusing, `/rate_limit` can report the pool as
+/// untouched, a full quota and a fresh hour, while GraphQL goes on
+/// refusing until the real window ends (seen 2026-09-13). A reset that is
+/// not ahead therefore means a blind wait: a minute, doubling, fifteen at
+/// most (`GBD_BACKOFF_MS` caps it so tests do not wait).
+fn wait_out_primary(args: &[&str], n: u32) {
+    let (pool, reset) = match exhausted(args) {
+        Ok(found) => found,
+        Err(err) => {
+            eprintln!(
+                "gh: primary rate limit on {}; could not read the reset time ({err:#})",
+                pool_of(args)
+            );
+            (pool_of(args), 0)
+        }
+    };
+    if reset > unix_now() {
+        wait_for_reset(pool, reset);
+        return;
+    }
+    let cap: u64 = std::env::var("GBD_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(900_000, |ms| ms.min(900_000));
+    let ms = (60_000u64 << (n - 1).min(4)).min(cap);
+    let secs = ms / 1000;
+    eprintln!(
+        "gh: primary rate limit on {pool}; GitHub reports no reset ahead, waiting {}m{:02}s ({n} of {PRIMARY_WAITS})",
+        secs / 60,
+        secs % 60
+    );
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// gh's own output for a failed call, lowercased: stderr, else stdout.
@@ -206,9 +253,7 @@ fn exhausted(args: &[&str]) -> Result<(&'static str, u64)> {
 /// Sleep until `reset` (Unix seconds) plus a few seconds, saying so.
 /// `GBD_BACKOFF_MS`, when set, caps the margin so tests do not wait.
 pub fn wait_for_reset(pool: &str, reset: u64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = unix_now();
     let margin_ms: u64 = std::env::var("GBD_BACKOFF_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

@@ -586,6 +586,21 @@ pub fn doctor(
         ),
     }
 
+    // Everything from here on asks GitHub. When GraphQL is refusing on the
+    // hourly quota, say so once rather than let each check fail in its own
+    // words (gh reports it as "unknown owner type" in places) or wait it out.
+    if gh::graphql_refusing() {
+        ok = false;
+        push(
+            &mut lines,
+            "quota",
+            false,
+            "GitHub is refusing GraphQL on the hourly quota; the checks that need it are skipped. Try again after the reset (`gh api rate_limit` names it, though it can claim the quota is back while GraphQL still refuses)".into(),
+            false,
+        );
+        return DoctorReport { ok, lines };
+    }
+
     if let Some(repo) = repo {
         push(
             &mut lines,

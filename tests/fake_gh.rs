@@ -991,6 +991,32 @@ fn doctor_reports_missing_types_and_fields_as_warnings() {
 }
 
 #[test]
+fn doctor_reports_a_refused_quota_once_and_stops() {
+    let h = Harness::new();
+    h.on_fail(
+        "probe",
+        "query={viewer{login}}",
+        "GraphQL: API rate limit already exceeded for user ID 1",
+    );
+    h.gbd()
+        .args(["doctor", "--no-skills", "--json"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            r#""detail":"GitHub is refusing GraphQL on the hourly quota"#,
+        ))
+        .stdout(predicate::str::contains(r#""name":"quota","ok":false"#))
+        .stdout(predicate::function(|out: &str| {
+            !out.contains(r#""name":"board""#)
+        }));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("project view") && !calls.contains("issue-fields"),
+        "no check that needs GraphQL runs: {calls}"
+    );
+}
+
+#[test]
 fn defer_many_with_a_relative_until_and_a_reason() {
     let h = Harness::new();
     h.on(
@@ -2478,8 +2504,8 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         h.calls()
     );
 
-    // The primary hourly quota is waited out until the reset GitHub names,
-    // twice at most; when /rate_limit cannot be read, a short wait stands in.
+    // The primary hourly quota is waited out until the reset GitHub names;
+    // when /rate_limit cannot be read, blind waits stand in, eight at most.
     let h = Harness::new();
     h.on_fail(
         "search",
@@ -2496,13 +2522,13 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         ));
     assert_eq!(
         h.calls().matches("search(query: $q").count(),
-        3,
-        "one hit and two waits, then the error stands: {}",
+        9,
+        "one hit and eight waits, then the error stands: {}",
         h.calls()
     );
-    // With /rate_limit readable and the quota already back (the window
-    // rolled over between the failure and the read), the retry is at once,
-    // not at the end of the new window.
+    // /rate_limit reporting the quota as back is not believed while GraphQL
+    // goes on refusing: that is what it says for the rest of the real
+    // window once the wall is hit. A blind wait stands in.
     let h = Harness::new();
     h.on(
         "rl",
@@ -2520,8 +2546,41 @@ fn a_secondary_rate_limit_is_retried_after_waiting() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+            "gh: primary rate limit on graphql; GitHub reports no reset ahead, waiting 0m00s (1 of 8)",
         ));
+
+    // gh swallows the refusal in places (`gh project view` says "unknown
+    // owner type"): a failure naming no limit is checked against GraphQL,
+    // and waited out when that is refused on the quota.
+    let h = Harness::new();
+    h.on_seq(
+        "search",
+        "search(query: $q",
+        &[
+            "unknown owner type",
+            &search_response(&format!("{NODE_10},{NODE_8}")),
+        ],
+    )
+    .on_fail(
+        "probe",
+        "query={viewer{login}}",
+        "GraphQL: API rate limit already exceeded for user ID 1",
+    );
+    fs::write(h.gh_dir.path().join("search.code.1"), "1").unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "gh: primary rate limit on graphql; GitHub reports no reset ahead, waiting 0m00s (1 of 8)",
+        ));
+    assert_eq!(
+        h.calls().matches("search(query: $q").count(),
+        2,
+        "{}",
+        h.calls()
+    );
 
     // A plain failure is not retried: a create behind a 502 may have gone through.
     let h = Harness::new();
@@ -3336,14 +3395,52 @@ fn a_primary_rate_limit_is_waited_out_until_the_reset() {
         .success()
         .stdout(predicate::str::contains("v"))
         .stderr(predicate::str::contains(
-            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+            "gh: primary rate limit on graphql; GitHub reports no reset ahead, waiting 0m00s (1 of 8)",
         ));
     assert_eq!(
         h.calls()
             .matches("issue view 3 -R acme/widgets --json body")
             .count(),
         2,
-        "once to hit the limit, once after the reset: {}",
+        "once to hit the limit, once after the wait: {}",
+        h.calls()
+    );
+
+    // /rate_limit says the pool is untouched while GraphQL keeps refusing:
+    // blind waits, doubling, until it answers.
+    let h = Harness::new();
+    h.on(
+        "rl",
+        "api rate_limit",
+        r#"{"resources":{"graphql":{"remaining":5000,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+    )
+    .on_seq(
+        "view",
+        "issue view 3 -R acme/widgets --json body",
+        &[
+            "GraphQL: API rate limit already exceeded for user ID 1",
+            "GraphQL: API rate limit already exceeded for user ID 1",
+            "GraphQL: API rate limit already exceeded for user ID 1",
+            "{\"body\":\"<!-- gbd-memories v1 -->\\n\\n## k\\nv\\n\"}",
+        ],
+    );
+    for n in 1..=3 {
+        fs::write(h.gh_dir.path().join(format!("view.code.{n}")), "1").unwrap();
+    }
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["recall", "k"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("v"))
+        .stderr(predicate::str::contains("waiting 0m00s (1 of 8)"))
+        .stderr(predicate::str::contains("waiting 0m00s (3 of 8)"));
+    assert_eq!(
+        h.calls()
+            .matches("issue view 3 -R acme/widgets --json body")
+            .count(),
+        4,
+        "{}",
         h.calls()
     );
 }
@@ -3479,7 +3576,10 @@ fn import_finishes_a_create_the_primary_limit_cut_short() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "wx-2 = #102  (created as the limit hit; finished now)",
+            "wx-2 = #102  (created before the failure; finished now)",
+        ))
+        .stderr(predicate::str::contains(
+            "wx-2: waiting out the rate limit, then looking for the issue before creating it again",
         ))
         .stdout(predicate::str::contains(
             "imported 2 issues (1 closed, 1 already imported)",
@@ -3540,6 +3640,59 @@ fn import_finishes_a_create_the_primary_limit_cut_short() {
     assert!(
         !calls.contains("issue edit 102 -R acme/widgets --type Bug"),
         "a fresh create sets its own type: {calls}"
+    );
+
+    // Any other failure gets the same treatment: a 502 whose create went
+    // through is found and finished, not created twice.
+    let h = Harness::new();
+    setup(&h);
+    h.on_seq(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        &[
+            "[]",
+            r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."}]"#,
+        ],
+    )
+    .on_fail("create-2", "--title Auth refresh", "HTTP 502: Bad Gateway");
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wx-2 = #102  (created before the failure; finished now)",
+        ))
+        .stderr(predicate::str::contains("wx-2: create failed (1 of 3): "))
+        .stderr(predicate::str::contains("wx-2: waiting 30s, then looking"));
+    let calls = h.calls();
+    assert_eq!(calls.matches("--title Auth refresh").count(), 1, "{calls}");
+    assert!(
+        calls.contains("issue edit 102 -R acme/widgets --type Bug"),
+        "{calls}"
+    );
+
+    // Three rounds, then the error stands.
+    let h = Harness::new();
+    setup(&h);
+    h.on(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        "[]",
+    )
+    .on_fail("create-2", "--title Auth refresh", "HTTP 502: Bad Gateway");
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("wx-2: create failed (3 of 3): "))
+        .stderr(predicate::str::contains("wx-2: stopped after 1 of 3"));
+    assert_eq!(
+        h.calls().matches("--title Auth refresh").count(),
+        4,
+        "{}",
+        h.calls()
     );
 }
 

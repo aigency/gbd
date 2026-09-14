@@ -1775,7 +1775,7 @@ impl Run<'_> {
             blocking: &[],
         };
         let (number, url) = match create_issue(self.ctx, &new) {
-            Err(err) if gh::primary_limit_hit(&err) => self.create_after_limit(item, &new),
+            Err(err) => self.recover_create(item, &new, err),
             created => created,
         }
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
@@ -1807,27 +1807,56 @@ impl Run<'_> {
         }
     }
 
-    /// The create tripped the hourly quota. `gh issue create` is several
-    /// mutations, so the issue may or may not exist: wait for the reset,
-    /// look for it by its footer, and finish it if it is there; create it
-    /// only when it is not.
-    fn create_after_limit(
+    /// The create failed. `gh issue create` is several mutations, so
+    /// whatever the error, the issue may or may not exist: wait, look for it
+    /// by its footer, finish it if it is there, and create it again only
+    /// when it is not. That is what a restart would do, done in place.
+    /// Three rounds; a rate limit is waited out inside the lookup, anything
+    /// else gets half a minute first (`GBD_BACKOFF_MS` caps it).
+    fn recover_create(
         &mut self,
         item: &import::Item,
         new: &NewIssue<'_>,
+        mut err: anyhow::Error,
     ) -> Result<(u64, String)> {
-        Self::ensure_budget();
-        if let Some((number, url)) = find_imported(self.ctx, &item.bead)? {
-            self.reapply_edges(item, number, &url)?;
-            if !self.ctx.json {
-                println!(
-                    "       {} = #{number}  (created as the limit hit; finished now)",
-                    item.bead
-                );
+        for round in 1..=3 {
+            let limit = gh::primary_limit_hit(&err);
+            eprintln!(
+                "{}: create failed ({} of 3): {err:#}\n{}: {}, then looking for the issue before creating it again",
+                item.bead,
+                round,
+                item.bead,
+                if limit {
+                    "waiting out the rate limit"
+                } else {
+                    "waiting 30s"
+                }
+            );
+            if limit {
+                Self::ensure_budget();
+            } else {
+                let ms = std::env::var("GBD_BACKOFF_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map_or(30_000, |ms| ms.min(30_000));
+                std::thread::sleep(std::time::Duration::from_millis(ms));
             }
-            return Ok((number, url));
+            if let Some((number, url)) = find_imported(self.ctx, &item.bead)? {
+                self.reapply_edges(item, number, &url)?;
+                if !self.ctx.json {
+                    println!(
+                        "       {} = #{number}  (created before the failure; finished now)",
+                        item.bead
+                    );
+                }
+                return Ok((number, url));
+            }
+            match create_issue(self.ctx, new) {
+                Ok(created) => return Ok(created),
+                Err(again) => err = again,
+            }
         }
-        create_issue(self.ctx, new)
+        Err(err)
     }
 
     /// `gh issue create` sets the type, parent, and blockers after the
