@@ -1,6 +1,6 @@
 //! Thin `gh` process wrapper. gbd never talks to GitHub except through `gh`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::io::Write;
@@ -114,9 +114,38 @@ fn rate_limited(output: &Output) -> bool {
 /// The primary hourly quota, as opposed to the secondary limit: GitHub says
 /// the limit is exceeded and does not say "secondary".
 fn primary_limited(output: &Output) -> bool {
-    let msg = failure_text(output);
+    says_primary_limit(&failure_text(output))
+}
+
+fn says_primary_limit(msg: &str) -> bool {
     msg.contains("rate limit") && msg.contains("exceeded") && !msg.contains("secondary")
 }
+
+/// Whether a failed call ran into the primary quota: for the one call
+/// `retrying` never repeats (`gh issue create`), whose caller decides what
+/// a repeat would mean. Read from the failure itself, never from the
+/// error's text, which carries the command line: a title or body that
+/// says "rate limit exceeded" must not turn a 5xx into a limit.
+pub fn primary_limit_hit(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.downcast_ref::<Failure>().is_some_and(|f| f.primary_limit))
+}
+
+/// A failed `gh` call: the command line and what gh printed, classified
+/// on gh's own text alone.
+#[derive(Debug)]
+struct Failure {
+    line: String,
+    primary_limit: bool,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.line)
+    }
+}
+
+impl std::error::Error for Failure {}
 
 /// The pool a call most likely draws on: GraphQL for `gh api graphql` and
 /// for the `issue`, `project`, and `repo` subcommands (GraphQL
@@ -214,7 +243,11 @@ fn finish(args: &[&str], output: &Output) -> Result<String> {
         } else {
             stderr.trim().to_string()
         };
-        return Err(anyhow!("gh {} failed: {msg}", args.join(" ")));
+        return Err(Failure {
+            primary_limit: says_primary_limit(&msg.to_ascii_lowercase()),
+            line: format!("gh {} failed: {msg}", args.join(" ")),
+        }
+        .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -363,6 +396,47 @@ fn spawn(args: &[&str], stdin: Option<&[u8]>) -> Result<Output> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn primary_limit_is_read_from_the_failure_not_the_error_text() {
+        let output = |stderr: &str| Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        // A body that says the words, behind a 5xx: not the limit.
+        let args = [
+            "issue",
+            "create",
+            "--body",
+            "API rate limit exceeded, retry",
+        ];
+        let err = finish(
+            &args,
+            &Output {
+                status: failed(),
+                ..output("HTTP 502: Bad Gateway")
+            },
+        )
+        .unwrap_err()
+        .context("creating issue");
+        assert!(!primary_limit_hit(&err), "{err:#}");
+        // gh's own text says it: the limit, through any context.
+        let err = finish(
+            &args,
+            &Output {
+                status: failed(),
+                ..output("GraphQL: API rate limit already exceeded for user ID 1")
+            },
+        )
+        .unwrap_err()
+        .context("creating issue");
+        assert!(primary_limit_hit(&err), "{err:#}");
+    }
+
+    fn failed() -> std::process::ExitStatus {
+        std::process::Command::new("false").status().unwrap()
+    }
+
     use super::*;
 
     #[test]
