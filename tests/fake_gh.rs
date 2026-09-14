@@ -2803,6 +2803,55 @@ fn import_links_the_parent_from_the_footer_when_github_refuses_the_sub_issue() {
         calls.contains("--add-blocked-by 102"),
         "the other edges are still reapplied: {calls}"
     );
+
+    // Killed between that edit and the record: the note is not added twice.
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n\
+         {\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        r#"[{"number":103,"url":"https://github.com/acme/widgets/issues/103","body":"Child of the epic.\n\n---\nImported from Beads `wx-1.1` (created 2026-03-03 by dev1). Parent (GitHub allows 100 sub-issues per parent): #101."}]"#,
+    )
+    .on("retype", "issue edit 103 -R acme/widgets --type Task", "")
+    .on_fail(
+        "reparent",
+        "issue edit 103 -R acme/widgets --parent 101",
+        "GraphQL: Failed to add sub-issue #103 to parent #101. Parent cannot have more than 100 sub-issues (addSubIssue)",
+    )
+    .on("reblock", "issue edit 103 -R acme/widgets --add-blocked-by 102", "")
+    .on(
+        "body",
+        "issue view 103 -R acme/widgets --json body",
+        r#"{"body":"Child of the epic.\n\n---\nImported from Beads `wx-1.1` (created 2026-03-03 by dev1). Parent (GitHub allows 100 sub-issues per parent): #101."}"#,
+    )
+    .on("values", "issue-field-values --input -", "{}")
+    .on("comment", "issue comment 103 -R acme/widgets --body-file -", "")
+    .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
+    .on("anyedit", "project item-edit --id PVTI_new", "")
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("the footer links to it instead"));
+    assert!(
+        !h.calls()
+            .contains("issue edit 103 -R acme/widgets --body-file -"),
+        "the note is already there: {}",
+        h.calls()
+    );
 }
 
 #[test]

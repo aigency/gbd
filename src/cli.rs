@@ -1892,6 +1892,11 @@ impl Run<'_> {
                 let note = format!(" Parent ({}): #{parent}.", import::SUB_ISSUE_CAP_WHY);
                 let n = number.to_string();
                 let linked = current_body(self.ctx, number).and_then(|body| {
+                    // A run killed between this edit and the record finds
+                    // the issue again: the note is added once.
+                    if body.contains(&note) {
+                        return Ok(());
+                    }
                     let args = [
                         "issue",
                         "edit",
