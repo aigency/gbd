@@ -2814,7 +2814,8 @@ fn import_links_the_parent_from_the_footer_when_github_refuses_the_sub_issue() {
         &two,
         "{\"_type\":\"issue\",\"id\":\"e-1\",\"title\":\"epic\",\"issue_type\":\"epic\",\"status\":\"open\",\"priority\":1,\"created_at\":\"2026-01-01T00:00:00Z\"}\n\
          {\"_type\":\"issue\",\"id\":\"e-1.1\",\"title\":\"child one\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-01T00:01:00Z\",\"dependencies\":[{\"issue_id\":\"e-1.1\",\"depends_on_id\":\"e-1\",\"type\":\"parent-child\"}]}\n\
-         {\"_type\":\"issue\",\"id\":\"e-1.2\",\"title\":\"child two\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-01T00:02:00Z\",\"dependencies\":[{\"issue_id\":\"e-1.2\",\"depends_on_id\":\"e-1\",\"type\":\"parent-child\"}]}\n",
+         {\"_type\":\"issue\",\"id\":\"e-1.2\",\"title\":\"child two\",\"description\":\"see e-1.3\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-01T00:02:00Z\",\"dependencies\":[{\"issue_id\":\"e-1.2\",\"depends_on_id\":\"e-1\",\"type\":\"parent-child\"}]}\n\
+         {\"_type\":\"issue\",\"id\":\"e-1.3\",\"title\":\"child three\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-01T00:03:00Z\"}\n",
     )
     .unwrap();
     fs::write(
@@ -2845,6 +2846,15 @@ fn import_links_the_parent_from_the_footer_when_github_refuses_the_sub_issue() {
     )
     .on("rebody", "issue edit 103 -R acme/widgets --body-file -", "")
     .on("create-2", "--title child two", "https://github.com/acme/widgets/issues/104")
+    .on("create-3", "--title child three", "https://github.com/acme/widgets/issues/105")
+    // Pass two rewrites child two's forward reference on the body GitHub
+    // has, which carries the note.
+    .on(
+        "body-104",
+        "issue view 104 -R acme/widgets --json body",
+        r#"{"body":"see e-1.3\n\n---\nImported from Beads `e-1.2` (created 2026-01-01). Parent (GitHub allows 100 sub-issues per parent): #101."}"#,
+    )
+    .on("rebody-104", "issue edit 104 -R acme/widgets --body-file -", "")
     .on("values", "issue-field-values --input -", "{}")
     .on("anyadd", "project item-add 7 --owner acme --url", r#"{"id":"PVTI_new"}"#)
     .on("anyedit", "project item-edit --id PVTI_new", "")
@@ -2874,6 +2884,10 @@ fn import_links_the_parent_from_the_footer_when_github_refuses_the_sub_issue() {
         calls.matches("--title child two").count(),
         1,
         "created once, without a failed attempt: {calls}"
+    );
+    assert!(
+        calls.contains("STDIN: see #105\n\n---\nImported from Beads `e-1.2` (created 2026-01-01). Parent (GitHub allows 100 sub-issues per parent): #101."),
+        "the forward reference is rewritten and the note kept: {calls}"
     );
 
     // Killed between that edit and the record: the note is not added twice.

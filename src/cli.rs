@@ -1415,6 +1415,7 @@ fn import_run(
         open_beads: BTreeSet::new(),
         unsure_blockers: BTreeSet::new(),
         full_parents: BTreeSet::new(),
+        footer_noted: BTreeSet::new(),
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1511,6 +1512,9 @@ struct Run<'a> {
     /// Parents GitHub has refused for the sub-issue cap this run: later
     /// children link to them from the footer without trying.
     full_parents: BTreeSet<u64>,
+    /// Beads whose footer gained the cap note at runtime: pass two must
+    /// rewrite the body GitHub has, not the plan's, or the note is lost.
+    footer_noted: BTreeSet<String>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1773,6 +1777,7 @@ impl Run<'_> {
         let parent = match parent {
             Some(p) if self.full_parents.contains(&p) => {
                 let _ = write!(body, " Parent ({}): #{p}.", import::SUB_ISSUE_CAP_WHY);
+                self.footer_noted.insert(item.bead.clone());
                 self.warnings.push(format!(
                     "{}: parent not set, GitHub allows {} sub-issues per parent and #{p} is full; the footer links to it instead",
                     item.bead,
@@ -1936,6 +1941,7 @@ impl Run<'_> {
                         import::SUB_ISSUE_CAP
                     )
                 })?;
+                self.footer_noted.insert(item.bead.clone());
                 self.warnings.push(format!(
                     "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and #{parent} is full; the footer links to it instead",
                     item.bead,
@@ -2123,8 +2129,9 @@ impl Run<'_> {
             }
             // A resumed bead's body is whatever is on GitHub now: it may
             // already carry the rewrite (killed before the checkpoint), or
-            // edits made by hand. Rewrite that text in place.
-            let base = if t.resumed {
+            // edits made by hand. Rewrite that text in place. The same for
+            // a body that gained the cap note at runtime.
+            let base = if t.resumed || self.footer_noted.contains(&t.bead) {
                 match current_body(self.ctx, t.number) {
                     Ok(b) => b,
                     Err(err) => {
