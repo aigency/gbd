@@ -1414,6 +1414,7 @@ fn import_run(
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
         unsure_blockers: BTreeSet::new(),
+        full_parents: BTreeSet::new(),
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1507,6 +1508,9 @@ struct Run<'a> {
     /// Finished blockers whose live state could not be read: anything
     /// placed against them stays unfinished, so the next run looks again.
     unsure_blockers: BTreeSet<String>,
+    /// Parents GitHub has refused for the sub-issue cap this run: later
+    /// children link to them from the footer without trying.
+    full_parents: BTreeSet<u64>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1765,7 +1769,19 @@ impl Run<'_> {
             .iter()
             .map(|b| edge(b))
             .collect::<Result<_>>()?;
-        let body = import::rewrite_ids(&item.body, &self.numbers);
+        let mut body = import::rewrite_ids(&item.body, &self.numbers);
+        let parent = match parent {
+            Some(p) if self.full_parents.contains(&p) => {
+                let _ = write!(body, " Parent ({}): #{p}.", import::SUB_ISSUE_CAP_WHY);
+                self.warnings.push(format!(
+                    "{}: parent not set, GitHub allows {} sub-issues per parent and #{p} is full; the footer links to it instead",
+                    item.bead,
+                    import::SUB_ISSUE_CAP
+                ));
+                None
+            }
+            other => other,
+        };
         let new = NewIssue {
             title: &item.title,
             body: &body,
@@ -1889,6 +1905,9 @@ impl Run<'_> {
             // written it), and the report says so. Not fatal.
             if *what == "parent" && format!("{err:#}").contains("more than 100 sub-issues") {
                 let parent = flags[1];
+                if let Ok(p) = parent.parse::<u64>() {
+                    self.full_parents.insert(p);
+                }
                 let note = format!(" Parent ({}): #{parent}.", import::SUB_ISSUE_CAP_WHY);
                 let n = number.to_string();
                 let linked = current_body(self.ctx, number).and_then(|body| {
