@@ -1884,14 +1884,36 @@ impl Run<'_> {
                 continue;
             };
             // The plan keeps parents under GitHub's cap, but a parent may
-            // have sub-issues from outside the import: the edge is given up
-            // and said, not fatal.
+            // have sub-issues from outside the import: the edge is given up,
+            // the footer links to the parent instead (as the plan would have
+            // written it), and the report says so. Not fatal.
             if *what == "parent" && format!("{err:#}").contains("more than 100 sub-issues") {
-                self.warnings.push(format!(
-                    "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and it is full",
+                let parent = flags[1];
+                let note = format!(" Parent ({}): #{parent}.", import::SUB_ISSUE_CAP_WHY);
+                let n = number.to_string();
+                let linked = current_body(self.ctx, number).and_then(|body| {
+                    let args = [
+                        "issue",
+                        "edit",
+                        &n,
+                        "-R",
+                        &self.ctx.repo.name_with_owner,
+                        "--body-file",
+                        "-",
+                    ];
+                    gh::run_stdin(&args, format!("{body}{note}").as_bytes()).map(|_| ())
+                });
+                let full = format!(
+                    "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and #{parent} is full",
                     item.bead,
                     import::SUB_ISSUE_CAP
-                ));
+                );
+                self.warnings.push(match linked {
+                    Ok(()) => format!("{full}; the footer links to it instead"),
+                    Err(e) => format!(
+                        "{full}, and the footer could not be updated ({e:#}); add `Parent: #{parent}` to the body by hand"
+                    ),
+                });
                 continue;
             }
             return Err(err).with_context(|| {
