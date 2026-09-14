@@ -1865,7 +1865,7 @@ impl Run<'_> {
     /// is recorded: a failure stops the run with nothing recorded, so the
     /// next run finds the issue again and retries, rather than resuming
     /// past a missing edge.
-    fn reapply_edges(&self, item: &import::Item, number: u64, url: &str) -> Result<()> {
+    fn reapply_edges(&mut self, item: &import::Item, number: u64, url: &str) -> Result<()> {
         let target = self.ctx.target(&number.to_string())?;
         let mut redo: Vec<(&str, Vec<String>)> =
             vec![("type", vec!["--type".into(), item.issue_type.into()])];
@@ -1880,12 +1880,26 @@ impl Run<'_> {
         }
         for (what, flags) in &redo {
             let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-            target.edit(&flags).with_context(|| {
+            let Err(err) = target.edit(&flags) else {
+                continue;
+            };
+            // The plan keeps parents under GitHub's cap, but a parent may
+            // have sub-issues from outside the import: the edge is given up
+            // and said, not fatal.
+            if *what == "parent" && format!("{err:#}").contains("more than 100 sub-issues") {
+                self.warnings.push(format!(
+                    "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and it is full",
+                    item.bead,
+                    import::SUB_ISSUE_CAP
+                ));
+                continue;
+            }
+            return Err(err).with_context(|| {
                 format!(
                     "{} is #{number} ({url}) but its {what} could not be reapplied; nothing was recorded, run gbd import again to retry",
                     item.bead
                 )
-            })?;
+            });
         }
         Ok(())
     }

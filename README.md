@@ -246,6 +246,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 
 - **Relations other than blocking are text, not edges.** GitHub has two kinds of issue relation, blocked-by and sub-issue. `related`, `discovered-from`, `supersedes`, `duplicates`, and `tracks` become footer lines whose ids link to the right issues, and GitHub shows the back-reference on the other side, but nothing can query them as a graph.
 - **One parent per issue.** GitHub sub-issues allow one; a second Beads parent is a footer line (`Also under: #7`).
+- **A hundred children per parent.** GitHub allows a parent 100 sub-issues, full stop. The first hundred children of an epic, in import order, become its sub-issues; the rest link to it from their footer (`Parent (GitHub allows 100 sub-issues per parent): #2118`) and are listed in the report, so a view grouped by parent shows them as having none. Split such an epic in Beads before exporting if the hierarchy matters more than the epic's identity.
 - **Dependency cycles are broken.** GitHub refuses them. A cycle is created with the edges that close it dropped; each dropped edge is listed in the report and noted in the footer of the issue that lost it.
 - **`blocked` is recomputed.** Beads stores it; gbd derives it from open blockers. A bead stored as blocked with no open blocker lands on Ready.
 - **Statuses beyond open, `in_progress`, `blocked`, `deferred`, and `closed`** (a custom status, `pinned`, `hooked`) are reported and imported as open; custom statuses on the board are #29.
