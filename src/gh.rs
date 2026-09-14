@@ -114,8 +114,18 @@ fn rate_limited(output: &Output) -> bool {
 /// The primary hourly quota, as opposed to the secondary limit: GitHub says
 /// the limit is exceeded and does not say "secondary".
 fn primary_limited(output: &Output) -> bool {
-    let msg = failure_text(output);
+    says_primary_limit(&failure_text(output))
+}
+
+fn says_primary_limit(msg: &str) -> bool {
     msg.contains("rate limit") && msg.contains("exceeded") && !msg.contains("secondary")
+}
+
+/// Whether a failed call's error says the primary quota is exhausted: for
+/// the one call `retrying` never repeats (`gh issue create`), whose caller
+/// decides what a repeat would mean.
+pub fn primary_limit_hit(err: &anyhow::Error) -> bool {
+    says_primary_limit(&format!("{err:#}").to_ascii_lowercase())
 }
 
 /// The pool a call most likely draws on: GraphQL for `gh api graphql` and

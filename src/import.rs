@@ -619,6 +619,9 @@ pub enum Phase {
     /// idempotent and get replayed; `comments` says how many comments are
     /// on it already.
     Created,
+    /// Priority, dates, assignee, close, and the card are on it; the body
+    /// rewrite and the comments (pass two) may not be.
+    Placed,
     /// Everything is on it.
     #[default]
     Done,

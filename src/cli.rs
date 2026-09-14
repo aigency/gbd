@@ -1414,7 +1414,6 @@ fn import_run(
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
         unsure_blockers: BTreeSet::new(),
-        budget: None,
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1508,10 +1507,6 @@ struct Run<'a> {
     /// Finished blockers whose live state could not be read: anything
     /// placed against them stays unfinished, so the next run looks again.
     unsure_blockers: BTreeSet<String>,
-    /// GraphQL points believed left, read from `/rate_limit` when it runs
-    /// low. A create is several mutations that cannot be retried, so the
-    /// run waits for the reset rather than let a create trip the limit.
-    budget: Option<u64>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1561,9 +1556,22 @@ impl Run<'_> {
                     println!("{:>5}/{total}  {} {what}", n + 1, item.bead);
                 }
             };
-            let mut t = match done.get(&item.bead) {
-                Some(m) if m.phase == import::Phase::Done => {
-                    progress(format!("= #{}  (already imported)", m.number));
+            let mapped = done.get(&item.bead);
+            if !mapped.is_some_and(|m| m.phase != import::Phase::Created) {
+                Self::ensure_budget();
+            }
+            let mut t = match mapped {
+                Some(m) if m.phase != import::Phase::Created => {
+                    let placed = m.phase == import::Phase::Placed;
+                    progress(format!(
+                        "= #{}  ({})",
+                        m.number,
+                        if placed {
+                            "finishing"
+                        } else {
+                            "already imported"
+                        }
+                    ));
                     let open = if pending.contains(item.bead.as_str()) {
                         match issue_is_open(self.ctx, m.number) {
                             Ok(open) => open,
@@ -1581,6 +1589,18 @@ impl Run<'_> {
                     };
                     if open {
                         self.open_beads.insert(item.bead.clone());
+                    }
+                    if placed {
+                        // Placed by an earlier run: only pass two is left.
+                        self.touched.push(Touched {
+                            bead: item.bead.clone(),
+                            number: m.number,
+                            url: m.url.clone(),
+                            resumed: true,
+                            comments: m.comments,
+                            rewritten: m.rewritten,
+                            clean: true,
+                        });
                     }
                     continue;
                 }
@@ -1610,6 +1630,10 @@ impl Run<'_> {
                 }
             };
             let state = self.place(item, &mut t);
+            if t.clean {
+                // Checkpoint: a restart skips straight to pass two for it.
+                self.record(&t, import::Phase::Placed)?;
+            }
             let closed = if matches!(state, import::State::Closed { .. }) {
                 "  ✓"
             } else {
@@ -1658,32 +1682,7 @@ impl Run<'_> {
                 }
             }
         }
-        // `gh issue create` sets the type, parent, and blockers after the
-        // create; the run that died may not have got that far. Reapply them
-        // (each is idempotent) before recording anything: a failure stops
-        // the run with nothing recorded, so the next run finds the issue
-        // again and retries, rather than resuming past a missing edge.
-        let target = self.ctx.target(&number.to_string())?;
-        let mut redo: Vec<(&str, Vec<String>)> =
-            vec![("type", vec!["--type".into(), item.issue_type.into()])];
-        if let Some(parent) = item.parent.as_deref().and_then(|p| self.numbers.get(p)) {
-            redo.push(("parent", vec!["--parent".into(), parent.to_string()]));
-        }
-        for blocker in item.blocked_by.iter().filter_map(|b| self.numbers.get(b)) {
-            redo.push((
-                "blocker",
-                vec!["--add-blocked-by".into(), blocker.to_string()],
-            ));
-        }
-        for (what, flags) in &redo {
-            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-            target.edit(&flags).with_context(|| {
-                format!(
-                    "{} is #{number} ({url}) but its {what} could not be reapplied; nothing was recorded, run gbd import again to retry",
-                    item.bead
-                )
-            })?;
-        }
+        self.reapply_edges(item, number, &url)?;
         if !self.ctx.json {
             println!(
                 "       {} = #{number}  (found on GitHub, unrecorded; recorded now)",
@@ -1753,21 +1752,19 @@ impl Run<'_> {
             .map(|b| edge(b))
             .collect::<Result<_>>()?;
         let body = import::rewrite_ids(&item.body, &self.numbers);
-        self.ensure_budget();
-        let (number, url) = create_issue(
-            self.ctx,
-            &NewIssue {
-                title: &item.title,
-                body: &body,
-                issue_type: item.issue_type,
-                parent,
-                blocked_by: &blocked_by,
-                blocking: &[],
-            },
-        )
+        let new = NewIssue {
+            title: &item.title,
+            body: &body,
+            issue_type: item.issue_type,
+            parent,
+            blocked_by: &blocked_by,
+            blocking: &[],
+        };
+        let (number, url) = match create_issue(self.ctx, &new) {
+            Err(err) if gh::primary_limit_hit(&err) => self.create_after_limit(item, &new),
+            created => created,
+        }
         .with_context(|| format!("{}: stopped after {n} of {total}", item.bead))?;
-        // A create with its edges is up to about ten points.
-        self.budget = self.budget.map(|b| b.saturating_sub(10));
         let t = Touched {
             bead: item.bead.clone(),
             number,
@@ -1782,28 +1779,72 @@ impl Run<'_> {
         Ok((number, url))
     }
 
-    /// Before a create: with fewer than a comfortable reserve of GraphQL
-    /// points left, wait for the hourly reset. `/rate_limit` is free, but
-    /// it is read only when the running estimate says it matters; if it
-    /// cannot be read, the create goes ahead and the read is tried again
-    /// a little later.
-    fn ensure_budget(&mut self) {
+    /// Before a bead's calls: with fewer than a comfortable reserve of
+    /// GraphQL points left, wait for the hourly reset. `/rate_limit` is
+    /// free and is read every time, since the pool is shared with whatever
+    /// else runs under the same token and no running estimate survives
+    /// that; if it cannot be read, the bead goes ahead.
+    fn ensure_budget() {
         const RESERVE: u64 = 60;
-        if self.budget.is_some_and(|b| b > RESERVE) {
-            return;
+        if let Ok((remaining, reset)) = gh::budget("graphql") {
+            if remaining < RESERVE {
+                gh::wait_for_reset("graphql", reset);
+            }
         }
-        let Ok((remaining, reset)) = gh::budget("graphql") else {
-            // Unreadable this time: try again a couple of dozen creates on.
-            self.budget = Some(RESERVE + 200);
-            return;
-        };
-        self.budget = Some(if remaining < RESERVE {
-            gh::wait_for_reset("graphql", reset);
-            // Fresh after the reset; a stale read must not wait again.
-            gh::budget("graphql").map_or(RESERVE + 1, |(r, _)| r.max(RESERVE + 1))
-        } else {
-            remaining
-        });
+    }
+
+    /// The create tripped the hourly quota. `gh issue create` is several
+    /// mutations, so the issue may or may not exist: wait for the reset,
+    /// look for it by its footer, and finish it if it is there; create it
+    /// only when it is not.
+    fn create_after_limit(
+        &mut self,
+        item: &import::Item,
+        new: &NewIssue<'_>,
+    ) -> Result<(u64, String)> {
+        Self::ensure_budget();
+        if let Some((number, url)) = find_imported(self.ctx, &item.bead)? {
+            self.reapply_edges(item, number, &url)?;
+            if !self.ctx.json {
+                println!(
+                    "       {} = #{number}  (created as the limit hit; finished now)",
+                    item.bead
+                );
+            }
+            return Ok((number, url));
+        }
+        create_issue(self.ctx, new)
+    }
+
+    /// `gh issue create` sets the type, parent, and blockers after the
+    /// create; a run that died, or a create the limit cut short, may not
+    /// have got that far. Reapply them (each is idempotent) before anything
+    /// is recorded: a failure stops the run with nothing recorded, so the
+    /// next run finds the issue again and retries, rather than resuming
+    /// past a missing edge.
+    fn reapply_edges(&self, item: &import::Item, number: u64, url: &str) -> Result<()> {
+        let target = self.ctx.target(&number.to_string())?;
+        let mut redo: Vec<(&str, Vec<String>)> =
+            vec![("type", vec!["--type".into(), item.issue_type.into()])];
+        if let Some(parent) = item.parent.as_deref().and_then(|p| self.numbers.get(p)) {
+            redo.push(("parent", vec!["--parent".into(), parent.to_string()]));
+        }
+        for blocker in item.blocked_by.iter().filter_map(|b| self.numbers.get(b)) {
+            redo.push((
+                "blocker",
+                vec!["--add-blocked-by".into(), blocker.to_string()],
+            ));
+        }
+        for (what, flags) in &redo {
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            target.edit(&flags).with_context(|| {
+                format!(
+                    "{} is #{number} ({url}) but its {what} could not be reapplied; nothing was recorded, run gbd import again to retry",
+                    item.bead
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Priority, Start date, assignee, the close, and the card: all
@@ -1996,7 +2037,7 @@ impl Run<'_> {
             if body == base {
                 // Nothing left to rewrite: checkpoint what an earlier run did.
                 t.rewritten = true;
-                if let Err(err) = self.record(t, import::Phase::Created) {
+                if let Err(err) = self.record(t, checkpoint(t)) {
                     self.warnings.push(format!("{err:#}"));
                     t.clean = false;
                 }
@@ -2016,7 +2057,7 @@ impl Run<'_> {
                 Ok(_) => {
                     t.rewritten = true;
                     self.rewritten.push(t.number);
-                    if let Err(err) = self.record(t, import::Phase::Created) {
+                    if let Err(err) = self.record(t, checkpoint(t)) {
                         self.warnings.push(format!("{err:#}"));
                         t.clean = false;
                     }
@@ -2086,7 +2127,7 @@ impl Run<'_> {
                     break;
                 }
                 t.comments = k + 1;
-                self.record(t, import::Phase::Created)?;
+                self.record(t, checkpoint(t))?;
             }
             if t.clean {
                 self.record(t, import::Phase::Done)?;
@@ -2152,6 +2193,16 @@ fn current_body(ctx: &Ctx, number: u64) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string())
+}
+
+/// The phase a pass-two checkpoint records: placed, unless a step on the
+/// bead failed, in which case the next run places it again.
+fn checkpoint(t: &Touched) -> import::Phase {
+    if t.clean {
+        import::Phase::Placed
+    } else {
+        import::Phase::Created
+    }
 }
 
 /// The issue an earlier import made for `bead`, found by the footer its

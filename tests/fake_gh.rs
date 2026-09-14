@@ -2327,7 +2327,7 @@ fn import_resumes_from_the_mapping_file() {
     );
     let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
     let lines: Vec<&str> = map.lines().collect();
-    assert_eq!(lines.len(), 8, "{map}");
+    assert_eq!(lines.len(), 10, "{map}");
     let phases: Vec<String> = lines[3..]
         .iter()
         .map(|l| {
@@ -2343,13 +2343,15 @@ fn import_resumes_from_the_mapping_file() {
     assert_eq!(
         phases,
         [
+            "wx-2 placed 0",
             "wx-1.1 created 0",
+            "wx-1.1 placed 0",
             "wx-2 done 0",
-            "wx-1.1 created 1",
-            "wx-1.1 created 2",
+            "wx-1.1 placed 1",
+            "wx-1.1 placed 2",
             "wx-1.1 done 2"
         ],
-        "pass one creates and places; pass two posts comments with a checkpoint each, then done: {map}"
+        "pass one creates and places, checkpointing each; pass two posts comments with a checkpoint each, then done: {map}"
     );
 }
 
@@ -2413,8 +2415,8 @@ fn import_keeps_a_bead_off_done_when_its_body_edit_fails() {
         .rfind(|l| l.contains("\"bead\":\"wx-1\""))
         .unwrap();
     assert!(
-        last_wx1.contains("\"phase\":\"created\""),
-        "not done until the body is right: {map}"
+        last_wx1.contains("\"phase\":\"placed\""),
+        "placed, but not done until the body is right: {map}"
     );
     assert!(
         map.lines()
@@ -3391,5 +3393,210 @@ fn import_waits_for_graphql_budget_before_a_create() {
     assert!(
         calls.find("api rate_limit").unwrap() < calls.find("issue create").unwrap(),
         "the budget is read before the create: {calls}"
+    );
+}
+
+#[test]
+fn import_finishes_a_create_the_primary_limit_cut_short() {
+    const LIMIT: &str = "GraphQL: API rate limit already exceeded for user ID 1";
+    const FIELDS: &str = r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[
+        {"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},
+        {"id":7886557,"name":"Start date","data_type":"date"}]"#;
+    let setup = |h: &Harness| {
+        board_fixtures(h);
+        fs::write(
+            h.cwd.path().join("beads-map.jsonl"),
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+        )
+        .unwrap();
+        // Plenty before each bead; nothing right after the create fails.
+        h.on(
+            "rl",
+            "api rate_limit",
+            r#"{"resources":{"graphql":{"remaining":4990,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+        );
+        fs::write(
+            h.gh_dir.path().join("rl.out.2"),
+            r#"{"resources":{"graphql":{"remaining":0,"reset":0},"core":{"remaining":5000,"reset":0}}}"#,
+        )
+        .unwrap();
+        h.on("fields", FIELDS_GET, FIELDS)
+            .on("search", "issue list -R acme/widgets --search", "[]")
+            .on(
+                "create-3",
+                "--title Rename the endpoints",
+                "https://github.com/acme/widgets/issues/103",
+            )
+            .on("values", "issue-field-values --input -", "{}")
+            .on("retype", "issue edit 102 -R acme/widgets --type Bug", "")
+            .on(
+                "assign",
+                "issue edit 102 -R acme/widgets --add-assignee dev1",
+                "",
+            )
+            .on(
+                "close",
+                "issue close 102 -R acme/widgets --reason duplicate",
+                "",
+            )
+            .on(
+                "comment",
+                "issue comment 103 -R acme/widgets --body-file -",
+                "",
+            )
+            .on(
+                "anyadd",
+                "project item-add 7 --owner acme --url",
+                r#"{"id":"PVTI_new"}"#,
+            )
+            .on("anyedit", "project item-edit --id PVTI_new", "")
+            .on(
+                "mem-view",
+                "issue view 3 -R acme/widgets --json body",
+                "{\"body\":\"\"}",
+            )
+            .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+
+    // The limit lands after the create mutation: the issue exists without
+    // its type. Found among the newest issues after the reset, finished,
+    // and not created again.
+    let h = Harness::new();
+    setup(&h);
+    h.on_seq(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        &[
+            "[]",
+            r#"[{"number":102,"url":"https://github.com/acme/widgets/issues/102","body":"Token refresh races the request.\n\n---\nImported from Beads `wx-2` (created 2026-03-02 by dev2)."},{"number":101,"url":"https://github.com/acme/widgets/issues/101","body":"…Imported from Beads `wx-1`…"}]"#,
+        ],
+    )
+    .on_fail("create-2", "--title Auth refresh", LIMIT);
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wx-2 = #102  (created as the limit hit; finished now)",
+        ))
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 already imported)",
+        ))
+        .stderr(predicate::str::contains(
+            "gh: primary rate limit on graphql; waiting 0m00s for the reset",
+        ));
+    let calls = h.calls();
+    assert_eq!(
+        calls.matches("--title Auth refresh").count(),
+        1,
+        "not created twice: {calls}"
+    );
+    assert!(
+        calls.contains("issue edit 102 -R acme/widgets --type Bug"),
+        "the type the cut-short create did not set is reapplied: {calls}"
+    );
+    assert!(
+        calls.contains("--type Task --parent 101 --blocked-by 102"),
+        "{calls}"
+    );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    assert!(
+        map.lines().nth(1).unwrap().contains("\"bead\":\"wx-2\""),
+        "{map}"
+    );
+
+    // The limit lands on the create mutation itself: nothing exists, so
+    // after the reset it is created.
+    let h = Harness::new();
+    setup(&h);
+    h.on(
+        "newest",
+        "issue list -R acme/widgets --state all --limit 20 --json number,url,body",
+        "[]",
+    )
+    .on_seq(
+        "create-2",
+        "--title Auth refresh",
+        &[LIMIT, "https://github.com/acme/widgets/issues/102"],
+    );
+    fs::write(h.gh_dir.path().join("create-2.code.1"), "1").unwrap();
+    h.gbd()
+        .env("GBD_BACKOFF_MS", "1")
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 1 already imported)",
+        ))
+        .stderr(predicate::str::contains("waiting 0m00s for the reset"));
+    let calls = h.calls();
+    assert_eq!(
+        calls.matches("--title Auth refresh").count(),
+        2,
+        "once into the limit, once after the reset: {calls}"
+    );
+    assert!(
+        !calls.contains("issue edit 102 -R acme/widgets --type Bug"),
+        "a fresh create sets its own type: {calls}"
+    );
+}
+
+#[test]
+fn import_skips_placing_a_bead_an_earlier_run_placed() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    // The last run placed wx-2 and wx-1.1 (and posted wx-1.1's comments)
+    // before it died: only the done lines are missing.
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n\
+         {\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"placed\"}\n\
+         {\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"placed\",\"comments\":2}\n",
+    )
+    .unwrap();
+    h.on(
+        "fields",
+        FIELDS_GET,
+        r#"[{"id":46822523,"name":"Priority","data_type":"single_select","options":[{"id":1,"name":"P0"},{"id":2,"name":"P1"},{"id":3,"name":"P2"},{"id":4,"name":"P3"},{"id":5,"name":"P4"}]},{"id":7886557,"name":"Start date","data_type":"date"}]"#,
+    )
+    .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2/3  wx-2 = #102  (finishing)\n"))
+        .stdout(predicate::str::contains(
+            "3/3  wx-1.1 = #103  (finishing)\n",
+        ))
+        .stdout(predicate::str::contains("2 finished from an earlier run"));
+    let calls = h.calls();
+    for step in [
+        "issue create",
+        "issue-field-values",
+        "issue close",
+        "project item-add",
+        "issue comment",
+    ] {
+        assert!(
+            !calls.contains(step),
+            "{step} is not replayed for a placed bead: {calls}"
+        );
+    }
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last: Vec<&str> = map.lines().skip(3).collect();
+    assert_eq!(last.len(), 2, "one done line each: {map}");
+    assert!(
+        last[0].contains("\"bead\":\"wx-2\"") && last[0].contains("\"phase\":\"done\""),
+        "{map}"
+    );
+    assert!(
+        last[1].contains("\"bead\":\"wx-1.1\"")
+            && last[1].contains("\"phase\":\"done\"")
+            && last[1].contains("\"comments\":2"),
+        "{map}"
     );
 }
