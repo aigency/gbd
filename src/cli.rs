@@ -1414,6 +1414,8 @@ fn import_run(
         rewritten: Vec::new(),
         open_beads: BTreeSet::new(),
         unsure_blockers: BTreeSet::new(),
+        full_parents: BTreeSet::new(),
+        footer_noted: BTreeSet::new(),
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1507,6 +1509,12 @@ struct Run<'a> {
     /// Finished blockers whose live state could not be read: anything
     /// placed against them stays unfinished, so the next run looks again.
     unsure_blockers: BTreeSet<String>,
+    /// Parents GitHub has refused for the sub-issue cap this run: later
+    /// children link to them from the footer without trying.
+    full_parents: BTreeSet<u64>,
+    /// Beads whose footer gained the cap note at runtime: pass two must
+    /// rewrite the body GitHub has, not the plan's, or the note is lost.
+    footer_noted: BTreeSet<String>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1765,7 +1773,20 @@ impl Run<'_> {
             .iter()
             .map(|b| edge(b))
             .collect::<Result<_>>()?;
-        let body = import::rewrite_ids(&item.body, &self.numbers);
+        let mut body = import::rewrite_ids(&item.body, &self.numbers);
+        let parent = match parent {
+            Some(p) if self.full_parents.contains(&p) => {
+                let _ = write!(body, " Parent ({}): #{p}.", import::SUB_ISSUE_CAP_WHY);
+                self.footer_noted.insert(item.bead.clone());
+                self.warnings.push(format!(
+                    "{}: parent not set, GitHub allows {} sub-issues per parent and #{p} is full; the footer links to it instead",
+                    item.bead,
+                    import::SUB_ISSUE_CAP
+                ));
+                None
+            }
+            other => other,
+        };
         let new = NewIssue {
             title: &item.title,
             body: &body,
@@ -1865,7 +1886,7 @@ impl Run<'_> {
     /// is recorded: a failure stops the run with nothing recorded, so the
     /// next run finds the issue again and retries, rather than resuming
     /// past a missing edge.
-    fn reapply_edges(&self, item: &import::Item, number: u64, url: &str) -> Result<()> {
+    fn reapply_edges(&mut self, item: &import::Item, number: u64, url: &str) -> Result<()> {
         let target = self.ctx.target(&number.to_string())?;
         let mut redo: Vec<(&str, Vec<String>)> =
             vec![("type", vec!["--type".into(), item.issue_type.into()])];
@@ -1880,12 +1901,60 @@ impl Run<'_> {
         }
         for (what, flags) in &redo {
             let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-            target.edit(&flags).with_context(|| {
+            let Err(err) = target.edit(&flags) else {
+                continue;
+            };
+            // The plan keeps parents under GitHub's cap, but a parent may
+            // have sub-issues from outside the import: the edge is given up,
+            // the footer links to the parent instead (as the plan would have
+            // written it), and the report says so. Not fatal.
+            if *what == "parent" && format!("{err:#}").contains("more than 100 sub-issues") {
+                let parent = flags[1];
+                if let Ok(p) = parent.parse::<u64>() {
+                    self.full_parents.insert(p);
+                }
+                let note = format!(" Parent ({}): #{parent}.", import::SUB_ISSUE_CAP_WHY);
+                let n = number.to_string();
+                let linked = current_body(self.ctx, number).and_then(|body| {
+                    // A run killed between this edit and the record finds
+                    // the issue again: the note is added once.
+                    if body.contains(&note) {
+                        return Ok(());
+                    }
+                    let args = [
+                        "issue",
+                        "edit",
+                        &n,
+                        "-R",
+                        &self.ctx.repo.name_with_owner,
+                        "--body-file",
+                        "-",
+                    ];
+                    gh::run_stdin(&args, format!("{body}{note}").as_bytes()).map(|_| ())
+                });
+                // Like any other reapply failure: nothing recorded, so the
+                // next run finds the issue and tries the footer again.
+                linked.with_context(|| {
+                    format!(
+                        "{} is #{number} ({url}) but its parent #{parent} is full (GitHub allows {} sub-issues per parent) and the footer could not be updated to link to it; nothing was recorded, run gbd import again to retry",
+                        item.bead,
+                        import::SUB_ISSUE_CAP
+                    )
+                })?;
+                self.footer_noted.insert(item.bead.clone());
+                self.warnings.push(format!(
+                    "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and #{parent} is full; the footer links to it instead",
+                    item.bead,
+                    import::SUB_ISSUE_CAP
+                ));
+                continue;
+            }
+            return Err(err).with_context(|| {
                 format!(
                     "{} is #{number} ({url}) but its {what} could not be reapplied; nothing was recorded, run gbd import again to retry",
                     item.bead
                 )
-            })?;
+            });
         }
         Ok(())
     }
@@ -2060,8 +2129,9 @@ impl Run<'_> {
             }
             // A resumed bead's body is whatever is on GitHub now: it may
             // already carry the rewrite (killed before the checkpoint), or
-            // edits made by hand. Rewrite that text in place.
-            let base = if t.resumed {
+            // edits made by hand. Rewrite that text in place. The same for
+            // a body that gained the cap note at runtime.
+            let base = if t.resumed || self.footer_noted.contains(&t.bead) {
                 match current_body(self.ctx, t.number) {
                     Ok(b) => b,
                     Err(err) => {

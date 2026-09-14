@@ -490,6 +490,11 @@ fn residual(export: &Export, ids: &[String]) -> (Vec<String>, Vec<Vec<String>>) 
 // ---------------------------------------------------------------------------
 // The plan
 
+/// GitHub's limit on sub-issues under one parent.
+pub const SUB_ISSUE_CAP: usize = 100;
+/// The footer's reason for a parent edge dropped for the cap.
+pub const SUB_ISSUE_CAP_WHY: &str = "GitHub allows 100 sub-issues per parent";
+
 pub fn plan(export: &Export) -> Plan {
     let by_id: HashMap<&str, &Bead> = export.issues.iter().map(|b| (b.id.as_str(), b)).collect();
     let (placed, stuck) = order(export);
@@ -498,6 +503,7 @@ pub fn plan(export: &Export) -> Plan {
     let mut items = Vec::new();
     let mut done: BTreeSet<&str> = BTreeSet::new();
     let mut relations = 0;
+    let mut children: HashMap<&str, usize> = HashMap::new();
     for id in placed.iter().chain(&behind) {
         let b = by_id[id.as_str()];
         let (issue_type, native) = issue_type(&b.kind);
@@ -541,6 +547,24 @@ pub fn plan(export: &Export) -> Plan {
             .filter(|t| keep(t, "blocked-by", "Blocked by"))
             .cloned()
             .collect();
+        // GitHub allows a parent 100 sub-issues. The first hundred children
+        // in plan order are sub-issues; the rest link to the parent from
+        // their footer, and the report says so.
+        let parent = parent.filter(|target| {
+            let n = children.entry(by_id[target.as_str()].id.as_str()).or_insert(0);
+            *n += 1;
+            if *n <= SUB_ISSUE_CAP {
+                return true;
+            }
+            skipped.push(Skip {
+                bead: b.id.clone(),
+                what: format!(
+                    "parent {target} dropped: GitHub allows {SUB_ISSUE_CAP} sub-issues per parent and this is child {n}; the footer links to it"
+                ),
+            });
+            dropped.push(("Parent", target.clone(), SUB_ISSUE_CAP_WHY));
+            false
+        });
         relations += b.other_deps.len();
         // From the edges that survived, so a card never says Blocked when
         // the issue behind it has no blocker.
@@ -1722,6 +1746,44 @@ mod tests {
             "the dropped edge is noted where it was dropped: {}",
             item(&p, "c-1").body
         );
+    }
+
+    #[test]
+    fn a_parent_keeps_a_hundred_sub_issues_and_the_rest_link_from_the_footer() {
+        let mut lines = String::from(
+            "{\"id\":\"e-1\",\"title\":\"epic\",\"issue_type\":\"epic\",\"status\":\"open\",\"priority\":1,\"created_at\":\"2026-01-01T00:00:00Z\"}\n",
+        );
+        for k in 1..=102 {
+            let _ = writeln!(
+                lines,
+                "{{\"id\":\"e-1.{k}\",\"title\":\"child {k}\",\"issue_type\":\"task\",\"status\":\"open\",\"priority\":2,\"created_at\":\"2026-01-01T00:{:02}:{:02}Z\",\"dependencies\":[{{\"issue_id\":\"e-1.{k}\",\"depends_on_id\":\"e-1\",\"type\":\"parent-child\"}}]}}",
+                k / 60,
+                k % 60
+            );
+        }
+        let e = beads::parse(lines.as_bytes()).unwrap();
+        let p = plan(&e);
+        assert_eq!(item(&p, "e-1.100").parent.as_deref(), Some("e-1"));
+        assert_eq!(item(&p, "e-1.101").parent, None);
+        assert_eq!(item(&p, "e-1.102").parent, None);
+        assert!(
+            item(&p, "e-1.101")
+                .body
+                .ends_with(" Parent (GitHub allows 100 sub-issues per parent): e-1."),
+            "{}",
+            item(&p, "e-1.101").body
+        );
+        assert_eq!(
+            p.skipped
+                .iter()
+                .filter(|s| s.what.contains("sub-issues per parent"))
+                .count(),
+            2,
+            "{:?}",
+            p.skipped
+        );
+        assert!(p.skipped.iter().any(|s| s.bead == "e-1.101"
+            && s.what == "parent e-1 dropped: GitHub allows 100 sub-issues per parent and this is child 101; the footer links to it"));
     }
 
     #[test]
