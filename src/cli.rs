@@ -1903,17 +1903,20 @@ impl Run<'_> {
                     ];
                     gh::run_stdin(&args, format!("{body}{note}").as_bytes()).map(|_| ())
                 });
-                let full = format!(
-                    "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and #{parent} is full",
+                // Like any other reapply failure: nothing recorded, so the
+                // next run finds the issue and tries the footer again.
+                linked.with_context(|| {
+                    format!(
+                        "{} is #{number} ({url}) but its parent #{parent} is full (GitHub allows {} sub-issues per parent) and the footer could not be updated to link to it; nothing was recorded, run gbd import again to retry",
+                        item.bead,
+                        import::SUB_ISSUE_CAP
+                    )
+                })?;
+                self.warnings.push(format!(
+                    "{} (#{number}): parent not set, GitHub allows {} sub-issues per parent and #{parent} is full; the footer links to it instead",
                     item.bead,
                     import::SUB_ISSUE_CAP
-                );
-                self.warnings.push(match linked {
-                    Ok(()) => format!("{full}; the footer links to it instead"),
-                    Err(e) => format!(
-                        "{full}, and the footer could not be updated ({e:#}); add `Parent: #{parent}` to the body by hand"
-                    ),
-                });
+                ));
                 continue;
             }
             return Err(err).with_context(|| {
