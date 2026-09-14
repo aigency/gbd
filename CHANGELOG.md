@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.5] - 2026-09-14
+
+### Documentation
+
+- docs(import): warn how long a migration takes and what Beads users give up (#58)
+
+### Fixed
+
+- fix(gh): wait blind for the primary limit when /rate_limit shows no reset ahead; recover any failed create (#60)
+
 ## [1.8.4] - 2026-09-14
 
 ### Fixed
