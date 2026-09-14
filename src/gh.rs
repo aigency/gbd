@@ -55,7 +55,10 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
         if composite || output.status.success() {
             return finish(args, &output);
         }
-        if primary_limited(&output) {
+        // gh does not always relay the refusal: `gh project view` reports
+        // the quota as "unknown owner type". A failure that is neither
+        // limit by its text is checked against GraphQL directly.
+        if primary_limited(&output) || (!rate_limited(&output) && graphql_refusing()) {
             if primary >= PRIMARY_WAITS {
                 return finish(args, &output);
             }
@@ -75,6 +78,14 @@ fn retrying(args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         wait = wait.saturating_mul(2);
     }
+}
+
+/// Whether GraphQL is refusing on the primary quota right now: one
+/// one-point query, read for the refusal alone. Asked only after a failure
+/// whose text names no limit, since gh swallows the refusal in places.
+pub fn graphql_refusing() -> bool {
+    let args = ["api", "graphql", "-f", "query={viewer{login}}"];
+    spawn(&args, None).is_ok_and(|output| !output.status.success() && primary_limited(&output))
 }
 
 /// How many times in a row the primary quota is waited out for one call.
