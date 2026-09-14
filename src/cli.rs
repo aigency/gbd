@@ -1181,11 +1181,11 @@ fn cmd_import(
     let done = import::read_mapping(mapping)?;
     let logins = import::assignee_map(assignees)?;
     // The names as the export has them, for the preflight's messages; only
-    // beads this run will touch, so a finished bead's assignee is history.
+    // beads this run will place, so a placed bead's assignee is history.
     let raw_assignees = import::assignee_summary_of(plan.items.iter().filter(|i| {
         !done
             .get(&i.bead)
-            .is_some_and(|m| m.phase == import::Phase::Done)
+            .is_some_and(|m| m.phase != import::Phase::Created)
     }));
     import::map_assignees(&mut plan, &logins);
     import::note_imported(&mut plan, &done);
@@ -1395,7 +1395,7 @@ fn import_run(
         .filter(|i| {
             !done
                 .get(&i.bead)
-                .is_some_and(|m| m.phase == import::Phase::Done)
+                .is_some_and(|m| m.phase != import::Phase::Created)
         })
         .any(|i| i.start_date.is_some())
         .then(|| fields::start_date_field(org))
@@ -1592,6 +1592,20 @@ impl Run<'_> {
                     }
                     if placed {
                         // Placed by an earlier run: only pass two is left.
+                        if !open {
+                            self.closed_ok += 1;
+                        }
+                        let state = match (&item.state, open) {
+                            (_, true) => import::State::Open,
+                            (closed @ import::State::Closed { .. }, false) => closed.clone(),
+                            (import::State::Open, false) => import::State::Closed {
+                                reason: import::CloseReason::Completed,
+                            },
+                        };
+                        self.created.push(json!({
+                            "bead": item.bead, "number": m.number, "url": m.url,
+                            "state": state, "status": Value::Null,
+                        }));
                         self.touched.push(Touched {
                             bead: item.bead.clone(),
                             number: m.number,

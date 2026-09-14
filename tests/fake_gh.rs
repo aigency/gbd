@@ -3564,6 +3564,13 @@ fn import_skips_placing_a_bead_an_earlier_run_placed() {
     )
     .on("mem-view", "issue view 3 -R acme/widgets --json body", "{\"body\":\"\"}")
     .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    // wx-2's assignee is already on it, so the preflight must not ask
+    // whether dev1 is still assignable.
+    h.on_fail(
+        "assignable",
+        "repos/acme/widgets/assignees/",
+        "gh: Not Found (HTTP 404)",
+    );
     h.gbd()
         .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
         .assert()
@@ -3572,8 +3579,14 @@ fn import_skips_placing_a_bead_an_earlier_run_placed() {
         .stdout(predicate::str::contains(
             "3/3  wx-1.1 = #103  (finishing)\n",
         ))
-        .stdout(predicate::str::contains("2 finished from an earlier run"));
+        .stdout(predicate::str::contains(
+            "imported 2 issues (1 closed, 2 finished from an earlier run, 1 already imported)",
+        ));
     let calls = h.calls();
+    assert!(
+        !calls.contains("repos/acme/widgets/assignees/"),
+        "no assignee preflight for placed beads: {calls}"
+    );
     for step in [
         "issue create",
         "issue-field-values",
