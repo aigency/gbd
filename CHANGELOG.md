@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-09-14
+
+### Fixed
+
+- fix(import): survive the primary rate limit inside a create; read the budget per bead (#57)
+
 ## [1.8.3] - 2026-09-13
 
 ### Fixed
