@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.6] - 2026-09-14
+
+### Fixed
+
+- fix(import): a parent keeps 100 sub-issues, GitHub's cap; the rest link from the footer (#62)
+
 ## [1.8.5] - 2026-09-14
 
 ### Documentation
