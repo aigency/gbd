@@ -120,7 +120,7 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 | `list [--state open\|closed\|all] [--type T] [--assignee A] [--parent N] [--search Q] [--flat]` | A tree with children under parents: `○ #12 ● P1 [bug] Title`. |
 | `search "<GitHub search syntax>"` | Same output as `list`. |
 | `ready [--claim] [--explain] [--strict-parent] [--include-epics] [--sort priority\|unblocks\|path]` | See above. |
-| `update <id> [--claim] [--status ready\|in_progress\|deferred\|done] [--priority P1] [--type T] [--title] [--body] [--add-assignee] [--remove-assignee]` | Beads `update` / `set-state`. `--claim` runs first and, if refused, nothing else is touched. |
+| `update <id> [--claim] [--status ready\|in_progress\|deferred\|done\|<custom>] [--priority P1] [--type T] [--title] [--body] [--add-assignee] [--remove-assignee]` | Beads `update` / `set-state`. `--claim` runs first and, if refused, nothing else is touched. `--status` also accepts a custom name from `.gbd.yml`. |
 | `assign <id> [login]` | Default `@me`. |
 | `close <id> [--reason completed\|not_planned\|duplicate]` | Board → Done. Cards this issue was blocking go Blocked → Ready once their last open blocker is gone. |
 | `reopen <id>` | Board → Ready (Blocked if it still has open blockers); what it blocks goes back to Blocked. |
@@ -149,8 +149,8 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 | Command | Does |
 | --- | --- |
 | `board` | The board URL and every item grouped by Status, Done included. |
-| `board sync` | Put every open issue on the board (In Progress if assigned, else Blocked or Ready) and make Ready ⇄ Blocked agree with GitHub's open-blocker counts. In Progress, Deferred, and Done cards are left alone. |
-| `status` | `open ready blocked in-progress deferred assigned-to-me closed-last-7d`. |
+| `board sync` | Put every open issue on the board (In Progress if assigned, else Blocked or Ready), create any missing custom columns, and move an `active` card with an open blocker to Blocked (and Blocked back to Ready when the blocker is gone). `wip`, `frozen`, and `done` cards are left alone. |
+| `status` | Counts per category (`active` / `wip` / `frozen` / `done`) with a per-column breakdown, plus `open ready blocked in-progress deferred assigned-to-me closed-last-7d`. |
 | `count [--state]`, `stale [--days N]`, `statuses`, `types` | Small views. |
 
 ### Memories
@@ -182,11 +182,12 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 | `blocks` / blocked-by | native issue **dependencies** | `create --deps`, `dep add` |
 | `related`, `relates-to` | native **relates to** (one undirected link; both issues show it; does not block) | `dep relate`, `relate` |
 | parent / epic children | **sub-issues** | `create --parent`, `parent --set` |
-| `open` | issue open, board **Ready** | `update --status ready`, `reopen` |
-| `in_progress` | board **In Progress** (an assignee, when there is no board) | `update --claim`, `ready --claim` |
-| `blocked` | derived: GitHub `is:blocked` (an open blocker); mirrored to board **Blocked** by gbd | never set by hand; `dep add`, `close`, `board sync` keep it |
-| `deferred` | board **Deferred** and/or org field **Start date** in the future | `defer` |
-| `closed` | issue closed, board **Done** | `close` |
+| `open` | issue open, board **Ready** (`active`) | `update --status ready`, `reopen` |
+| `in_progress` | board **In Progress** (`wip`; an assignee, when there is no board) | `update --claim`, `ready --claim` |
+| `blocked` | derived: GitHub `is:blocked` (an open blocker); mirrored to board **Blocked** (`wip`) by gbd | never set by hand; `dep add`, `close`, `board sync` keep it |
+| `deferred` | board **Deferred** (`frozen`) and/or org field **Start date** in the future | `defer` |
+| `closed` | issue closed, board **Done** (`done`) | `close` |
+| custom (`bd config set status.custom`) | extra Status column, category in `.gbd.yml` | `update --status <name>`, `config set status.custom` |
 | `defer_until` | org issue field **Start date** | `defer --until` |
 | notes | comments | `comment` |
 | memories (`bd remember`) | one closed issue, gbd Role = Memory | `remember` |
@@ -196,9 +197,20 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 
 ## The board
 
-`gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Blocked / Deferred / Ready / In Progress / Done** in that column order, names the default view **Board** in board layout with the filter `-type:Epic` (epics are containers, not work), links the repo, and writes `project: N` to `.gbd.yml`. On a board from an earlier gbd, re-running `init` adds any missing option and puts the five in that order with their ids kept, so no card loses its value; the view is rewritten only while it is still GitHub's untouched "View 1" table, and `gbd doctor` says when a hand-shaped view differs. From then on `create` adds new issues as Ready (Blocked when `--deps` names an open issue), and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` skips In Progress and Deferred. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
+`gbd init` creates an org Project named `<repo> board` (or adopts one of that title already linked to the repo) with Status options **Blocked / Deferred / Ready / In Progress / Done** in that column order, names the default view **Board** in board layout with the filter `-type:Epic` (epics are containers, not work), links the repo, and writes `project: N` to `.gbd.yml`. On a board from an earlier gbd, re-running `init` adds any missing option and puts the five in that order with their ids kept, so no card loses its value; the view is rewritten only while it is still GitHub's untouched "View 1" table, and `gbd doctor` says when a hand-shaped view differs. From then on `create` adds new issues as Ready (Blocked when `--deps` names an open issue), and claim, close, reopen, defer, and `update --status` move the card. `gbd ready` lists cards in an `active` column (Ready, or a custom of that category) and skips `wip`, `frozen`, and `done`. Projects need the `project` scope on the `gh` token (`gh auth refresh -s project`).
 
-**Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back. `update --status ready`, `reopen`, and `undefer` land on Blocked instead when a blocker is still open. Only Ready and Blocked ever swap; In Progress, Deferred, and Done are someone's decision. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
+Custom statuses are extra columns. Each one is a lowercase name (`[a-z0-9_]`) and a category, `active`, `wip`, `frozen`, or `done`. Repeated or edge underscores are rejected, because they collapse onto one column (`in__review` is `in_review`, and `in__progress` is the built-in In Progress):
+
+```yaml
+statuses:
+  triage: active
+  in_review: wip
+  pinned: frozen
+```
+
+`gbd config set status.custom "triage:active,in_review:wip,pinned:frozen"` writes the same map, and `gbd config get status.custom` prints it. `gbd init` and `gbd board sync` add each one as a Status option in Title Case (`in_review` → **In Review**), beside the built-in of the same category, so a `wip` column sits between In Progress and Done. Built-in columns are never removed. Removing a name from the config does not delete the GitHub option either: the column stays, and the next sync sorts it after the columns gbd still knows. `gbd doctor` reports a configured status the board does not have (matched case-insensitively by the key or the Title Case name), and a board option that has no category. `pinned` and `hooked` are allowed as ordinary customs (`pinned: frozen`, `hooked: wip`); `ready`, `in_progress`, `blocked`, `deferred`, `done`, `open`, and `closed` are reserved. `gbd update --status <name>` moves the card. A `done` custom closes the issue (reason completed) and moves the card there; `gbd close` still uses Done, and `gbd reopen` returns a card from any `done` column to Ready. `gbd ready` offers `active` columns only. `gbd stale` skips `frozen` columns and keeps paging until that list is full. `gbd prime` prints the configured names.
+
+**Blocked** exists because project views cannot filter on dependency state (`-is:blocked` is not understood), so without it blocked cards sit in the Ready column. gbd keeps the column from GitHub's own open-blocker count: `dep add` moves a Ready card, or a card in a custom `active` column, to Blocked, and `dep remove` or closing the last open blocker through gbd moves it back to Ready. The column it was in before Blocked is not remembered. `update --status ready`, `update --status` of an `active` custom, `reopen`, and `undefer` land on Blocked instead when a blocker is still open. `wip`, `frozen`, and `done` cards are never moved by that rule. The column is display only: `gbd ready` reads `is:blocked` directly and never looks at it. One limit: a blocker closed in the GitHub UI leaves the blocked card in Blocked until the next `gbd board sync` (or the next gbd command that touches that issue).
 
 Without `project:` in `.gbd.yml`, gbd still works: an assignee means in progress, and `defer --until` means deferred.
 
@@ -231,6 +243,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | open | board Ready, or Blocked when a blocker is still open |
 | `in_progress` | board In Progress, assignee kept |
 | `deferred`, or any `defer_until` | board Deferred, Start date |
+| custom status, `pinned`, `hooked` | that column when `.gbd.yml` names it, else the built-in of its category (`pinned` → Deferred, `hooked` → In Progress); an `active` custom with an open blocker → Blocked |
 | `assignee` | the assignee, by GitHub login. Beads usually holds a display name, so the dry run lists the names it found, and the real run checks every one, mapped or not, can be assigned in the repository before creating anything, refusing with the list otherwise: `--assignee 'Pat Example=patexample'` maps a name, `--assignee 'Pat Example='` imports without it and leaves `Beads assignee: Pat Example` in the footer |
 | closed | closed with a reason read from the free-text `close_reason` (duplicate / not planned / else completed), board Done |
 | `notes`, comments | comments, with author and date |
@@ -252,7 +265,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 - **A hundred children per parent.** GitHub allows a parent 100 sub-issues, full stop. The first hundred children of an epic, in import order, become its sub-issues; the rest link to it from their footer (`Parent (GitHub allows 100 sub-issues per parent): #2118`) and are listed in the report, so a view grouped by parent shows them as having none. Split such an epic in Beads before exporting if the hierarchy matters more than the epic's identity.
 - **Dependency cycles are broken.** GitHub refuses them. A cycle is created with the edges that close it dropped; each dropped edge is listed in the report and noted in the footer of the issue that lost it.
 - **`blocked` is recomputed.** Beads stores it; gbd derives it from open blockers. A bead stored as blocked with no open blocker lands on Ready.
-- **Statuses beyond open, `in_progress`, `blocked`, `deferred`, and `closed`** (a custom status, `pinned`, `hooked`) are reported and imported as open; custom statuses on the board are #29.
+- **Custom statuses land on the matching column when `.gbd.yml` names them, and otherwise on the built-in of their category.** `pinned` is frozen (Deferred, unless `pinned: frozen` is configured) and `hooked` is wip (In Progress, unless configured). The export's own `status.custom` config line supplies the category when gbd has no column of that name. An `active` custom with an open blocker is Blocked. A name with no category at all is reported and imported as Ready.
 - **Close reasons collapse to GitHub's three.** `completed`, `not planned`, or `duplicate` is chosen from the free text; the text itself stays in the footer.
 - **Comments are posted by whoever runs the import.** GitHub's author is the importer; the original author and date are the first line of each comment.
 - **Labels are never labels.** They are footer text. gbd keeps type, priority, and state out of labels on purpose.
@@ -338,6 +351,8 @@ The three `SKILL.md` files are identical. The always-on files get a marked block
 repo: acme/widgets    # else `gh repo view`, else the git remote
 memory_issue: 3       # the memories issue
 project: 8            # the board's number under the org; omit for assignee-only mode
+statuses:             # custom columns; category is active, wip, frozen, or done
+  in_review: wip
 ```
 
 `--repo OWNER/REPO` overrides `repo` for one command. Output is plain text with a few glyphs (`○` open, `◐` in progress, `⊘` blocked, `⏸` deferred, `✓` closed); the priority dot is colored on a terminal unless `NO_COLOR` is set. `--json` prints stable records instead.

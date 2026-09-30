@@ -19,6 +19,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::status::{self, CustomStatus};
+
 /// Beads `issue_type`. Anything Beads may grow that gbd does not know is
 /// carried as `Other`, so the dry run can name it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -212,6 +214,8 @@ pub struct Export {
     pub issues: Vec<Bead>,
     pub memories: Vec<Memory>,
     pub problems: Vec<Problem>,
+    /// Beads `status.custom` from `_type: config` lines, if the export has it.
+    pub status_custom: Vec<CustomStatus>,
 }
 
 impl Export {
@@ -306,6 +310,25 @@ pub fn parse(reader: impl BufRead) -> Result<Export> {
                     .with_context(|| format!("line {n}: malformed memory record"))?;
                 export.memories.push(m);
             }
+            Some("config") => {
+                #[derive(Deserialize)]
+                struct RawConfig {
+                    key: Option<String>,
+                    value: Option<String>,
+                }
+                let raw: RawConfig = serde_json::from_str(&line)
+                    .with_context(|| format!("line {n}: malformed config record"))?;
+                if raw.key.as_deref() == Some("status.custom") {
+                    match status::parse_beads_custom(raw.value.as_deref().unwrap_or("")) {
+                        Ok(list) => export.status_custom = list,
+                        Err(err) => export.problems.push(Problem {
+                            line: n,
+                            id: None,
+                            what: format!("status.custom: {err:#}"),
+                        }),
+                    }
+                }
+            }
             Some(other) => export.problems.push(Problem {
                 line: n,
                 id: None,
@@ -338,7 +361,9 @@ fn resolve(raw: Vec<(usize, RawIssue)>, export: &mut Export) {
             note(format!("unknown issue type {k:?}"));
         }
         if let Status::Other(s) = &r.status {
-            note(format!("unknown status {s:?}"));
+            if !status::known_beads_status(s, &export.status_custom) {
+                note(format!("unknown status {s:?}"));
+            }
         }
         let priority = match u8::try_from(r.priority) {
             Ok(p) if p <= 4 => p,

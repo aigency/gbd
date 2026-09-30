@@ -141,7 +141,7 @@ pub enum Commands {
         id: String,
         #[arg(long)]
         claim: bool,
-        /// ready, `in_progress`, deferred, or done
+        /// Built-in (`ready`, `in_progress`, `deferred`, `done`) or a custom name from `.gbd.yml`
         #[arg(long)]
         status: Option<String>,
         /// P0–P4 or 0–4
@@ -400,6 +400,7 @@ impl Ctx {
         Scope {
             project: self.cfg.project_number(),
             owner: self.repo.owner(),
+            customs: &self.cfg.statuses,
         }
     }
 
@@ -608,7 +609,10 @@ fn dispatch(cli: Cli) -> Result<u8> {
             let ctx = Ctx::open(explicit, json)?;
             let cutoff = fields::days_ago(days);
             let q = format!("{} is:open updated:<{cutoff}", ctx.search_prefix());
-            cmd_list(&ctx, &q, 50, true)
+            let issues = issue::search_where(&q, 50, ctx.scope(), |i| {
+                !crate::status::parked(i.status.as_deref(), i.deferred, &ctx.cfg.statuses)
+            })?;
+            Ok(show_issues(&ctx, &issues, true))
         }
         Commands::Blocked => cmd_blocked(&Ctx::open(explicit, json)?),
         Commands::Import {
@@ -723,7 +727,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                         b
                     })
                     .collect();
-                if let Err(err) = reconcile_each(board, &freed, &mut moved) {
+                if let Err(err) = reconcile_each(board, &freed, &ctx.cfg.statuses, &mut moved) {
                     eprintln!("warning: board not reconciled: {err:#}. Run: gbd board sync");
                 }
             }
@@ -894,28 +898,57 @@ fn ping(json: bool) -> u8 {
 }
 
 fn statuses(json: bool) -> u8 {
+    let customs = config::load().map(|c| c.statuses).unwrap_or_default();
     let rows = [
         (
-            "open",
-            "issue open, board Ready (or unassigned without a board)",
+            "ready",
+            "active",
+            "board Ready (or unassigned without a board)",
         ),
         (
             "in_progress",
+            "wip",
             "board In Progress (or assigned without a board)",
         ),
         (
             "blocked",
-            "open with an open blocker (GitHub is:blocked); board Blocked, kept by gbd",
+            "wip",
+            "derived from an open blocker; board Blocked, never set by hand",
         ),
-        ("deferred", "board Deferred, or Start date in the future"),
-        ("closed", "issue closed; board Done"),
+        (
+            "deferred",
+            "frozen",
+            "board Deferred, or Start date in the future",
+        ),
+        ("done", "done", "issue closed; board Done"),
     ];
     if json {
-        let map: BTreeMap<_, _> = rows.iter().copied().collect();
-        println!("{}", serde_json::to_string_pretty(&map).unwrap());
+        let builtin: Vec<Value> = rows
+            .iter()
+            .map(|(name, category, about)| json!({ "name": name, "category": category, "about": about }))
+            .collect();
+        let custom: Vec<Value> = customs
+            .iter()
+            .map(|c| {
+                json!({
+                    "name": c.name,
+                    "column": crate::status::title_case(&c.name),
+                    "category": c.category.as_str(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "builtin": builtin, "custom": custom })).unwrap()
+        );
     } else {
-        for (k, v) in rows {
-            println!("{k:<12} {v}");
+        for (k, category, v) in rows {
+            println!("{k:<12} [{category:<6}] {v}");
+        }
+        if customs.is_empty() {
+            println!("custom: none (`gbd config set status.custom \"name:category,…\"`)");
+        } else {
+            println!("{}", crate::status::vocabulary(&customs));
         }
     }
     0
@@ -1107,7 +1140,8 @@ fn cmd_create(ctx: &Ctx, args: &CreateArgs) -> Result<u8> {
                 }
             };
             if let Some(d) = &detail {
-                if let Err(err) = reconcile_each(&board, &d.blocking, &mut moved) {
+                if let Err(err) = reconcile_each(&board, &d.blocking, &ctx.cfg.statuses, &mut moved)
+                {
                     warnings.push(format!(
                         "blocked cards not moved (gbd board sync places them): {err:#}"
                     ));
@@ -1161,6 +1195,10 @@ fn cmd_show(ctx: &Ctx, id: &str) -> Result<u8> {
 
 fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
     let issues = issue::search(query, limit, ctx.scope())?;
+    Ok(show_issues(ctx, &issues, flat))
+}
+
+fn show_issues(ctx: &Ctx, issues: &[Issue], flat: bool) -> u8 {
     ctx.emit(&issues, || {
         if issues.is_empty() {
             return "no issues".into();
@@ -1172,10 +1210,10 @@ fn cmd_list(ctx: &Ctx, query: &str, limit: usize, flat: bool) -> Result<u8> {
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
-            render::tree(&issues)
+            render::tree(issues)
         }
     });
-    Ok(0)
+    0
 }
 
 /// Beads → GitHub, planned in memory first. Only the plan exists so far:
@@ -1199,7 +1237,8 @@ fn cmd_import(
     });
     let mapping = mapping.as_path();
     let export = beads::load(from_beads)?;
-    let mut plan = import::plan(&export);
+    let gbd_statuses = config::load()?.statuses;
+    let mut plan = import::plan_configured(&export, &gbd_statuses);
     let done = import::read_mapping(mapping)?;
     let logins = import::assignee_map(assignees)?;
     // The names as the export has them, for the preflight's messages; only
@@ -2257,19 +2296,22 @@ impl Run<'_> {
         if matches!(state, import::State::Open) {
             self.open_beads.insert(item.bead.clone());
         }
-        let mut status = match (&state, &item.state, item.status) {
-            (import::State::Closed { .. }, _, _) => Some(project::STATUS_DONE),
+        let mut status = match (&state, &item.state, item.status.as_str()) {
+            (import::State::Closed { .. }, _, _) => Some(project::STATUS_DONE.to_string()),
             // The close failed: the issue is open, so no card rather than Done.
             (import::State::Open, import::State::Closed { .. }, _) => None,
             (import::State::Open, _, project::STATUS_READY | project::STATUS_BLOCKED) => {
                 let blocked = item.blocked_by.iter().any(|b| self.open_beads.contains(b));
-                Some(if blocked {
-                    project::STATUS_BLOCKED
-                } else {
-                    project::STATUS_READY
-                })
+                Some(
+                    if blocked {
+                        project::STATUS_BLOCKED
+                    } else {
+                        project::STATUS_READY
+                    }
+                    .to_string(),
+                )
             }
-            (import::State::Open, _, planned) => Some(planned),
+            (import::State::Open, _, planned) => Some(planned.to_string()),
         };
         if let Some(unsure) = item
             .blocked_by
@@ -2281,7 +2323,7 @@ impl Run<'_> {
                 format!("placed against {unsure}, whose state could not be read; run gbd import again to settle it"),
             );
         }
-        if let Some(s) = status {
+        if let Some(s) = status.as_deref() {
             if let Err(err) = self.board.set_status(&t.url, s) {
                 warn(
                     &mut warnings,
@@ -2632,7 +2674,7 @@ struct ReadyArgs {
 
 fn cmd_ready(ctx: &Ctx, a: &ReadyArgs) -> Result<u8> {
     let issues = issue::snapshot(&ctx.repo, ctx.scope())?;
-    let mut items = ready::rank(&issues, &a.rank);
+    let mut items = ready::rank_with(&issues, &a.rank, &ctx.cfg.statuses);
     items.truncate(a.limit);
     if a.claim {
         let Some(top) = items.first() else {
@@ -2758,7 +2800,8 @@ fn card_done_or_reopen(t: &Target, board: Option<&Board>) -> Result<Option<Strin
 /// Ready and Blocked.
 type Moves = Vec<(u64, &'static str)>;
 
-/// Ready, or Blocked while GitHub counts an open blocker.
+/// Ready, or Blocked while GitHub counts an open blocker. New cards and a
+/// release from Blocked use this; a custom active column is not remembered.
 fn ready_or_blocked(i: &Issue) -> &'static str {
     if i.directly_blocked() {
         project::STATUS_BLOCKED
@@ -2778,14 +2821,27 @@ fn release_card(ctx: &Ctx, t: &Target, board: Option<&Board>) -> Result<Option<S
     t.set_board_status(Some(board), ready_or_blocked(&d.issue))
 }
 
-/// Blocked ⇄ Ready for one card, from GitHub's open-blocker count. Only
-/// those two statuses move: In Progress, Deferred, and Done were someone's
-/// decision, and an issue that is not on the board is `board sync`'s job.
-fn reconcile_card(board: &Board, i: &Issue) -> Result<Option<&'static str>> {
-    let want = ready_or_blocked(i);
-    let movable = i.is_open()
-        && (i.has_status(project::STATUS_READY) || i.has_status(project::STATUS_BLOCKED));
-    if !movable || i.has_status(want) {
+/// Blocked ⇄ Ready for one card, from GitHub's open-blocker count. An
+/// `active` column (Ready or a custom) with an open blocker moves to
+/// Blocked; Blocked with none moves to Ready. The previous column is not
+/// remembered. `wip`, `frozen`, and `done` stay put, and an issue that is
+/// not on the board is `board sync`'s job.
+fn reconcile_card(
+    board: &Board,
+    i: &Issue,
+    customs: &[crate::status::CustomStatus],
+) -> Result<Option<&'static str>> {
+    if !i.is_open() {
+        return Ok(None);
+    }
+    let Some(current) = i.status.as_deref() else {
+        return Ok(None);
+    };
+    let Some(want) = crate::status::blocker_destination(current, i.directly_blocked(), customs)
+    else {
+        return Ok(None);
+    };
+    if current.eq_ignore_ascii_case(want) {
         return Ok(None);
     }
     board.set_status(&i.url, want)?;
@@ -2806,6 +2862,7 @@ fn reconcile_cards(ctx: &Ctx, t: &Target, board: Option<&Board>) -> Moves {
         reconcile_each(
             board,
             std::iter::once(&d.issue).chain(&d.blocking),
+            &ctx.cfg.statuses,
             &mut moved,
         )
     });
@@ -2820,10 +2877,11 @@ fn reconcile_cards(ctx: &Ctx, t: &Target, board: Option<&Board>) -> Moves {
 fn reconcile_each<'a>(
     board: &Board,
     issues: impl IntoIterator<Item = &'a Issue>,
+    customs: &[crate::status::CustomStatus],
     moved: &mut Moves,
 ) -> Result<()> {
     for i in issues {
-        if let Some(status) = reconcile_card(board, i)? {
+        if let Some(status) = reconcile_card(board, i, customs)? {
             moved.push((i.number, status));
         }
     }
@@ -2860,7 +2918,11 @@ struct UpdateArgs {
 fn cmd_update(ctx: &Ctx, id: &str, a: &UpdateArgs) -> Result<u8> {
     let t = ctx.target(id)?;
     let rank = a.priority.as_deref().map(fields::parse_rank).transpose()?;
-    let wanted = a.status.as_deref().map(project::status_for).transpose()?;
+    let wanted = a
+        .status
+        .as_deref()
+        .map(|w| crate::status::resolve(w, &ctx.cfg.statuses))
+        .transpose()?;
     if a.claim && wanted.is_some() {
         bail!("--claim already sets the status; drop --status");
     }
@@ -2899,9 +2961,12 @@ fn cmd_update(ctx: &Ctx, id: &str, a: &UpdateArgs) -> Result<u8> {
         changed.push("priority".into());
     }
     let mut moved = Vec::new();
-    if let Some(s) = wanted {
+    if let Some(s) = &wanted {
         (status, moved) = set_status(ctx, &t, s)?;
-        changed.push(format!("status {}", status.as_deref().unwrap_or(s)));
+        changed.push(format!(
+            "status {}",
+            status.as_deref().unwrap_or(s.column.as_str())
+        ));
     }
     if changed.is_empty() {
         bail!("nothing to update; see gbd update --help");
@@ -2974,29 +3039,50 @@ fn cmd_undefer(ctx: &Ctx, ids: &[String]) -> Result<u8> {
 /// a board, the card moves and assignees are untouched (ownership is
 /// `--claim`'s job). Without one, the assignee is the only in-progress
 /// signal, so it is set or cleared.
-fn set_status(ctx: &Ctx, t: &Target, status: &str) -> Result<(Option<String>, Moves)> {
+fn set_status(
+    ctx: &Ctx,
+    t: &Target,
+    resolved: &crate::status::Resolved,
+) -> Result<(Option<String>, Moves)> {
     let board = ctx.board()?;
-    match (status, board.is_none()) {
-        (project::STATUS_DONE, _) => {
-            t.gh_issue("close", &["--reason", "completed"])?;
-            let card = t.set_board_status(board.as_ref(), status)?;
-            return Ok((card, reconcile_cards(ctx, t, board.as_ref())));
-        }
-        (project::STATUS_IN_PROGRESS, true) => {
-            t.edit(&["--add-assignee", "@me"])?;
-        }
-        (project::STATUS_READY, true) => {
-            let _ = t.edit(&["--remove-assignee", "@me"]);
-        }
-        (project::STATUS_READY, false) => {
-            return Ok((release_card(ctx, t, board.as_ref())?, Vec::new()));
-        }
-        (project::STATUS_DEFERRED, true) => {
-            bail!("deferred needs a board (.gbd.yml project:) or a date: gbd defer {} --until tomorrow", t.number);
-        }
-        _ => {}
+    let column = resolved.column.as_str();
+    if resolved.category == crate::status::Category::Done {
+        t.gh_issue("close", &["--reason", "completed"])?;
+        let card = t.set_board_status(board.as_ref(), column)?;
+        return Ok((card, reconcile_cards(ctx, t, board.as_ref())));
     }
-    Ok((t.set_board_status(board.as_ref(), status)?, Vec::new()))
+    if board.is_none() {
+        if column == project::STATUS_IN_PROGRESS {
+            t.edit(&["--add-assignee", "@me"])?;
+            return Ok((None, Vec::new()));
+        }
+        if column == project::STATUS_READY {
+            let _ = t.edit(&["--remove-assignee", "@me"]);
+            return Ok((None, Vec::new()));
+        }
+        if column == project::STATUS_DEFERRED {
+            bail!(
+                "deferred needs a board (.gbd.yml project:) or a date: gbd defer {} --until tomorrow",
+                t.number
+            );
+        }
+        bail!(
+            "{column} needs a board (.gbd.yml project:); without one, only ready, in_progress, and done can be set"
+        );
+    }
+    // Ready, and a custom `active` column, cannot display a card that still
+    // has an open blocker: that card is Blocked. The custom is not
+    // remembered. `wip`, `frozen`, and `done` are set as named.
+    if resolved.category == crate::status::Category::Active {
+        let d = t.fetch(ctx.scope())?;
+        let place = if d.issue.directly_blocked() {
+            project::STATUS_BLOCKED
+        } else {
+            column
+        };
+        return Ok((t.set_board_status(board.as_ref(), place)?, Vec::new()));
+    }
+    Ok((t.set_board_status(board.as_ref(), column)?, Vec::new()))
 }
 
 fn cmd_close(ctx: &Ctx, id: &str, reason: &str) -> Result<u8> {
@@ -3384,7 +3470,7 @@ fn cmd_memories(ctx: &Ctx, search: Option<&str>) -> Result<u8> {
 
 fn cmd_prime(ctx: &Ctx, limit: usize) -> Result<u8> {
     let issues = issue::snapshot(&ctx.repo, ctx.scope())?;
-    let ready: Vec<_> = ready::rank(&issues, &RankOpts::default())
+    let ready: Vec<_> = ready::rank_with(&issues, &RankOpts::default(), &ctx.cfg.statuses)
         .into_iter()
         .take(limit)
         .collect();
@@ -3400,6 +3486,7 @@ fn cmd_prime(ctx: &Ctx, limit: usize) -> Result<u8> {
         &json!({
             "workflow": "gbd ready → gbd show <n> → gbd update <n> --claim → gbd close <n>",
             "memories": memories,
+            "statuses": crate::status::vocabulary(&ctx.cfg.statuses),
             "ready": ready,
             "assigned_to_me": mine,
         }),
@@ -3408,6 +3495,9 @@ fn cmd_prime(ctx: &Ctx, limit: usize) -> Result<u8> {
             out.push_str("gbd ready → gbd show <n> → gbd update <n> --claim → gbd close <n>\n");
             out.push_str("gbd create \"…\" -t Task -p 1 --parent 88 --deps 12\n");
             out.push_str("gbd remember \"insight\"\n\n");
+            out.push_str("## Statuses\n\n");
+            out.push_str(&crate::status::vocabulary(&ctx.cfg.statuses));
+            out.push('\n');
             let _ = write!(out, "## Persistent Memories ({})\n\n", memories.len());
             out.push_str(
                 "Stored via `gbd remember`. Update with `gbd remember --key <key> \"…\"`.\n\n",
@@ -3455,24 +3545,122 @@ fn cmd_status(ctx: &Ctx) -> Result<u8> {
         .iter()
         .filter(|i| i.assignees.iter().any(|a| a == &me))
         .count();
-    let ready = ready::rank(&issues, &RankOpts::default()).len();
+    let ready = ready::rank_with(&issues, &RankOpts::default(), &ctx.cfg.statuses).len();
     let closed_week = issue::count(&format!(
         "{} is:closed closed:>={}",
         ctx.search_prefix(),
         fields::days_ago(7)
     ))?;
+    let (categories, uncategorized) = category_counts(&work, &ctx.cfg.statuses);
     ctx.emit(
         &json!({
             "open": open, "ready": ready, "blocked": blocked, "in_progress": in_progress,
             "deferred": deferred, "assigned_to_me": mine, "closed_last_7d": closed_week,
+            "categories": categories, "uncategorized": uncategorized,
         }),
         || {
-            format!(
+            let mut out = String::new();
+            for cat in [
+                crate::status::Category::Active,
+                crate::status::Category::Wip,
+                crate::status::Category::Frozen,
+                crate::status::Category::Done,
+            ] {
+                let row = &categories[cat.as_str()];
+                let _ = writeln!(out, "{cat} {}", row["count"]);
+                if let Some(cols) = row["columns"].as_array() {
+                    for col in cols {
+                        let _ = writeln!(
+                            out,
+                            "  {} {}",
+                            col["name"].as_str().unwrap_or(""),
+                            col["count"]
+                        );
+                    }
+                }
+            }
+            if !uncategorized.is_empty() {
+                let _ = writeln!(out, "uncategorized {}", uncategorized.len());
+                for (name, n) in &uncategorized {
+                    let _ = writeln!(out, "  {name} {n}");
+                }
+            }
+            let _ = write!(
+                out,
                 "open {open}  ready {ready}  blocked {blocked}  in-progress {in_progress}  deferred {deferred}  assigned-to-me {mine}  closed-last-7d {closed_week}"
-            )
+            );
+            out
         },
     );
     Ok(0)
+}
+
+/// Per-category counts with one row per column. A card with a Status uses
+/// that column. With no board, an assignee is In Progress, a future Start
+/// date is Deferred, an open blocker is Blocked, and the rest are Ready.
+fn category_counts(
+    work: &[&Issue],
+    customs: &[crate::status::CustomStatus],
+) -> (serde_json::Map<String, Value>, BTreeMap<String, usize>) {
+    use crate::status::Category;
+    let mut cols: Vec<(Category, String, usize)> = crate::status::column_order(customs)
+        .into_iter()
+        .filter_map(|c| crate::status::category_of(&c.name, customs).map(|cat| (cat, c.name, 0)))
+        .collect();
+    let mut uncategorized: BTreeMap<String, usize> = BTreeMap::new();
+    for i in work {
+        if let Some(s) = &i.status {
+            match crate::status::category_of(s, customs) {
+                Some(cat) => {
+                    if let Some(slot) = cols
+                        .iter_mut()
+                        .find(|(c, n, _)| *c == cat && crate::status::same_column(n, s))
+                    {
+                        slot.2 += 1;
+                    } else {
+                        cols.push((cat, s.clone(), 1));
+                    }
+                }
+                None => *uncategorized.entry(s.clone()).or_insert(0) += 1,
+            }
+            continue;
+        }
+        let (_cat, name) = if i.deferred {
+            (Category::Frozen, project::STATUS_DEFERRED)
+        } else if !i.assignees.is_empty() {
+            (Category::Wip, project::STATUS_IN_PROGRESS)
+        } else if i.directly_blocked() {
+            (Category::Wip, project::STATUS_BLOCKED)
+        } else {
+            (Category::Active, project::STATUS_READY)
+        };
+        if let Some(slot) = cols.iter_mut().find(|(_, n, _)| n == name) {
+            slot.2 += 1;
+        }
+    }
+    let mut categories = serde_json::Map::new();
+    for cat in [
+        Category::Active,
+        Category::Wip,
+        Category::Frozen,
+        Category::Done,
+    ] {
+        let columns: Vec<Value> = cols
+            .iter()
+            .filter(|(c, _, _)| *c == cat)
+            .map(|(_, name, n)| json!({ "name": name, "count": n, "category": cat.as_str() }))
+            .collect();
+        let count: usize = columns
+            .iter()
+            .filter_map(|c| c["count"].as_u64())
+            .map(|n| usize::try_from(n).unwrap_or(0))
+            .sum();
+        categories.insert(
+            cat.as_str().into(),
+            json!({ "count": count, "columns": columns }),
+        );
+    }
+    (categories, uncategorized)
 }
 
 /// The board's own item list (so Done shows), with open rows enriched from
@@ -3481,7 +3669,14 @@ fn cmd_board(ctx: &Ctx) -> Result<u8> {
     let Some(board) = ctx.board()? else {
         bail!("no board configured. Run `gbd init` (creates one) or `gbd config set project <number>`");
     };
-    let items = board.items()?;
+    let mut items = board.items()?;
+    for it in &mut items {
+        it.category = it
+            .status
+            .as_deref()
+            .and_then(|s| crate::status::category_of(s, &ctx.cfg.statuses))
+            .map(|c| c.as_str().to_string());
+    }
     let open = issue::snapshot(&ctx.repo, ctx.scope())?;
     let by_number: BTreeMap<u64, &Issue> = open.iter().map(|i| (i.number, i)).collect();
     let mut by_status: BTreeMap<String, Vec<&project::BoardItem>> = BTreeMap::new();
@@ -3491,13 +3686,13 @@ fn cmd_board(ctx: &Ctx) -> Result<u8> {
             .or_default()
             .push(it);
     }
-    // The board's column order.
-    let order: Vec<&str> = project::STATUSES.iter().map(|(n, _)| *n).collect();
+    // Built-ins and customs, then any other column the board still has.
+    let order = crate::status::column_order(&ctx.cfg.statuses);
     let mut keys: Vec<&String> = by_status.keys().collect();
     keys.sort_by_key(|k| {
         order
             .iter()
-            .position(|o| o.eq_ignore_ascii_case(k))
+            .position(|o| crate::status::same_column(k, &o.name))
             .unwrap_or(order.len())
     });
     let here = ctx.repo.name_with_owner.as_str();
@@ -3516,7 +3711,11 @@ fn cmd_board(ctx: &Ctx) -> Result<u8> {
     ctx.emit(
         &json!({
             "number": board.number, "title": board.title, "url": board.url,
-            "statuses": board.status_options.iter().map(|o| &o.name).collect::<Vec<_>>(),
+            "statuses": board.status_options.iter().map(|o| json!({
+                "name": o.name,
+                "category": crate::status::category_of(&o.name, &ctx.cfg.statuses)
+                    .map(crate::status::Category::as_str),
+            })).collect::<Vec<_>>(),
             "items": items,
         }),
         || {
@@ -3539,14 +3738,17 @@ fn cmd_board(ctx: &Ctx) -> Result<u8> {
     Ok(0)
 }
 
-/// Put every open work issue on the board and make Ready ⇄ Blocked agree
-/// with GitHub's open-blocker counts. Cards that are In Progress, Deferred,
-/// or Done are left alone. New cards become In Progress if assigned (the
-/// pre-board convention), else Blocked or Ready.
+/// Put every open work issue on the board and make active columns agree
+/// with GitHub's open-blocker counts. An `active` card with an open blocker
+/// moves to Blocked; Blocked with none moves to Ready. `wip`, `frozen`, and
+/// `done` cards are left alone. New cards become In Progress if assigned
+/// (the pre-board convention), else Blocked or Ready. Configured custom
+/// columns are created here, the same way `gbd init` creates them.
 fn cmd_board_sync(ctx: &Ctx) -> Result<u8> {
-    let Some(board) = ctx.board()? else {
+    let Some(mut board) = ctx.board()? else {
         bail!("no board configured. Run `gbd init` (creates one) or `gbd config set project <number>`");
     };
+    board.ensure_statuses(false, &ctx.cfg.statuses)?;
     // An org project can hold several repos' issues; numbers collide.
     let on_board: BTreeMap<u64, Option<String>> = board
         .items()?
@@ -3555,30 +3757,30 @@ fn cmd_board_sync(ctx: &Ctx) -> Result<u8> {
         .filter_map(|it| it.number.map(|n| (n, it.status)))
         .collect();
     let open = issue::snapshot(&ctx.repo, ctx.scope())?;
-    let mut added: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-    let mut moved: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    let mut added: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut moved: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut unchanged = 0usize;
     for i in open.iter().filter(|i| !i.memory) {
         let current = on_board.get(&i.number).and_then(Option::as_deref);
         let want = match current {
-            None if !i.assignees.is_empty() => project::STATUS_IN_PROGRESS,
-            None => ready_or_blocked(i),
-            Some(s)
-                if s.eq_ignore_ascii_case(project::STATUS_READY)
-                    || s.eq_ignore_ascii_case(project::STATUS_BLOCKED) =>
-            {
-                ready_or_blocked(i)
-            }
-            Some(_) => {
-                unchanged += 1;
-                continue;
+            None if !i.assignees.is_empty() => project::STATUS_IN_PROGRESS.to_string(),
+            None => ready_or_blocked(i).to_string(),
+            Some(s) => {
+                if let Some(dest) =
+                    crate::status::blocker_destination(s, i.directly_blocked(), &ctx.cfg.statuses)
+                {
+                    dest.to_string()
+                } else {
+                    unchanged += 1;
+                    continue;
+                }
             }
         };
-        if current.is_some_and(|s| s.eq_ignore_ascii_case(want)) {
+        if current.is_some_and(|s| s.eq_ignore_ascii_case(&want)) {
             unchanged += 1;
             continue;
         }
-        board.set_status(&i.url, want)?;
+        board.set_status(&i.url, &want)?;
         let bucket = if current.is_some() {
             &mut moved
         } else {
@@ -3610,7 +3812,7 @@ fn cmd_board_sync(ctx: &Ctx) -> Result<u8> {
 }
 
 /// `#5 #6 as Ready, #9 as Blocked`
-fn group_text(groups: &BTreeMap<&str, Vec<u64>>, joiner: &str) -> String {
+fn group_text(groups: &BTreeMap<String, Vec<u64>>, joiner: &str) -> String {
     groups
         .iter()
         .map(|(status, nums)| {
@@ -3634,7 +3836,12 @@ fn cmd_config(cmd: ConfigCmd, json: bool) -> Result<u8> {
                     "project" => {
                         println!("{}", cfg.project.map(|p| p.to_string()).unwrap_or_default());
                     }
-                    other => bail!("unknown key {other}"),
+                    "status.custom" => {
+                        println!("{}", crate::status::custom_list_string(&cfg.statuses));
+                    }
+                    other => bail!(
+                        "unknown key {other}; known: repo, memory_issue, project, status.custom"
+                    ),
                 }
             } else {
                 print!("{}", cfg.render());
@@ -3658,7 +3865,12 @@ fn cmd_config(cmd: ConfigCmd, json: bool) -> Result<u8> {
                             .context("project must be the board's number")?,
                     );
                 }
-                other => bail!("unknown key {other}"),
+                "status.custom" => {
+                    cfg.statuses = crate::status::parse_custom_list(&value)?;
+                }
+                other => {
+                    bail!("unknown key {other}; known: repo, memory_issue, project, status.custom")
+                }
             }
             cfg.save_to(&path)?;
             if json {

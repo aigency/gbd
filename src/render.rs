@@ -176,7 +176,12 @@ pub fn show(d: &Detail) -> String {
         meta.push(format!("Type: {t}"));
     }
     if let Some(s) = &i.status {
-        meta.push(format!("Status: {s}"));
+        let cat = i
+            .category
+            .as_deref()
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
+        meta.push(format!("Status: {s}{cat}"));
     }
     if let Some(sd) = &i.start_date {
         meta.push(format!("Start date: {sd}"));
@@ -255,6 +260,7 @@ mod tests {
             deferred: false,
             memory: false,
             status: None,
+            category: None,
         }
     }
 

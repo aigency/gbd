@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::status::{self, CustomStatus};
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
@@ -15,6 +17,9 @@ pub struct Config {
     /// GitHub Project number under the repo's owner (the board).
     #[serde(default)]
     pub project: Option<u64>,
+    /// Custom board columns, in config order, each with a Beads category.
+    #[serde(default)]
+    pub statuses: Vec<CustomStatus>,
 }
 
 impl Config {
@@ -24,16 +29,40 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let mut cfg = Config::default();
-        for line in text.lines() {
-            let line = line.trim();
+        let mut in_statuses = false;
+        for raw in text.lines() {
+            let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            let indented = raw.starts_with([' ', '\t']);
+            if !indented {
+                in_statuses = false;
+            }
             let Some((k, v)) = line.split_once(':') else {
+                if in_statuses {
+                    anyhow::bail!("status line {line:?} must be name: category");
+                }
                 continue;
             };
             let k = k.trim();
             let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !indented && k == "statuses" {
+                if v.is_empty() {
+                    in_statuses = true;
+                } else if let Some(inner) = v.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    cfg.statuses.extend(status::parse_custom_list(inner)?);
+                } else {
+                    anyhow::bail!(
+                        "statuses: must be a map (one `name: category` per indented line) or {{name: category, ...}}"
+                    );
+                }
+                continue;
+            }
+            if indented && in_statuses {
+                cfg.statuses.push(status::parse_one(k, v)?);
+                continue;
+            }
             match k {
                 "repo" if !v.is_empty() && v != "null" => cfg.repo = Some(v.to_string()),
                 "memory_issue" if !v.is_empty() && v != "null" => {
@@ -45,6 +74,7 @@ impl Config {
                 _ => {}
             }
         }
+        status::parse_custom_list(&status::custom_list_string(&cfg.statuses))?;
         Ok(cfg)
     }
 
@@ -58,6 +88,12 @@ impl Config {
         }
         if let Some(p) = self.project {
             let _ = writeln!(out, "project: {p}");
+        }
+        if !self.statuses.is_empty() {
+            out.push_str("statuses:\n");
+            for s in &self.statuses {
+                let _ = writeln!(out, "  {}: {}", s.name, s.category);
+            }
         }
         out
     }
@@ -112,6 +148,7 @@ mod tests {
             repo: Some("acme/widgets".into()),
             memory_issue: Some(7),
             project: None,
+            statuses: vec![status::parse_one("in_review", "wip").unwrap()],
         };
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
@@ -131,6 +168,26 @@ mod tests {
         let err = Config::parse("project: abc\n").unwrap_err();
         assert!(format!("{err:#}").contains("project"), "{err:#}");
         assert!(Config::parse("memory_issue: abc\n").is_err());
+    }
+
+    #[test]
+    fn statuses_round_trip_and_reject_reserved_names() {
+        let cfg = Config::parse(
+            "repo: acme/widgets\nstatuses:\n  triage: active\n  in_review: wip\n  pinned: frozen\n",
+        )
+        .unwrap();
+        assert_eq!(
+            status::custom_list_string(&cfg.statuses),
+            "triage:active,in_review:wip,pinned:frozen"
+        );
+        let again = Config::parse(&cfg.render()).unwrap();
+        assert_eq!(again.statuses, cfg.statuses);
+        let brace = Config::parse("statuses: {triage: active, pinned: frozen}\n").unwrap();
+        assert_eq!(brace.statuses.len(), 2);
+        let err = Config::parse("statuses:\n  blocked: wip\n").unwrap_err();
+        assert!(format!("{err:#}").contains("reserved"), "{err:#}");
+        let err = Config::parse("statuses:\n  triage: active\n  triage: frozen\n").unwrap_err();
+        assert!(format!("{err:#}").contains("twice"), "{err:#}");
     }
 
     #[test]
