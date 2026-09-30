@@ -460,6 +460,58 @@ pub fn search(q: &str, limit: usize, scope: Scope<'_>) -> Result<Vec<Issue>> {
     Ok(all)
 }
 
+/// Like [`search`], but keep paging until `limit` issues pass `keep` or the
+/// search runs out. Callers that drop rows after the fact (frozen cards in
+/// `gbd stale`) would otherwise fill the cap with issues they then discard
+/// and never see the later pages. Scanning stops at 5000 nodes, the same
+/// bound as [`snapshot`](crate::issue::snapshot).
+pub fn search_where(
+    q: &str,
+    limit: usize,
+    scope: Scope<'_>,
+    keep: impl Fn(&Issue) -> bool,
+) -> Result<Vec<Issue>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query = search_query(scope.project.is_some());
+    let today = fields::today_utc();
+    let mut kept = Vec::new();
+    let mut scanned = 0usize;
+    let mut cursor: Option<String> = None;
+    let mut capped = false;
+    loop {
+        let first = (limit - kept.len()).min(100).to_string();
+        let mut vars: Vec<(&str, &str)> = vec![("q", q), ("first", &first)];
+        if let Some(c) = &cursor {
+            vars.push(("cursor", c));
+        }
+        let data = gh::graphql(&query, &vars)?;
+        let (page, next) = page(&data, &["data", "search"], scope, &today)?;
+        if page.is_empty() {
+            break;
+        }
+        scanned += page.len();
+        kept.extend(page.into_iter().filter(|i| keep(i)));
+        if next.is_some() && next == cursor {
+            bail!("pagination did not advance (cursor {next:?} repeated)");
+        }
+        cursor = next;
+        if cursor.is_none() || kept.len() >= limit {
+            break;
+        }
+        if scanned >= 5000 {
+            capped = true;
+            break;
+        }
+    }
+    if capped {
+        eprintln!("warning: stopped after scanning {scanned} issues; more may match");
+    }
+    kept.truncate(limit);
+    Ok(kept)
+}
+
 pub fn fetch(repo: &Repo, number: u64, scope: Scope<'_>) -> Result<Detail> {
     let query = detail_query(scope.project.is_some());
     let n = number.to_string();

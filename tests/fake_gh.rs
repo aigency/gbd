@@ -4275,6 +4275,87 @@ fn board_sync_adds_a_wip_column_between_in_progress_and_done() {
 }
 
 #[test]
+fn update_status_active_custom_with_a_blocker_lands_on_blocked() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 1, Some("Deferred"), "")),
+    );
+    h.gbd()
+        .args(["update", "12", "--status", "triage"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated #12 (status Blocked)"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--single-select-option-id O_blocked"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("O_ready"),
+        "an open blocker does not land on Ready: {calls}"
+    );
+
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    fs::write(
+        h.gh_dir.path().join("pfields.out"),
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_blocked","name":"Blocked"},{"id":"O_def","name":"Deferred"},{"id":"O_ready","name":"Ready"},
+            {"id":"O_triage","name":"Triage"},{"id":"O_wip","name":"In Progress"},{"id":"O_done","name":"Done"}]}]}"#,
+    )
+    .unwrap();
+    h.on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Ready"), "")),
+    );
+    h.gbd()
+        .args(["update", "12", "--status", "triage"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status Triage"));
+    assert!(
+        h.calls().contains("--single-select-option-id O_triage"),
+        "{}",
+        h.calls()
+    );
+}
+
+#[test]
+fn stale_pages_past_a_full_page_of_frozen_cards() {
+    let h = Harness::new();
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    let parked = (1..=50)
+        .map(|n| card_node(n, "OPEN", 0, Some("Pinned"), ""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let page1 = format!(
+        r#"{{"data":{{"search":{{"issueCount":51,"pageInfo":{{"hasNextPage":true,"endCursor":"p2"}},"nodes":[{parked}]}}}}}}"#
+    );
+    let page2 = format!(
+        r#"{{"data":{{"search":{{"issueCount":51,"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{}]}}}}}}"#,
+        card_node(99, "OPEN", 0, Some("Ready"), "")
+    );
+    h.on_seq("search", "search(query: $q", &[&page1, &page2]);
+    h.gbd()
+        .args(["stale", "--days", "30"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#99"))
+        .stdout(predicate::str::contains("[Pinned]").not());
+    assert!(
+        h.calls().contains("-F cursor=p2"),
+        "the frozen page must not fill the cap: {}",
+        h.calls()
+    );
+}
+
+#[test]
 fn update_status_custom_moves_the_card() {
     let h = Harness::new();
     board_fixtures(&h);
@@ -4521,4 +4602,19 @@ fn config_set_status_custom_round_trips() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("reserved"));
+    h.gbd()
+        .args(["config", "set", "status.custom", "in__progress:active"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("in_progress"));
+    h.gbd()
+        .args([
+            "config",
+            "set",
+            "status.custom",
+            "in_review:wip,in__review:active",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("in_review"));
 }

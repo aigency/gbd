@@ -184,6 +184,32 @@ pub fn column_order(customs: &[CustomStatus]) -> Vec<OrderedColumn> {
     out
 }
 
+/// Column identity of a config key. Title Case then back to a key collapses
+/// repeated and edge underscores, so `in__review` and `in_review` are one
+/// column (`In  Review` and `In Review` match through [`same_column`]).
+fn column_key(name: &str) -> String {
+    key_form(&title_case(name))
+}
+
+/// Built-in columns, their keys, and the words [`resolve`] already accepts
+/// as those columns (`todo`, `claimed`, `defer`, …).
+fn collides_with_builtin(key: &str) -> bool {
+    const ALIASES: [&str; 4] = ["todo", "inprogress", "claimed", "defer"];
+    if key.is_empty() || RESERVED.contains(&key) || ALIASES.contains(&key) {
+        return true;
+    }
+    let column = title_case(key);
+    [
+        STATUS_READY,
+        STATUS_IN_PROGRESS,
+        STATUS_BLOCKED,
+        STATUS_DEFERRED,
+        STATUS_DONE,
+    ]
+    .iter()
+    .any(|builtin| same_column(&column, builtin))
+}
+
 pub fn parse_one(name: &str, category: &str) -> Result<CustomStatus> {
     let name = name.trim();
     if name.is_empty()
@@ -193,14 +219,27 @@ pub fn parse_one(name: &str, category: &str) -> Result<CustomStatus> {
     {
         bail!("status name {name:?} must match [a-z0-9_]");
     }
-    let name = name.to_string();
-    if RESERVED.contains(&name.as_str()) {
+    let canonical = column_key(name);
+    if canonical.is_empty() {
+        bail!("status name {name:?} is not a column name");
+    }
+    if canonical != name {
+        if collides_with_builtin(&canonical) {
+            bail!(
+                "status name {name:?} matches built-in column {canonical:?}; those names are reserved"
+            );
+        }
+        bail!(
+            "status name {name:?} normalizes to {canonical:?}; use that name so two keys cannot share a column"
+        );
+    }
+    if collides_with_builtin(name) {
         bail!(
             "status name {name:?} is reserved (ready, in_progress, blocked, deferred, done, open, closed)"
         );
     }
     Ok(CustomStatus {
-        name,
+        name: name.to_string(),
         category: Category::parse(category)?,
     })
 }
@@ -208,7 +247,7 @@ pub fn parse_one(name: &str, category: &str) -> Result<CustomStatus> {
 fn ensure_unique(list: &[CustomStatus]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for c in list {
-        if !seen.insert(c.name.as_str()) {
+        if !seen.insert(column_key(&c.name)) {
             bail!("status {:?} is listed twice", c.name);
         }
     }
@@ -493,6 +532,20 @@ mod tests {
         assert!(parse_one("hooked", "wip").is_ok());
         let err = parse_custom_list("triage:active,triage:wip").unwrap_err();
         assert!(format!("{err:#}").contains("twice"), "{err:#}");
+        let collapsed = parse_one("in__progress", "active").unwrap_err();
+        assert!(
+            format!("{collapsed:#}").contains("in_progress"),
+            "{collapsed:#}"
+        );
+        let alias = parse_one("todo", "frozen").unwrap_err();
+        assert!(format!("{alias:#}").contains("reserved"), "{alias:#}");
+        assert!(parse_one("_pinned", "frozen").is_err());
+        assert!(parse_one("pinned_", "frozen").is_err());
+        let shared = parse_custom_list("in_review:wip,in__review:active").unwrap_err();
+        assert!(
+            format!("{shared:#}").contains("in_review"),
+            "two keys, one column: {shared:#}"
+        );
     }
 
     #[test]

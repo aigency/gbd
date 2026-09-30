@@ -609,10 +609,9 @@ fn dispatch(cli: Cli) -> Result<u8> {
             let ctx = Ctx::open(explicit, json)?;
             let cutoff = fields::days_ago(days);
             let q = format!("{} is:open updated:<{cutoff}", ctx.search_prefix());
-            let mut issues = issue::search(&q, 50, ctx.scope())?;
-            issues.retain(|i| {
+            let issues = issue::search_where(&q, 50, ctx.scope(), |i| {
                 !crate::status::parked(i.status.as_deref(), i.deferred, &ctx.cfg.statuses)
-            });
+            })?;
             Ok(show_issues(&ctx, &issues, true))
         }
         Commands::Blocked => cmd_blocked(&Ctx::open(explicit, json)?),
@@ -3071,8 +3070,17 @@ fn set_status(
             "{column} needs a board (.gbd.yml project:); without one, only ready, in_progress, and done can be set"
         );
     }
-    if column == project::STATUS_READY {
-        return Ok((release_card(ctx, t, board.as_ref())?, Vec::new()));
+    // Ready, and a custom `active` column, cannot display a card that still
+    // has an open blocker: that card is Blocked. The custom is not
+    // remembered. `wip`, `frozen`, and `done` are set as named.
+    if resolved.category == crate::status::Category::Active {
+        let d = t.fetch(ctx.scope())?;
+        let place = if d.issue.directly_blocked() {
+            project::STATUS_BLOCKED
+        } else {
+            column
+        };
+        return Ok((t.set_board_status(board.as_ref(), place)?, Vec::new()));
     }
     Ok((t.set_board_status(board.as_ref(), column)?, Vec::new()))
 }

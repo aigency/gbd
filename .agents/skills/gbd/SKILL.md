@@ -46,7 +46,7 @@ One command. Type, priority, parent, blocked-by together:
 
 Built-ins, by category: Ready (`active`), In Progress (`wip`), Blocked (`wip`, derived — not set by hand), Deferred (`frozen`), Done (`done`).
 
-Custom columns are `statuses:` in `.gbd.yml`, or `gbd config set status.custom "name:category,…"`. Categories are `active` (ready work), `wip`, `frozen`, and `done`. Names are lowercase `[a-z0-9_]`. `gbd prime` prints the ones this repo configured, including each column's Title Case name (`in_review` → In Review). `gbd update <n> --status <name>` moves the card. `gbd ready` lists `active` columns only. Removing a name from the config leaves the column on the board.
+Custom columns are `statuses:` in `.gbd.yml`, or `gbd config set status.custom "name:category,…"`. Categories are `active` (ready work), `wip`, `frozen`, and `done`. Names are lowercase `[a-z0-9_]`, and a name that collapses onto another column is rejected (`in__review` is `in_review`; `in__progress` is the built-in In Progress). `gbd prime` prints the ones this repo configured, including each column's Title Case name (`in_review` → In Review). `gbd update <n> --status <name>` moves the card; an `active` name with an open blocker lands on Blocked. `gbd ready` lists `active` columns only. `gbd stale` skips `frozen` columns and keeps paging past them. Removing a name from the config leaves the column on the board.
 
 ## Memories
 
