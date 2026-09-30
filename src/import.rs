@@ -4,9 +4,9 @@
 //!
 //! Mapping, in gbd's data model and never a label: type → issue type,
 //! priority → Priority, `blocks` → dependency, `parent-child` → sub-issue,
-//! `in_progress` → board In Progress, deferred / `defer_until` → board
-//! Deferred + Start date, closed → closed with a reason, notes and
-//! comments → comments.
+//! `related` / `relates-to` → relates-to, `in_progress` → board In
+//! Progress, deferred / `defer_until` → board Deferred + Start date,
+//! closed → closed with a reason, notes and comments → comments.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -100,6 +100,10 @@ pub struct Item {
     pub labels: Vec<String>,
     pub body: String,
     pub comments: Vec<String>,
+    /// Beads ids this issue relates to (`related`, `relates-to`,
+    /// `relates_to`) that are in the export. One GitHub relates-to edge
+    /// per unordered pair; the description does not repeat them.
+    pub relates_to: Vec<String>,
 }
 
 /// Something in the export the plan drops, with the reason.
@@ -163,10 +167,13 @@ fn date_of(ts: &str) -> Option<String> {
     ok.then(|| d.to_string())
 }
 
-/// A relation GitHub cannot hold as an edge, kept in the footer as text.
+/// Footer text for relations that are not a GitHub edge. `related` /
+/// `relates-to` / `relates_to` are omitted here when the other bead is in
+/// the export: those become a relates-to link. A target that is not stays
+/// `Related:`.
 /// Beads kinds map to a label; a kind not listed keeps its own name.
 const RELATIONS: [(&str, &[&str]); 6] = [
-    ("Related", &["related", "relates-to"]),
+    ("Related", &["related", "relates-to", "relates_to"]),
     ("Discovered from", &["discovered-from"]),
     ("Supersedes", &["supersedes"]),
     ("Duplicates", &["duplicates"]),
@@ -183,9 +190,59 @@ fn relation_label(kind: &str) -> String {
     }
 }
 
+fn is_relates_kind(kind: &str) -> bool {
+    matches!(kind, "related" | "relates-to" | "relates_to")
+}
+
+/// Beads this issue relates to that the export actually contains. A target
+/// outside the export cannot become an edge and stays in the footer.
+fn relates_targets(b: &Bead, known: &HashMap<&str, &Bead>) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in &b.other_deps {
+        if is_relates_kind(&e.kind)
+            && e.to != b.id
+            && known.contains_key(e.to.as_str())
+            && !out.contains(&e.to)
+        {
+            out.push(e.to.clone());
+        }
+    }
+    out
+}
+
+/// Unordered bead pair, smaller id first, so both directions are one edge.
+pub fn ordered_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
+/// How many distinct relates-to links the plan will write.
+fn relate_count(items: &[Item]) -> usize {
+    let mut pairs = BTreeSet::new();
+    for item in items {
+        for other in &item.relates_to {
+            pairs.insert(ordered_pair(&item.bead, other));
+        }
+    }
+    pairs.len()
+}
+
+/// A bead still owes a relates-to link: it lists one, and the mapping has
+/// not recorded that those links were written.
+pub fn relate_pending(plan: &Plan, done: &BTreeMap<String, Mapped>) -> bool {
+    plan.items
+        .iter()
+        .any(|i| !i.relates_to.is_empty() && !done.get(&i.bead).is_some_and(|m| m.relates))
+}
+
 /// The footer lines for `b`'s relations: `(label, ids)` in table order,
-/// then any other kind by name, ids unique and in file order.
-fn relation_lines(b: &Bead) -> Vec<(String, Vec<String>)> {
+/// then any other kind by name, ids unique and in file order. `edged` are
+/// relates-to targets that will be a real link, so they are not repeated
+/// as text.
+fn relation_lines(b: &Bead, edged: &[String]) -> Vec<(String, Vec<String>)> {
     let mut lines: Vec<(String, Vec<String>)> = Vec::new();
     let mut add = |label: String, id: &str| {
         let at = if let Some(at) = lines.iter().position(|(l, _)| *l == label) {
@@ -199,19 +256,22 @@ fn relation_lines(b: &Bead) -> Vec<(String, Vec<String>)> {
             ids.push(id.to_string());
         }
     };
+    let in_footer =
+        |e: &beads::Edge| !(is_relates_kind(&e.kind) && edged.iter().any(|id| id == &e.to));
     for (label, kinds) in RELATIONS {
         for e in b
             .other_deps
             .iter()
-            .filter(|e| kinds.contains(&e.kind.as_str()))
+            .filter(|e| kinds.contains(&e.kind.as_str()) && in_footer(e))
         {
             add(label.to_string(), &e.to);
         }
     }
     for e in &b.other_deps {
-        if !RELATIONS
-            .iter()
-            .any(|(_, kinds)| kinds.contains(&e.kind.as_str()))
+        if in_footer(e)
+            && !RELATIONS
+                .iter()
+                .any(|(_, kinds)| kinds.contains(&e.kind.as_str()))
         {
             add(relation_label(&e.kind), &e.to);
         }
@@ -222,7 +282,7 @@ fn relation_lines(b: &Bead) -> Vec<(String, Vec<String>)> {
 /// An edge the plan could not keep: what it was, the id, and why.
 type Dropped = (&'static str, String, &'static str);
 
-fn body_of(b: &Bead, dropped: &[Dropped]) -> String {
+fn body_of(b: &Bead, dropped: &[Dropped], edged: &[String]) -> String {
     let mut body = b.description.trim_end().to_string();
     for (heading, text) in [
         ("Design", &b.design),
@@ -279,7 +339,7 @@ fn body_of(b: &Bead, dropped: &[Dropped]) -> String {
     // Relations GitHub has no edge for, and edges it could not have: text
     // here, with the ids rewritten to #n like the rest of the body, so each
     // is a link and a cross-reference on the other issue.
-    for (label, ids) in relation_lines(b) {
+    for (label, ids) in relation_lines(b, edged) {
         let _ = write!(body, " {label}: {}.", ids.join(", "));
     }
     let mut noted: Vec<(String, Vec<&str>)> = Vec::new();
@@ -565,7 +625,14 @@ pub fn plan(export: &Export) -> Plan {
             dropped.push(("Parent", target.clone(), SUB_ISSUE_CAP_WHY));
             false
         });
-        relations += b.other_deps.len();
+        let relates_to = relates_targets(b, &by_id);
+        // A relates-to target in the export is an edge, not footer text.
+        let edged = b
+            .other_deps
+            .iter()
+            .filter(|e| is_relates_kind(&e.kind) && relates_to.iter().any(|id| id == &e.to))
+            .count();
+        relations += b.other_deps.len() - edged;
         // From the edges that survived, so a card never says Blocked when
         // the issue behind it has no blocker.
         let open_blocker = blocked_by
@@ -602,8 +669,9 @@ pub fn plan(export: &Export) -> Plan {
             status: board_status(b, open_blocker),
             start_date,
             labels: b.labels.clone(),
-            body: body_of(b, &dropped),
+            body: body_of(b, &dropped, &relates_to),
             comments: comments_of(b),
+            relates_to,
         });
         done.insert(&b.id);
     }
@@ -668,6 +736,10 @@ pub struct Mapped {
     /// leaves it alone.
     #[serde(default)]
     pub rewritten: bool,
+    /// This bead's relates-to edges have been written. Absent on a line
+    /// from an older gbd, which is not yet done with them.
+    #[serde(default)]
+    pub relates: bool,
 }
 
 impl Mapped {
@@ -1423,9 +1495,10 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
         .iter()
         .flat_map(|i| i.labels.iter().map(String::as_str))
         .collect();
+    let relates = relate_count(&p.items);
     let _ = writeln!(
         out,
-        "{:<11} {parents} parent links, {blocks} blocked-by",
+        "{:<11} {parents} parent links, {blocks} blocked-by, {relates} relates-to",
         "Edges:"
     );
     let _ = writeln!(
@@ -1462,6 +1535,9 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
         }
         if !i.blocked_by.is_empty() {
             edges.push(format!("blocked by {}", i.blocked_by.join(" ")));
+        }
+        if !i.relates_to.is_empty() {
+            edges.push(format!("relates to {}", i.relates_to.join(" ")));
         }
         let edges = if edges.is_empty() {
             String::new()
@@ -1685,20 +1761,28 @@ mod tests {
         );
         assert!(
             !has("related edge"),
-            "a relation is kept in the footer, not reported: {what:?}"
+            "an in-export relates-to is a link, not reported as dropped: {what:?}"
         );
         assert_eq!(p.skipped.len(), 2, "{what:?}");
         let body = &item(&p, "wx-5").body;
         assert!(
-            body.ends_with(" Related: wx-1. Blocked by (not in the export): wx-9."),
+            body.ends_with(" Blocked by (not in the export): wx-9."),
             "{body}"
         );
+        assert!(
+            !body.contains("Related:"),
+            "wx-1 is in the export, so the link is not footer text: {body}"
+        );
+        assert_eq!(item(&p, "wx-5").relates_to, vec!["wx-1".to_string()]);
         assert!(
             item(&p, "wx-6").body.contains(" Also under: wx-3."),
             "{}",
             item(&p, "wx-6").body
         );
-        assert_eq!(p.relations, 2, "wx-5's related and wx-6's second parent");
+        assert_eq!(
+            p.relations, 1,
+            "wx-6's second parent; wx-5's related is an edge"
+        );
         assert_eq!(p.problems.len(), 6);
     }
 
@@ -2219,6 +2303,7 @@ mod tests {
             phase,
             comments: 0,
             rewritten: false,
+            relates: false,
         };
         let mut m = Mapping::open(&path).unwrap();
         m.record(&rec("a-1", 7, Phase::Created)).unwrap();
@@ -2280,6 +2365,7 @@ mod tests {
             phase: Phase::Created,
             comments: 0,
             rewritten: false,
+            relates: false,
         })
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -2357,7 +2443,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Edges:      2 parent links, 1 blocked-by\n"),
+            text.contains("Edges:      2 parent links, 1 blocked-by, 1 relates-to\n"),
             "{text}"
         );
         assert!(

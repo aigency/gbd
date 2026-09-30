@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- feat(dep): `gbd dep relate` / `gbd dep unrelate` write GitHub's relates-to relationship (Beads `bd dep relate`). `gbd import` writes the same link for `related`, `relates-to`, and `relates_to` when the other issue is in the export, instead of a `Related:` footer line
+
 ## [1.8.6] - 2026-09-14
 
 ### Fixed

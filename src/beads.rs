@@ -7,8 +7,9 @@
 //!
 //! Dependency edges hang off the dependent side: for `blocks`, `issue_id`
 //! is blocked by `depends_on_id`; for `parent-child`, `issue_id` is the
-//! child. Every other kind (`related`, `discovered-from`, `supersedes`, …)
-//! has no GitHub primitive and is kept only for the dry-run report.
+//! child. `related`, `relates-to`, and `relates_to` become GitHub's
+//! relates-to relationship. Every other kind (`discovered-from`,
+//! `supersedes`, …) has no GitHub edge and stays footer text.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -114,9 +115,10 @@ impl fmt::Display for Status {
 /// A dependency edge gbd cannot turn into a GitHub relation. Kept so the
 /// dry run can list what is dropped.
 /// Beads relation kinds GitHub has no edge for; kept as footer text.
-pub const RELATION_KINDS: [&str; 6] = [
+pub const RELATION_KINDS: [&str; 7] = [
     "related",
     "relates-to",
+    "relates_to",
     "discovered-from",
     "supersedes",
     "duplicates",

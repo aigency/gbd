@@ -116,7 +116,7 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 | Command | Does |
 | --- | --- |
 | `create "Title" -t Bug -p 1 --parent 88 --deps 12,13 --blocking 40` | One `gh issue create` carrying type, parent, and both edge lists; Priority and board Status set right after (`--deps` on open issues → Blocked; `--blocking` moves those cards to Blocked). `q` is the same and prints only `repo#n`. |
-| `show <id>` | The issue with fields, parent, children, blocked-by, and blocking, rendered like `bd show`. |
+| `show <id>` | The issue with fields, parent, children, blocked-by, blocking, and relates-to, rendered like `bd show`. |
 | `list [--state open\|closed\|all] [--type T] [--assignee A] [--parent N] [--search Q] [--flat]` | A tree with children under parents: `○ #12 ● P1 [bug] Title`. |
 | `search "<GitHub search syntax>"` | Same output as `list`. |
 | `ready [--claim] [--explain] [--strict-parent] [--include-epics] [--sort priority\|unblocks\|path]` | See above. |
@@ -137,7 +137,8 @@ Every command takes `--json` (for agents) and `--repo OWNER/REPO`. Issue ids are
 | Command | Does |
 | --- | --- |
 | `dep add <id> <blocker>` / `dep remove` / `link` | `#id` is blocked by `#blocker` (native issue dependencies, cross-repo by URL). The card moves Ready → Blocked, and back once no open blocker remains. |
-| `dep list <id>` | Direct blockers and blockees. |
+| `dep relate <id> <other>` / `dep unrelate` / `relate` / `unrelate` | Beads `bd dep relate` / `bd dep unrelate`. One relates-to link, shown on both issues. It does not block, and the board does not move. Cross-repo ids are `owner/repo#n`. |
+| `dep list <id>` | Direct blockers, blockees, and relates-to. |
 | `dep tree <id>` | Upstream blockers, downstream blockees, and the sub-issue subtree, walked in memory from one snapshot. |
 | `children <id>` | Sub-issues, as a tree. |
 | `parent <id> [--set N \| --remove]` | Sub-issue parent. |
@@ -179,6 +180,7 @@ Two layers, never collapsed: the issue is the record; the Project item is the bo
 | type (`task`, `bug`, `feature`, `epic`, `chore`, `decision`) | org **issue type** Epic / Feature / Bug / Task / Chore / Decision | `create -t`, `update --type` |
 | priority 0–4 | org issue field **Priority** with options P0–P4 | `create -p`, `priority`, `update --priority` |
 | `blocks` / blocked-by | native issue **dependencies** | `create --deps`, `dep add` |
+| `related`, `relates-to` | native **relates to** (one undirected link; both issues show it; does not block) | `dep relate`, `relate` |
 | parent / epic children | **sub-issues** | `create --parent`, `parent --set` |
 | `open` | issue open, board **Ready** | `update --status ready`, `reopen` |
 | `in_progress` | board **In Progress** (an assignee, when there is no board) | `update --claim`, `ready --claim` |
@@ -235,7 +237,8 @@ The dry run prints counts by type, board column, state, and priority; the creati
 | description, design, acceptance criteria | the body, as sections |
 | labels, owner, dates, estimate, external ref, the original close reason | an import footer at the end of the body (dates to the day), so nothing becomes a label |
 | `_type: memory` lines | the memories issue, upserted by key |
-| `related`, `relates-to`, `discovered-from`, `supersedes`, `duplicates`, `tracks`, a second parent | lines in the import footer (`Related: #12, #40`), the ids rewritten to `#n` so each is a link and a cross-reference on the other issue; a closed bead with a `duplicates` edge closes as duplicate. A `blocks` target Beads wrote as `discovered-from:pl-9` is read as that relation |
+| `related`, `relates-to`, `relates_to` | a relates-to link when the other issue is in the export (one undirected link; does not block). A target that is not stays a footer line (`Related: pl-9`) |
+| `discovered-from`, `supersedes`, `duplicates`, `tracks`, a second parent | lines in the import footer (`Discovered from: #12, #40`), the ids rewritten to `#n` so each is a link and a cross-reference on the other issue; a closed bead with a `duplicates` edge closes as duplicate. A `blocks` target Beads wrote as `discovered-from:pl-9` is read as that relation |
 | a blocker outside the export, or one dropped to break a cycle | noted in the footer (`Blocked by (not in the export): pl-9`) and listed in the report |
 | agents, gates, templates | dropped, each one listed with the reason |
 | an issue type gbd has no type for (a wisp, say) | imported as a Task, reported |
@@ -244,7 +247,7 @@ The dry run prints counts by type, board column, state, and priority; the creati
 
 **What does not survive the move.** Read this before `--yes`; the report lists every instance, this is the shape.
 
-- **Relations other than blocking are text, not edges.** GitHub has two kinds of issue relation, blocked-by and sub-issue. `related`, `discovered-from`, `supersedes`, `duplicates`, and `tracks` become footer lines whose ids link to the right issues, and GitHub shows the back-reference on the other side, but nothing can query them as a graph.
+- **Relations GitHub has no edge for stay text.** `discovered-from`, `supersedes`, `duplicates`, and `tracks` become footer lines whose ids link to the right issues. `related`, `relates-to`, and `relates_to` become a relates-to link when the other issue is in the export; a missing target stays `Related:` in the footer, the same way a missing blocker is noted.
 - **One parent per issue.** GitHub sub-issues allow one; a second Beads parent is a footer line (`Also under: #7`).
 - **A hundred children per parent.** GitHub allows a parent 100 sub-issues, full stop. The first hundred children of an epic, in import order, become its sub-issues; the rest link to it from their footer (`Parent (GitHub allows 100 sub-issues per parent): #2118`) and are listed in the report, so a view grouped by parent shows them as having none. Split such an epic in Beads before exporting if the hierarchy matters more than the epic's identity.
 - **Dependency cycles are broken.** GitHub refuses them. A cycle is created with the edges that close it dropped; each dropped edge is listed in the report and noted in the footer of the issue that lost it.
