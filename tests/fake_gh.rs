@@ -386,10 +386,15 @@ fn show_is_one_graphql_call_rendered_like_beads() {
         .stdout(predicate::str::contains(
             "CHILDREN (1)\n  ○ #10 ● P1 child B",
         ))
-        .stdout(predicate::str::contains("1 comment: gbd comments 8"));
+        .stdout(predicate::str::contains("1 comment: gbd comments 8"))
+        .stdout(predicate::str::contains("RELATES TO").not());
     let calls = h.calls();
     assert_eq!(calls.matches("api graphql").count(), 1, "{calls}");
     assert!(!calls.contains("issue view"), "{calls}");
+    assert!(
+        calls.contains("relatesTo(first: 50)"),
+        "relates-to rides on the same detail query: {calls}"
+    );
     assert!(
         !calls.contains("issue-field-values"),
         "fields come from the same query: {calls}"
@@ -417,7 +422,27 @@ fn board_fixtures(h: &Harness) {
      // The importer's preflights: any login can be assigned here, and the
      // org has every type.
      .on("assignable", "repos/acme/widgets/assignees/", "")
-     .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#);
+     .on("types", TYPES_GET, r#"[{"name":"Epic"},{"name":"Feature"},{"name":"Bug"},{"name":"Task"},{"name":"Chore"},{"name":"Decision"}]"#)
+     // Import relates-to. Names sort after a test's own `ids` / `add`
+     // fixtures. The existence query is matched on `$num: Int` (not
+     // `relatesTo(first: 100)`): a `)` inside a fixture needle ends the
+     // fake gh `case` pattern. That needle is not the detail query's
+     // `$number`.
+     .on(
+         "relate-have",
+         "$num: Int",
+         r#"{"data":{"repository":{"issue":{"relatesTo":{"nodes":[]}}}}}"#,
+     )
+     .on(
+         "relate-ids",
+         "left: repository",
+         r#"{"data":{"left":{"issue":{"id":"IL"}},"right":{"issue":{"id":"IR"}}}}"#,
+     )
+     .on(
+         "relate-add",
+         "addRelatesTo",
+         r#"{"data":{"addRelatesTo":{"issue":{"number":1},"relatedIssue":{"number":2}}}}"#,
+     );
 }
 
 #[test]
@@ -1556,6 +1581,154 @@ fn dep_add_moves_a_ready_card_to_blocked() {
 }
 
 #[test]
+fn dep_relate_links_both_issues_and_leaves_the_board_alone() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    h.on(
+        "ids",
+        "left: repository",
+        r#"{"data":{"left":{"issue":{"id":"I_12"}},"right":{"issue":{"id":"I_9"}}}}"#,
+    )
+    .on(
+        "add",
+        "addRelatesTo",
+        r#"{"data":{"addRelatesTo":{"issue":{"number":12},"relatedIssue":{"number":9}}}}"#,
+    );
+    h.gbd()
+        .args(["dep", "relate", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 relates to #9\n"));
+    h.gbd()
+        .args(["--json", "relate", "12", "acme/other#4"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"relates_to\": \"acme/other#4\""));
+    let calls = h.calls();
+    assert!(
+        calls.contains("-F o1=acme -F n1=widgets -F a=12 -F o2=acme -F n2=widgets -F b=9"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("-F o2=acme -F n2=other -F b=4"),
+        "cross-repo id is the other repository: {calls}"
+    );
+    assert!(
+        calls.contains("-F issueId=I_12 -F relatedIssueId=I_9"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("addRelatesTo") && !calls.contains("removeRelatesTo"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("project") && !calls.contains("blocked-by"),
+        "relates-to does not block and does not move the card: {calls}"
+    );
+    let calls_before = calls.matches("addRelatesTo").count();
+    h.gbd()
+        .args(["dep", "relate", "12", "12"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("#12 cannot relate to itself"));
+    assert_eq!(
+        h.calls().matches("addRelatesTo").count(),
+        calls_before,
+        "a self-link never reaches GitHub"
+    );
+}
+
+#[test]
+fn dep_unrelate_removes_the_link() {
+    let h = Harness::new();
+    h.on(
+        "ids",
+        "left: repository",
+        r#"{"data":{"left":{"issue":{"id":"I_12"}},"right":{"issue":{"id":"I_9"}}}}"#,
+    )
+    .on(
+        "remove",
+        "removeRelatesTo",
+        r#"{"data":{"removeRelatesTo":{"issue":{"number":12},"relatedIssue":{"number":9}}}}"#,
+    );
+    h.gbd()
+        .args(["unrelate", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 no longer relates to #9\n"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("-F issueId=I_12 -F relatedIssueId=I_9")
+            && calls.contains("removeRelatesTo"),
+        "{calls}"
+    );
+    assert!(!calls.contains("addRelatesTo"), "{calls}");
+}
+
+#[test]
+fn dep_relate_reports_a_missing_issue_and_a_graphql_error() {
+    let h = Harness::new();
+    h.on(
+        "ids",
+        "left: repository",
+        r#"{"data":{"left":{"issue":null},"right":{"issue":{"id":"I_9"}}}}"#,
+    );
+    h.gbd()
+        .args(["dep", "relate", "12", "9"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("acme/widgets#12: no such issue"));
+    assert!(!h.calls().contains("addRelatesTo"), "{}", h.calls());
+
+    let h = Harness::new();
+    h.on(
+        "ids",
+        "left: repository",
+        r#"{"data":{"left":{"issue":{"id":"I_12"}},"right":{"issue":{"id":"I_9"}}}}"#,
+    )
+    .on(
+        "add",
+        "addRelatesTo",
+        r#"{"errors":[{"message":"Issues are already related"}]}"#,
+    );
+    h.gbd()
+        .args(["dep", "relate", "12", "9"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Issues are already related"));
+}
+
+#[test]
+fn dep_list_and_show_include_relates_to() {
+    let h = Harness::new();
+    let related = r#"{"id":"I9","number":9,"title":"see also","url":"u","state":"OPEN","issueType":{"name":"Task"},"assignees":{"nodes":[]},"parent":null,"issueDependenciesSummary":{"blockedBy":0,"blocking":0},"issueFieldValues":{"nodes":[]}}"#;
+    let node = format!(
+        r#"{{"id":"I12","number":12,"title":"issue 12","url":"https://github.com/acme/widgets/issues/12","state":"OPEN",
+          "issueType":{{"name":"Task"}},"assignees":{{"nodes":[]}},"parent":null,
+          "issueDependenciesSummary":{{"blockedBy":0,"blocking":0}},
+          "blockedBy":{{"nodes":[]}},"blocking":{{"nodes":[]}},
+          "relatesTo":{{"nodes":[{related}]}},
+          "issueFieldValues":{{"nodes":[]}},
+          "body":"","author":null,"createdAt":"2026-09-11T00:00:00Z","updatedAt":"2026-09-11T00:00:00Z",
+          "closedAt":null,"stateReason":null,"comments":{{"totalCount":0}},
+          "subIssues":{{"nodes":[]}}}}"#
+    );
+    h.on("detail", "issue(number: $number)", &detail_response(&node));
+    h.gbd()
+        .args(["dep", "list", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("↔ related     ○ #9 ● P2 see also"));
+    h.gbd()
+        .args(["show", "12"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "RELATES TO (1)\n  ○ #9 ● P2 see also",
+        ));
+}
+
+#[test]
 fn dep_add_leaves_an_in_progress_card_alone() {
     let h = Harness::new();
     board_fixtures(&h);
@@ -2027,6 +2200,22 @@ fn import_creates_issues_in_dependency_order_through_the_create_path() {
     assert!(
         calls.contains("--title Rename the endpoints --body Child of the epic; see #102 and wx-9."),
         "a mention of a bead created earlier in the run is rewritten; an unknown one is kept: {calls}"
+    );
+    assert!(
+        calls.contains("relatesTo(first: 100, after"),
+        "missing relatesTo query: {calls}"
+    );
+    assert!(
+        calls.contains("-F a=103 -F o2=acme -F n2=widgets -F b=102"),
+        "missing node-id vars: {calls}"
+    );
+    assert!(
+        calls.contains("addRelatesTo"),
+        "missing addRelatesTo: {calls}"
+    );
+    assert!(
+        !calls.contains("Related:"),
+        "an in-export relates-to is a link, not footer text: {calls}"
     );
     assert!(
         calls.contains("--type Task --parent 101 --blocked-by 102"),
@@ -3134,7 +3323,7 @@ fn import_with_everything_done_only_retries_the_memories() {
         concat!(
             "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
             "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
-            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"done\",\"relates\":true}\n",
         ),
     )
     .unwrap();
@@ -3155,9 +3344,76 @@ fn import_with_everything_done_only_retries_the_memories() {
     assert!(
         !calls.contains("project view")
             && !calls.contains("issue-fields")
-            && !calls.contains("issue create"),
+            && !calls.contains("issue create")
+            && !calls.contains("addRelatesTo"),
+        "a mapping that already recorded the link does not write it again: {calls}"
+    );
+}
+
+#[test]
+fn import_writes_relates_to_when_a_finished_map_predates_the_link() {
+    let h = Harness::new(); // no board: a finished import never looks one up
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beads-small.jsonl");
+    fs::write(
+        h.cwd.path().join("beads-map.jsonl"),
+        concat!(
+            "{\"bead\":\"wx-1\",\"number\":101,\"url\":\"https://github.com/acme/widgets/issues/101\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-2\",\"number\":102,\"url\":\"https://github.com/acme/widgets/issues/102\",\"phase\":\"done\"}\n",
+            "{\"bead\":\"wx-1.1\",\"number\":103,\"url\":\"https://github.com/acme/widgets/issues/103\",\"phase\":\"done\"}\n",
+        ),
+    )
+    .unwrap();
+    h.on(
+        "have",
+        "$num: Int",
+        r#"{"data":{"repository":{"issue":{"relatesTo":{"nodes":[]}}}}}"#,
+    )
+    .on(
+        "ids",
+        "left: repository",
+        r#"{"data":{"left":{"issue":{"id":"I_103"}},"right":{"issue":{"id":"I_102"}}}}"#,
+    )
+    .on(
+        "add",
+        "addRelatesTo",
+        r#"{"data":{"addRelatesTo":{"issue":{"number":103},"relatedIssue":{"number":102}}}}"#,
+    )
+    .on(
+        "mem-view",
+        "issue view 3 -R acme/widgets --json body",
+        "{\"body\":\"\"}",
+    )
+    .on("mem-save", "issue edit 3 -R acme/widgets --body-file -", "");
+    h.gbd()
+        .args(["import", "--from-beads", fixture.to_str().unwrap(), "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no issues left to import (3 already imported); memories: 1 new, 0 updated on #3; 1 relates-to link",
+        ));
+    let calls = h.calls();
+    assert!(
+        calls.contains("relatesTo(first: 100, after"),
+        "missing relatesTo query: {calls}"
+    );
+    assert!(
+        calls.contains("-F a=103 -F o2=acme -F n2=widgets -F b=102"),
+        "missing node-id vars: {calls}"
+    );
+    assert!(
+        calls.contains("-F issueId=I_103 -F relatedIssueId=I_102"),
+        "missing mutation ids: {calls}"
+    );
+    assert!(
+        !calls.contains("project view") && !calls.contains("issue create"),
         "{calls}"
     );
+    let map = fs::read_to_string(h.cwd.path().join("beads-map.jsonl")).unwrap();
+    let last = map
+        .lines()
+        .rfind(|l| l.contains("\"bead\":\"wx-1.1\""))
+        .unwrap();
+    assert!(last.contains("\"relates\":true"), "{map}");
 }
 
 #[test]

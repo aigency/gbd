@@ -94,7 +94,7 @@ pub enum Commands {
     Create(CreateArgs),
     /// Alias of create that prints only repo#n
     Q(CreateArgs),
-    /// One issue: fields, parent, children, blockers
+    /// One issue: fields, parent, children, blockers, relates-to
     Show { id: String },
     /// Issues as a tree (children under parents)
     List {
@@ -179,13 +179,17 @@ pub enum Commands {
         #[arg(long)]
         yes: bool,
     },
-    /// Dependencies (blocked-by / blocking)
+    /// Dependencies (blocked-by / blocking) and relates-to
     Dep {
         #[command(subcommand)]
         cmd: DepCmd,
     },
     /// Alias of dep add
     Link { issue: String, blocked_by: String },
+    /// Alias of dep relate (`bd relate`)
+    Relate { issue: String, other: String },
+    /// Alias of dep unrelate (`bd unrelate`)
+    Unrelate { issue: String, other: String },
     /// Sub-issues of a parent
     Children { id: String },
     /// Show or set the parent
@@ -321,7 +325,18 @@ pub enum DepCmd {
         issue: String,
         blocked_by: String,
     },
-    /// Direct blockers and blockees
+    /// `gbd dep relate 12 40` → #12 relates to #40 (Beads `bd dep relate`).
+    /// Bidirectional and non-blocking: the board does not move.
+    Relate {
+        issue: String,
+        other: String,
+    },
+    /// `gbd dep unrelate 12 40` removes that relationship (Beads `bd dep unrelate`).
+    Unrelate {
+        issue: String,
+        other: String,
+    },
+    /// Direct blockers, blockees, and relates-to
     List {
         id: String,
     },
@@ -722,6 +737,13 @@ fn dispatch(cli: Cli) -> Result<u8> {
         Commands::Link { issue, blocked_by } => cmd_dep(
             &Ctx::open(explicit, json)?,
             DepCmd::Add { issue, blocked_by },
+        ),
+        Commands::Relate { issue, other } => {
+            cmd_dep(&Ctx::open(explicit, json)?, DepCmd::Relate { issue, other })
+        }
+        Commands::Unrelate { issue, other } => cmd_dep(
+            &Ctx::open(explicit, json)?,
+            DepCmd::Unrelate { issue, other },
         ),
         Commands::Children { id } => {
             let ctx = Ctx::open(explicit, json)?;
@@ -1317,22 +1339,138 @@ fn check_assignees(
     )
 }
 
+/// Issue numbers in this repo that `number` should relate to. One query
+/// sees a link a killed run already wrote; the mutation runs only when
+/// GitHub does not have it yet.
+fn ensure_relates(
+    ctx: &Ctx,
+    number: u64,
+    other: u64,
+    known: &mut BTreeMap<u64, BTreeSet<u64>>,
+) -> Result<()> {
+    if let std::collections::btree_map::Entry::Vacant(slot) = known.entry(number) {
+        slot.insert(issue::related_numbers(&ctx.repo, number)?);
+    }
+    if known.get(&number).is_some_and(|set| set.contains(&other)) {
+        return Ok(());
+    }
+    if known.get(&other).is_some_and(|set| set.contains(&number)) {
+        return Ok(());
+    }
+    let (id, related_id) = issue::relate_node_ids((&ctx.repo, number), (&ctx.repo, other))?;
+    issue::set_relates_to(&id, &related_id, issue::RelateOp::Add)?;
+    known.entry(number).or_default().insert(other);
+    known.entry(other).or_default().insert(number);
+    Ok(())
+}
+
+/// Write the plan's relates-to links. A GitHub error is a warning and that
+/// bead stays unmarked, so the next import retries it. Beads whose links
+/// are all present (including ones an earlier run already recorded) are
+/// returned.
+fn apply_relates(
+    ctx: &Ctx,
+    plan: &import::Plan,
+    numbers: &BTreeMap<String, u64>,
+    done: &BTreeMap<String, import::Mapped>,
+    warnings: &mut Vec<String>,
+) -> BTreeSet<String> {
+    let mut linked = BTreeSet::new();
+    for item in &plan.items {
+        if done.get(&item.bead).is_some_and(|m| m.relates) {
+            for other in &item.relates_to {
+                linked.insert(import::ordered_pair(&item.bead, other));
+            }
+        }
+    }
+    let mut known: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut ok = BTreeSet::new();
+    for item in &plan.items {
+        if item.relates_to.is_empty() {
+            continue;
+        }
+        if done.get(&item.bead).is_some_and(|m| m.relates) {
+            ok.insert(item.bead.clone());
+            continue;
+        }
+        let Some(&number) = numbers.get(&item.bead) else {
+            warnings.push(format!(
+                "{}: relates-to not written, the issue is not in the mapping yet. Run gbd import again to retry",
+                item.bead
+            ));
+            continue;
+        };
+        let mut failed = false;
+        for other in &item.relates_to {
+            let pair = import::ordered_pair(&item.bead, other);
+            if linked.contains(&pair) {
+                continue;
+            }
+            let Some(&other_number) = numbers.get(other) else {
+                warnings.push(format!(
+                    "{} (#{number}): relates to {other}, which has no issue yet. Run gbd import again to retry",
+                    item.bead
+                ));
+                failed = true;
+                continue;
+            };
+            if number == other_number {
+                linked.insert(pair);
+                continue;
+            }
+            match ensure_relates(ctx, number, other_number, &mut known) {
+                Ok(()) => {
+                    linked.insert(pair);
+                }
+                Err(err) => {
+                    warnings.push(format!(
+                        "{} (#{number}): relates to #{other_number}: {err:#}. Run gbd import again to retry",
+                        item.bead
+                    ));
+                    failed = true;
+                }
+            }
+        }
+        if !failed {
+            ok.insert(item.bead.clone());
+        }
+    }
+    ok
+}
+
+/// Append a mapping line that says this bead's relates-to links are written.
+fn record_relates_line(map: &mut import::Mapping, m: &import::Mapped) -> Result<()> {
+    let mut updated = m.clone();
+    updated.relates = true;
+    let line = serde_json::to_string(&updated).unwrap_or_default();
+    let path = map.path().display().to_string();
+    map.record(&updated).with_context(|| {
+        format!(
+            "{} is #{} ({}) and its relates-to links are on GitHub, but could not be recorded in {path}. Add this line to the file before resuming:\n{line}",
+            updated.bead, updated.number, updated.url
+        )
+    })
+}
+
 /// Execute the plan top to bottom: one `gh issue create` per bead, its
 /// edges pointing at issues made earlier (this run or a previous one, via
 /// the mapping file), then Priority, Start date, assignee, comments, the
-/// close, and the card. The mapping file records each bead as `created`,
-/// `commented`, and `done`, so a run killed anywhere resumes at the right
-/// step without duplicating anything. The create is fatal; every later
-/// step warns and moves on, since `board sync` and one edit repair them.
+/// close, and the card. Relates-to is written once every issue number is
+/// known. The mapping file records each bead as `created`, `placed`, and
+/// `done`, so a run killed anywhere resumes at the right step without
+/// duplicating anything. The create is fatal; every later step warns and
+/// moves on, since `board sync` and one edit repair them.
 fn import_run(
     ctx: &Ctx,
     plan: &import::Plan,
     map: import::Mapping,
     done: &BTreeMap<String, import::Mapped>,
 ) -> Result<u8> {
+    let mut map = map;
     // Nothing left to create or finish (an export of memories alone, or a
     // re-run after everything landed): only the memories, and no board or
-    // field lookups to get in the way of that.
+    // field lookups to get in the way of that. Relates-to links a previous
+    // gbd left as footer text are still written here, from the mapping.
     let unfinished = plan
         .items
         .iter()
@@ -1344,17 +1482,59 @@ fn import_run(
         .count();
     if unfinished == 0 {
         let already = plan.items.len();
+        let mut warnings = Vec::new();
+        let linked = if import::relate_pending(plan, done) {
+            let numbers = done
+                .iter()
+                .map(|(bead, mapped)| (bead.clone(), mapped.number))
+                .collect();
+            let ok = apply_relates(ctx, plan, &numbers, done, &mut warnings);
+            let mut n = 0;
+            for bead in &ok {
+                let Some(mapped) = done.get(bead) else {
+                    continue;
+                };
+                if mapped.relates {
+                    continue;
+                }
+                record_relates_line(&mut map, mapped)?;
+                n += 1;
+            }
+            n
+        } else {
+            0
+        };
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
         let memories = if plan.memories.is_empty() {
             json!(null)
         } else {
             let (issue, added, updated) = memories_for_import(ctx, &plan.memories)?;
             json!({ "issue": issue, "added": added, "updated": updated })
         };
+        let relates = if linked == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {linked} relates-to link{}",
+                if linked == 1 { "" } else { "s" }
+            )
+        };
+        let warning_note = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} warning{}",
+                warnings.len(),
+                if warnings.len() == 1 { "" } else { "s" }
+            )
+        };
         ctx.emit(
             &json!({
                 "created": [], "already_imported": plan.already_imported,
                 "finished": [], "mapping": map.path(), "rewritten": [],
-                "memories": memories, "warnings": [], "error": null,
+                "memories": memories, "warnings": warnings, "error": null,
                 "skipped": plan.skipped, "cycles": plan.cycles, "problems": plan.problems,
             }),
             || {
@@ -1364,9 +1544,9 @@ fn import_run(
                     format!("no issues left to import ({already} already imported)")
                 };
                 match &memories {
-                    Value::Null => format!("{issues}; nothing to do"),
+                    Value::Null => format!("{issues}; nothing to do{relates}{warning_note}"),
                     m => format!(
-                        "{issues}; memories: {} new, {} updated on #{}",
+                        "{issues}; memories: {} new, {} updated on #{}{relates}{warning_note}",
                         m["added"], m["updated"], m["issue"]
                     ),
                 }
@@ -1416,6 +1596,7 @@ fn import_run(
         unsure_blockers: BTreeSet::new(),
         full_parents: BTreeSet::new(),
         footer_noted: BTreeSet::new(),
+        relates_done: BTreeSet::new(),
         touched: Vec::new(),
     };
     let total = plan.items.len();
@@ -1515,6 +1696,9 @@ struct Run<'a> {
     /// Beads whose footer gained the cap note at runtime: pass two must
     /// rewrite the body GitHub has, not the plan's, or the note is lost.
     footer_noted: BTreeSet<String>,
+    /// Beads whose relates-to links are on GitHub. Pass-two mapping lines
+    /// record that, so a finished import is not linked again.
+    relates_done: BTreeSet<String>,
     /// Per bead touched this run: its issue, how far the mapping file says
     /// it got, and whether every step so far succeeded.
     touched: Vec<Touched>,
@@ -1668,7 +1852,33 @@ impl Run<'_> {
             self.touched.push(t);
         }
         self.rewrite_forward(plan);
+        self.link_relates(plan, &done)?;
         self.comments(plan)
+    }
+
+    /// Relates-to is written once every issue exists, then recorded on the
+    /// pass-two lines. A bead already marked done is recorded here when this
+    /// run is the one that finally linked it.
+    fn link_relates(
+        &mut self,
+        plan: &import::Plan,
+        done: &BTreeMap<String, import::Mapped>,
+    ) -> Result<()> {
+        let ok = apply_relates(self.ctx, plan, &self.numbers, done, &mut self.warnings);
+        self.relates_done.clone_from(&ok);
+        for bead in &ok {
+            if self.touched.iter().any(|t| t.bead == *bead) {
+                continue;
+            }
+            let Some(m) = done.get(bead) else {
+                continue;
+            };
+            if m.relates {
+                continue;
+            }
+            record_relates_line(&mut self.map, m)?;
+        }
+        Ok(())
     }
 
     /// A create that a previous run finished without recording (killed in
@@ -1731,6 +1941,7 @@ impl Run<'_> {
                 phase: import::Phase::Created,
                 comments: 0,
                 rewritten: false,
+                relates: false,
             },
         );
         Ok(())
@@ -1746,6 +1957,7 @@ impl Run<'_> {
             phase,
             comments: t.comments,
             rewritten: t.rewritten,
+            relates: self.relates_done.contains(&t.bead),
         };
         self.map.record(&m).with_context(|| {
             format!(
@@ -2852,10 +3064,14 @@ fn cmd_dep(ctx: &Ctx, cmd: DepCmd) -> Result<u8> {
             );
             Ok(0)
         }
+        DepCmd::Relate { issue, other } => cmd_relate(ctx, &issue, &other, issue::RelateOp::Add),
+        DepCmd::Unrelate { issue, other } => {
+            cmd_relate(ctx, &issue, &other, issue::RelateOp::Remove)
+        }
         DepCmd::List { id } => {
             let d = ctx.target(&id)?.fetch(ctx.scope())?;
             ctx.emit(
-                &json!({ "issue": d.issue, "blocked_by": d.blocked_by, "blocking": d.blocking }),
+                &json!({ "issue": d.issue, "blocked_by": d.blocked_by, "blocking": d.blocking, "relates_to": d.relates_to }),
                 || {
                     let mut out = render::line(&d.issue);
                     out.push('\n');
@@ -2864,6 +3080,9 @@ fn cmd_dep(ctx: &Ctx, cmd: DepCmd) -> Result<u8> {
                     }
                     for b in &d.blocking {
                         let _ = writeln!(out, "  → blocking    {}", render::line(b));
+                    }
+                    for b in &d.relates_to {
+                        let _ = writeln!(out, "  ↔ related     {}", render::line(b));
                     }
                     out
                 },
@@ -2876,6 +3095,29 @@ fn cmd_dep(ctx: &Ctx, cmd: DepCmd) -> Result<u8> {
 
 /// Walk the open snapshot in memory: upstream blockers, downstream
 /// blockees, and the sub-issue subtree. One paged query, no N+1.
+/// Beads `bd dep relate` / `bd dep unrelate`. GitHub stores one undirected
+/// relates-to link, so one mutation updates both issues. It does not block,
+/// so the board is left alone.
+fn cmd_relate(ctx: &Ctx, issue: &str, other: &str, op: issue::RelateOp) -> Result<u8> {
+    let t = ctx.target(issue)?;
+    let o = ctx.target(other)?;
+    if t.repo.name_with_owner == o.repo.name_with_owner && t.number == o.number {
+        bail!("{} cannot relate to itself", t.label);
+    }
+    let (id, related_id) = issue::relate_node_ids((&t.repo, t.number), (&o.repo, o.number))?;
+    issue::set_relates_to(&id, &related_id, op)?;
+    let by = format!("{}#{}", o.repo.name_with_owner, o.number);
+    let (key, human) = match op {
+        issue::RelateOp::Add => ("relates_to", format!("{} relates to {}", t.label, o.label)),
+        issue::RelateOp::Remove => (
+            "removed_relates_to",
+            format!("{} no longer relates to {}", t.label, o.label),
+        ),
+    };
+    ctx.emit(&json!({ "issue": t.number, key: by }), || human);
+    Ok(0)
+}
+
 fn cmd_dep_tree(ctx: &Ctx, id: &str) -> Result<u8> {
     fn chain<'a>(
         start: &'a Issue,

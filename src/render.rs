@@ -210,6 +210,7 @@ pub fn show(d: &Detail) -> String {
     }
     section(&mut out, "BLOCKED BY", &d.blocked_by);
     section(&mut out, "BLOCKING", &d.blocking);
+    section(&mut out, "RELATES TO", &d.relates_to);
     section(&mut out, "CHILDREN", &d.children);
     if d.comments > 0 {
         let _ = write!(

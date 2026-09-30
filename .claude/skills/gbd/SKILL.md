@@ -35,6 +35,7 @@ One command. Type, priority, parent, blocked-by together:
 | type | issue type (`-t`) |
 | priority P0–P4 | org issue field **Priority** (`gbd priority <n> P1`) |
 | blocks / blocked-by | issue dependencies (`gbd dep add <n> <blocker>`) |
+| related / relates-to | relates-to relationship (`gbd dep relate <a> <b>`, bidirectional, does not block) |
 | parent / epic | sub-issues (`gbd parent <n> --set <epic>`) |
 | in_progress / deferred | Project **Status** (`gbd update <n> --status in_progress`) |
 | defer until | org field **Start date** (`gbd defer <n> --until tomorrow --reason "…"`) |

@@ -3,6 +3,8 @@
 //! Org issue fields (Priority, Start date, gbd Role) and the optional
 //! Project Status ride along so no command needs a second read.
 
+use std::collections::BTreeSet;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,6 +66,9 @@ pub struct Detail {
     pub children: Vec<Issue>,
     pub blocked_by: Vec<Issue>,
     pub blocking: Vec<Issue>,
+    /// Issues linked by GitHub's relates-to relationship. The link is
+    /// undirected: it shows on both issues and does not block.
+    pub relates_to: Vec<Issue>,
 }
 
 impl Issue {
@@ -195,8 +200,9 @@ pub fn search_query(with_project: bool) -> String {
     )
 }
 
-/// One issue with body, parent, children, and blocker titles. Related rows
-/// carry the project fields too, so their glyph and status are right.
+/// One issue with body, parent, children, blocker titles, and relates-to.
+/// Related rows carry the project fields too, so their glyph and status
+/// are right.
 pub fn detail_query(with_project: bool) -> String {
     let fields = node_fields(with_project);
     let row = row_fields(with_project);
@@ -219,10 +225,173 @@ pub fn detail_query(with_project: bool) -> String {
         }} }}
         blocking(first: 50) {{ nodes {{{row}
         }} }}
+        relatesTo(first: 50) {{ nodes {{{row}
+        }} }}
     }}
   }}
 }}"
     )
+}
+
+/// Node ids for `addRelatesTo` / `removeRelatesTo`. One query, two issues,
+/// either repository. `gh issue edit` has no relates-to flag (gh 2.99).
+const RELATE_IDS_QUERY: &str = r"
+query($o1: String!, $n1: String!, $a: Int!, $o2: String!, $n2: String!, $b: Int!) {
+  left: repository(owner: $o1, name: $n1) {
+    issue(number: $a) { id }
+  }
+  right: repository(owner: $o2, name: $n2) {
+    issue(number: $b) { id }
+  }
+}";
+
+const ADD_RELATES_TO: &str = r"
+mutation($issueId: ID!, $relatedIssueId: ID!) {
+  addRelatesTo(input: {issueId: $issueId, relatedIssueId: $relatedIssueId}) {
+    issue { number }
+    relatedIssue { number }
+  }
+}";
+
+const REMOVE_RELATES_TO: &str = r"
+mutation($issueId: ID!, $relatedIssueId: ID!) {
+  removeRelatesTo(input: {issueId: $issueId, relatedIssueId: $relatedIssueId}) {
+    issue { number }
+    relatedIssue { number }
+  }
+}";
+
+/// Whether to add or remove a relates-to link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelateOp {
+    Add,
+    Remove,
+}
+
+/// GraphQL node ids for two issues, in argument order.
+pub fn relate_node_ids(a: (&Repo, u64), b: (&Repo, u64)) -> Result<(String, String)> {
+    let (repo_a, num_a) = a;
+    let (repo_b, num_b) = b;
+    let a_s = num_a.to_string();
+    let b_s = num_b.to_string();
+    let data = gh::graphql(
+        RELATE_IDS_QUERY,
+        &[
+            ("o1", repo_a.owner()),
+            ("n1", repo_a.name()),
+            ("a", a_s.as_str()),
+            ("o2", repo_b.owner()),
+            ("n2", repo_b.name()),
+            ("b", b_s.as_str()),
+        ],
+    )?;
+    check_errors(&data)?;
+    let id_a = node_id_at(&data, "left", repo_a, num_a)?;
+    let id_b = node_id_at(&data, "right", repo_b, num_b)?;
+    Ok((id_a, id_b))
+}
+
+/// Add or remove GitHub's relates-to relationship. One mutation is the
+/// whole link: it shows on both issues.
+pub fn set_relates_to(issue_id: &str, related_issue_id: &str, op: RelateOp) -> Result<()> {
+    let (name, query) = match op {
+        RelateOp::Add => ("addRelatesTo", ADD_RELATES_TO),
+        RelateOp::Remove => ("removeRelatesTo", REMOVE_RELATES_TO),
+    };
+    let data = gh::graphql(
+        query,
+        &[("issueId", issue_id), ("relatedIssueId", related_issue_id)],
+    )?;
+    check_errors(&data)?;
+    let payload = data.pointer(&format!("/data/{name}"));
+    if payload.is_none_or(Value::is_null) {
+        bail!("GitHub did not record the relates-to relationship");
+    }
+    Ok(())
+}
+
+/// Issue numbers in `repo` that `number` already relates to. One page of
+/// 100, then further pages while GitHub says there are more.
+pub fn related_numbers(repo: &Repo, number: u64) -> Result<BTreeSet<u64>> {
+    const QUERY: &str = r"
+query($owner: String!, $name: String!, $num: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $num) {
+      relatesTo(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { number repository { nameWithOwner } }
+      }
+    }
+  }
+}";
+    let mut found = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    let num = number.to_string();
+    for _ in 0..20 {
+        let mut vars = vec![
+            ("owner", repo.owner()),
+            ("name", repo.name()),
+            ("num", num.as_str()),
+        ];
+        if let Some(c) = &cursor {
+            vars.push(("cursor", c.as_str()));
+        }
+        let data = gh::graphql(QUERY, &vars)?;
+        check_errors(&data)?;
+        let issue = data.pointer("/data/repository/issue");
+        if issue.is_none_or(Value::is_null) {
+            bail!("{}#{number}: no such issue", repo.name_with_owner);
+        }
+        let nodes = data
+            .pointer("/data/repository/issue/relatesTo/nodes")
+            .and_then(Value::as_array);
+        if let Some(nodes) = nodes {
+            for n in nodes {
+                let same_repo = n
+                    .pointer("/repository/nameWithOwner")
+                    .and_then(Value::as_str)
+                    .is_none_or(|r| r.eq_ignore_ascii_case(&repo.name_with_owner));
+                if same_repo {
+                    if let Some(n) = n.get("number").and_then(Value::as_u64) {
+                        found.insert(n);
+                    }
+                }
+            }
+        }
+        let more = data
+            .pointer("/data/repository/issue/relatesTo/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !more {
+            break;
+        }
+        let next = data
+            .pointer("/data/repository/issue/relatesTo/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if next.is_none() || next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(found)
+}
+
+fn node_id_at(data: &Value, key: &str, repo: &Repo, number: u64) -> Result<String> {
+    let issue = data.pointer(&format!("/data/{key}/issue"));
+    match issue {
+        Some(v) if !v.is_null() => v
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .with_context(|| {
+                format!(
+                    "{}#{number}: unexpected GraphQL shape",
+                    repo.name_with_owner
+                )
+            }),
+        _ => bail!("{}#{number}: no such issue", repo.name_with_owner),
+    }
 }
 
 /// Which snapshot shape to fetch: the board, if configured. Project numbers
@@ -458,6 +627,7 @@ pub fn detail_from_graphql(node: &Value, scope: Scope<'_>, today: &str) -> Optio
         children: related(node, "subIssues", scope, today),
         blocked_by: related(node, "blockedBy", scope, today),
         blocking: related(node, "blocking", scope, today),
+        relates_to: related(node, "relatesTo", scope, today),
     })
 }
 
@@ -602,9 +772,11 @@ mod tests {
         assert!(detail_query(true).contains("projectItems"));
         assert_eq!(
             detail_query(true).matches("projectItems").count(),
-            5,
-            "the issue plus parent, subIssues, blockedBy, blocking rows"
+            6,
+            "the issue plus parent, subIssues, blockedBy, blocking, relatesTo rows"
         );
+        assert!(detail_query(false).contains("relatesTo(first: 50)"));
+        assert!(!snapshot_query(false).contains("relatesTo"));
         assert_eq!(detail_query(false).matches("projectItems").count(), 0);
         assert!(snapshot_query(false).contains("$cursor: String)"));
         assert!(!snapshot_query(false).contains(" date\n"));
@@ -655,6 +827,9 @@ mod tests {
         ] });
         node["blockedBy"] =
             json!({ "nodes": [ { "number": 3, "title": "blocker", "state": "OPEN", "id": "C" } ] });
+        node["relatesTo"] = json!({ "nodes": [
+            { "number": 40, "title": "see also", "state": "OPEN", "id": "R" }
+        ] });
         let d = detail_from_graphql(&node, scope(None), "2026-09-11").unwrap();
         assert_eq!(d.body, "Body text");
         assert_eq!(d.author.as_deref(), Some("octocat"));
@@ -664,5 +839,13 @@ mod tests {
         assert_eq!(d.children[1].state, State::Closed);
         assert_eq!(d.blocked_by[0].title, "blocker");
         assert_eq!(d.issue.blocked_by_open, vec![3]);
+        assert_eq!(d.relates_to[0].number, 40);
+        assert_eq!(d.relates_to[0].title, "see also");
+        node.as_object_mut().unwrap().remove("relatesTo");
+        let missing = detail_from_graphql(&node, scope(None), "2026-09-11").unwrap();
+        assert!(
+            missing.relates_to.is_empty(),
+            "an older payload has no relates-to"
+        );
     }
 }
