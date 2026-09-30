@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-30
+
 ### Added
 
-- feat(dep): `gbd dep relate` / `gbd dep unrelate` write GitHub's relates-to relationship (Beads `bd dep relate`). `gbd import` writes the same link for `related`, `relates-to`, and `relates_to` when the other issue is in the export, instead of a `Related:` footer line
+- feat(dep): write GitHub relates-to links, including on import (#68)
+
+### Other
+
+- build(deps): bump taiki-e/install-action from 2.87.13 to 2.87.19 in the actions group (#67)
+- build(deps): bump taiki-e/install-action from 2.87.11 to 2.87.13 in the actions group (#66)
+- build(deps): bump the cargo-minor group with 2 updates (#65)
 
 ## [1.8.6] - 2026-09-14
 
