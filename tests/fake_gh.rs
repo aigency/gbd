@@ -4220,3 +4220,305 @@ fn import_skips_placing_a_bead_an_earlier_run_placed() {
         "{map}"
     );
 }
+
+fn custom_statuses_yml() -> &'static str {
+    "repo: acme/widgets\nmemory_issue: 3\nproject: 7\nstatuses:\n  triage: active\n  in_review: wip\n  pinned: frozen\n"
+}
+
+#[test]
+fn board_sync_adds_a_wip_column_between_in_progress_and_done() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: 7\nstatuses:\n  in_review: wip\n",
+    )
+    .unwrap();
+    h.on(
+        "opt-details",
+        "options { id name color description }",
+        r#"{"data":{"node":{"options":[
+            {"id":"O_blocked","name":"Blocked","color":"RED","description":""},
+            {"id":"O_def","name":"Deferred","color":"GRAY","description":""},
+            {"id":"O_ready","name":"Ready","color":"GREEN","description":""},
+            {"id":"O_wip","name":"In Progress","color":"YELLOW","description":""},
+            {"id":"O_done","name":"Done","color":"PURPLE","description":""}
+        ]}}}"#,
+    )
+    .on(
+        "opt-update",
+        "updateProjectV2Field",
+        r#"{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_status"}}}}"#,
+    )
+    .on(
+        "items",
+        "items(first: 100",
+        r#"{"data":{"node":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#,
+    )
+    .on(
+        "snapshot",
+        "issues(states: [OPEN]",
+        r#"{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#,
+    );
+    h.gbd()
+        .args(["board", "sync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to do"));
+    let calls = h.calls();
+    assert!(
+        calls.contains(
+            r#"{id: "O_blocked", name: "Blocked", color: RED, description: ""}, {id: "O_def", name: "Deferred", color: GRAY, description: ""}, {id: "O_ready", name: "Ready", color: GREEN, description: ""}, {id: "O_wip", name: "In Progress", color: YELLOW, description: ""}, {name: "In Review", color: YELLOW, description: ""}, {id: "O_done", name: "Done", color: PURPLE, description: ""}"#
+        ),
+        "In Review is inserted between In Progress and Done: {calls}"
+    );
+}
+
+#[test]
+fn update_status_custom_moves_the_card() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    fs::write(
+        h.gh_dir.path().join("pfields.out"),
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_blocked","name":"Blocked"},{"id":"O_def","name":"Deferred"},{"id":"O_ready","name":"Ready"},
+            {"id":"O_wip","name":"In Progress"},{"id":"O_review","name":"In Review"},{"id":"O_done","name":"Done"}]}]}"#,
+    )
+    .unwrap();
+    h.gbd()
+        .args(["update", "12", "--status", "in_review"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status In Review"));
+    assert!(
+        h.calls().contains("--single-select-option-id O_review"),
+        "{}",
+        h.calls()
+    );
+    assert!(!h.calls().contains("issue close"), "{}", h.calls());
+}
+
+#[test]
+fn update_status_unknown_names_the_configured_statuses() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    h.gbd()
+        .args(["update", "12", "--status", "nonsense"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown status \"nonsense\""))
+        .stderr(predicate::str::contains("in_review"))
+        .stderr(predicate::str::contains("triage"))
+        .stderr(predicate::str::contains("pinned"));
+    let calls = h.calls();
+    assert!(
+        !calls.contains("issue edit") && !calls.contains("project"),
+        "refused before any change: {calls}"
+    );
+}
+
+#[test]
+fn ready_follows_custom_categories() {
+    let h = Harness::new();
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    let nodes = [
+        card_node(1, "OPEN", 0, Some("Triage"), ""),
+        card_node(2, "OPEN", 0, Some("In Review"), ""),
+        card_node(3, "OPEN", 0, Some("Pinned"), ""),
+        card_node(4, "OPEN", 0, Some("Ready"), ""),
+    ]
+    .join(",");
+    h.on(
+        "snapshot",
+        "issues(states: [OPEN]",
+        &search_snapshot_with(&nodes),
+    );
+    let out = h.gbd().args(["ready", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let nums: Vec<u64> = items
+        .iter()
+        .map(|i| i["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![1, 4], "active columns only: {nums:?}");
+    assert!(items.iter().all(|i| i["category"] == "active"));
+    assert_eq!(items[0]["status"], "Triage");
+}
+
+#[test]
+fn dep_add_moves_a_custom_active_card_to_blocked_and_release_returns_to_ready() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    h.on(
+        "edit",
+        "issue edit 12 -R acme/widgets --add-blocked-by 9",
+        "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 1, Some("Triage"), "")),
+    );
+    h.gbd()
+        .args(["dep", "add", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 → Blocked"));
+    assert!(
+        h.calls().contains("--single-select-option-id O_blocked"),
+        "{}",
+        h.calls()
+    );
+
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    h.on(
+        "edit",
+        "issue edit 12 -R acme/widgets --remove-blocked-by 9",
+        "",
+    )
+    .on(
+        "detail",
+        "issue(number: $number)",
+        &detail_response(&card_node(12, "OPEN", 0, Some("Blocked"), "")),
+    );
+    h.gbd()
+        .args(["dep", "remove", "12", "9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#12 → Ready"));
+    let calls = h.calls();
+    assert!(
+        calls.contains("--single-select-option-id O_ready"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("O_review") && !calls.contains("Triage"),
+        "the pre-blocked column is not remembered: {calls}"
+    );
+}
+
+#[test]
+fn status_json_counts_categories_and_columns() {
+    let h = Harness::new();
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    let nodes = [
+        card_node(1, "OPEN", 0, Some("Triage"), ""),
+        card_node(2, "OPEN", 0, Some("In Review"), ""),
+        card_node(3, "OPEN", 0, Some("Ready"), ""),
+    ]
+    .join(",");
+    h.on(
+        "snapshot",
+        "issues(states: [OPEN]",
+        &search_snapshot_with(&nodes),
+    )
+    .on(
+        "count",
+        "first: 1) { issueCount }",
+        r#"{"data":{"search":{"issueCount":0}}}"#,
+    )
+    .on("me", "api user --jq .login", "octocat");
+    let out = h.gbd().args(["status", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["categories"]["active"]["count"], 2);
+    assert_eq!(v["categories"]["wip"]["count"], 1);
+    let wip = v["categories"]["wip"]["columns"].as_array().unwrap();
+    assert!(
+        wip.iter()
+            .any(|c| c["name"] == "In Review" && c["count"] == 1 && c["category"] == "wip"),
+        "{wip:?}"
+    );
+    assert_eq!(v["categories"]["frozen"]["count"], 0);
+}
+
+#[test]
+fn list_json_includes_category_beside_status() {
+    let h = Harness::new();
+    fs::write(h.cwd.path().join(".gbd.yml"), custom_statuses_yml()).unwrap();
+    h.on(
+        "search",
+        "search(query: $q",
+        &search_response(&card_node(2, "OPEN", 0, Some("In Review"), "")),
+    );
+    let out = h.gbd().args(["list", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(items[0]["status"], "In Review");
+    assert_eq!(items[0]["category"], "wip");
+}
+
+#[test]
+fn doctor_reports_a_missing_custom_and_an_uncategorized_option() {
+    let h = Harness::new();
+    board_fixtures(&h);
+    fs::write(
+        h.cwd.path().join(".gbd.yml"),
+        "repo: acme/widgets\nmemory_issue: 3\nproject: 7\nstatuses:\n  in_review: wip\n",
+    )
+    .unwrap();
+    fs::write(
+        h.gh_dir.path().join("pfields.out"),
+        r#"{"fields":[{"id":"F_status","name":"Status","options":[
+            {"id":"O_blocked","name":"Blocked"},{"id":"O_def","name":"Deferred"},{"id":"O_ready","name":"Ready"},
+            {"id":"O_wip","name":"In Progress"},{"id":"O_done","name":"Done"},{"id":"O_ice","name":"Icebox"}]}]}"#,
+    )
+    .unwrap();
+    h.on("fields", FIELDS_GET, "[]")
+        .on("types", TYPES_GET, "[]");
+    h.gbd()
+        .args(["doctor", "--no-skills"])
+        .assert()
+        .stdout(predicate::str::contains(
+            "missing Status options In Review. Run: gbd init",
+        ))
+        .stdout(predicate::str::contains("no category: Icebox"));
+}
+
+#[test]
+fn config_set_status_custom_round_trips() {
+    let h = Harness::new();
+    h.gbd()
+        .args([
+            "config",
+            "set",
+            "status.custom",
+            "triage:active,in_review:wip,pinned:frozen",
+        ])
+        .assert()
+        .success();
+    let yml = fs::read_to_string(h.cwd.path().join(".gbd.yml")).unwrap();
+    assert!(
+        yml.contains("statuses:\n  triage: active\n  in_review: wip\n  pinned: frozen\n"),
+        "{yml}"
+    );
+    h.gbd()
+        .args(["config", "get", "status.custom"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "triage:active,in_review:wip,pinned:frozen\n",
+        ));
+    h.gbd()
+        .args(["config", "set", "status.custom", "blocked:wip"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved"));
+}

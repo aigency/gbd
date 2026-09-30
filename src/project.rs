@@ -8,14 +8,11 @@ use std::collections::HashMap;
 
 use crate::gh;
 use crate::repo::Repo;
+use crate::status::{self, CustomStatus};
 
-pub const STATUS_READY: &str = "Ready";
-pub const STATUS_IN_PROGRESS: &str = "In Progress";
-/// Maintained by gbd from GitHub's open-blocker count, never set by hand:
-/// project views cannot filter on `is:blocked`, so the board carries it.
-pub const STATUS_BLOCKED: &str = "Blocked";
-pub const STATUS_DEFERRED: &str = "Deferred";
-pub const STATUS_DONE: &str = "Done";
+pub use crate::status::{
+    STATUS_BLOCKED, STATUS_DEFERRED, STATUS_DONE, STATUS_IN_PROGRESS, STATUS_READY,
+};
 
 /// The five options `gbd init` puts on the Status field, in column order
 /// (what needs attention first, then what is parked, then the work), with
@@ -75,6 +72,9 @@ pub struct BoardItem {
     pub title: String,
     pub repo: Option<String>,
     pub status: Option<String>,
+    /// Category of `status` (`active`, `wip`, `frozen`, `done`).
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +218,7 @@ impl Board {
                             .pointer("/fieldValueByName/name")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        category: None,
                     }),
             );
             let more = conn
@@ -247,10 +248,17 @@ impl Board {
             .any(|o| o.name.eq_ignore_ascii_case(name))
     }
 
+    /// The column is on the board under its Title Case name or its config key.
+    pub fn has_column(&self, wanted: &str) -> bool {
+        self.status_options
+            .iter()
+            .any(|o| status::same_column(&o.name, wanted))
+    }
+
     fn option_id(&self, status: &str) -> Result<&str> {
         self.status_options
             .iter()
-            .find(|o| o.name.eq_ignore_ascii_case(status))
+            .find(|o| status::same_column(&o.name, status))
             .map(|o| o.id.as_str())
             .ok_or_else(|| {
                 anyhow!(
@@ -477,18 +485,21 @@ impl Board {
         }
     }
 
-    /// Make sure every option in [`STATUSES`] exists on Status, in column
-    /// order.
+    /// Make sure every built-in and configured custom exists on Status, in
+    /// column order.
     ///
     /// `updateProjectV2Field` replaces the option list wholesale. Existing
     /// options are carried over with their ids, colors, and descriptions:
     /// GitHub keeps an option's identity, and so every card's value, only
-    /// when the id is sent. A missing option is added, and the five are put
-    /// in the order of [`STATUSES`]; any other option keeps its place after
-    /// them. On a board `gbd init` just created, GitHub's default `Todo` is
-    /// renamed to `Ready`; on an existing board it is kept, so no item
-    /// silently loses its status.
-    pub fn ensure_statuses(&mut self, fresh: bool) -> Result<bool> {
+    /// when the id is sent. A missing option is added. Built-ins and
+    /// customs are ordered by category (a `wip` custom sits between In
+    /// Progress and Done); any other option keeps its relative place after
+    /// them. Nothing is ever deleted: dropping a status from `.gbd.yml`
+    /// leaves the column on the board, and the next sync sorts that option
+    /// after the columns gbd still knows. On a board `gbd init` just
+    /// created, GitHub's default `Todo` is renamed to `Ready`; on an
+    /// existing board it is kept, so no item silently loses its status.
+    pub fn ensure_statuses(&mut self, fresh: bool, customs: &[CustomStatus]) -> Result<bool> {
         struct Opt {
             /// None for an option that does not exist yet.
             id: Option<String>,
@@ -516,23 +527,27 @@ impl Board {
                 changed = true;
             }
         }
-        for (want, color) in STATUSES {
-            if !options.iter().any(|o| o.name.eq_ignore_ascii_case(want)) {
+        let order = status::column_order(customs);
+        for want in &order {
+            if !options
+                .iter()
+                .any(|o| status::same_column(&o.name, &want.name))
+            {
                 options.push(Opt {
                     id: None,
-                    name: want.to_string(),
-                    color: Some(color),
+                    name: want.name.clone(),
+                    color: Some(want.color),
                 });
                 changed = true;
             }
         }
-        // Column order: the gbd statuses as STATUSES lists them, then any
-        // other option in the order the board had them (the sort is stable).
+        // Column order: built-ins and customs as `column_order` lists them,
+        // then any other option in the order the board had them (stable).
         let column = |o: &Opt| {
-            STATUSES
+            order
                 .iter()
-                .position(|(n, _)| o.name.eq_ignore_ascii_case(n))
-                .unwrap_or(STATUSES.len())
+                .position(|want| status::same_column(&o.name, &want.name))
+                .unwrap_or(order.len())
         };
         let before: Vec<String> = options.iter().map(|o| o.name.clone()).collect();
         options.sort_by_key(column);
@@ -646,7 +661,7 @@ pub fn find_linked(repo: &Repo, title: &str) -> Result<Vec<u64>> {
 }
 
 /// `gh project create` + Status options + link to the repo.
-pub fn create(repo: &Repo, title: &str) -> Result<Board> {
+pub fn create(repo: &Repo, title: &str, customs: &[CustomStatus]) -> Result<Board> {
     let created: Value = gh::run_json(&[
         "project",
         "create",
@@ -663,7 +678,7 @@ pub fn create(repo: &Repo, title: &str) -> Result<Board> {
         .and_then(Value::as_u64)
         .context("gh project create returned no number")?;
     let mut board = Board::load(repo.owner(), number)?;
-    board.ensure_statuses(true)?;
+    board.ensure_statuses(true, customs)?;
     link(&board, repo)?;
     Ok(board)
 }
@@ -681,38 +696,4 @@ pub fn link(board: &Board, repo: &Repo) -> Result<()> {
     ])
     .map_err(scope_error)?;
     Ok(())
-}
-
-/// Beads status word → board Status option.
-pub fn status_for(word: &str) -> Result<&'static str> {
-    Ok(
-        match word.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-            "open" | "ready" | "todo" => STATUS_READY,
-            "in_progress" | "inprogress" | "claimed" => STATUS_IN_PROGRESS,
-            "deferred" | "defer" => STATUS_DEFERRED,
-            "done" | "closed" => STATUS_DONE,
-            "blocked" => bail!(
-                "blocked is not set by hand; it follows from open blockers (gbd dep add <n> <blocker>)"
-            ),
-            other => bail!("unknown status {other:?}; use ready, in_progress, deferred, or done"),
-        },
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_words_map_to_board_options() {
-        assert_eq!(status_for("in_progress").unwrap(), STATUS_IN_PROGRESS);
-        assert_eq!(status_for("in-progress").unwrap(), STATUS_IN_PROGRESS);
-        assert_eq!(status_for("Ready").unwrap(), STATUS_READY);
-        assert_eq!(status_for("deferred").unwrap(), STATUS_DEFERRED);
-        assert_eq!(status_for("done").unwrap(), STATUS_DONE);
-        assert!(
-            status_for("blocked").is_err(),
-            "blocked is derived, never set"
-        );
-    }
 }

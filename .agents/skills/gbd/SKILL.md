@@ -37,10 +37,16 @@ One command. Type, priority, parent, blocked-by together:
 | blocks / blocked-by | issue dependencies (`gbd dep add <n> <blocker>`) |
 | related / relates-to | relates-to relationship (`gbd dep relate <a> <b>`, bidirectional, does not block) |
 | parent / epic | sub-issues (`gbd parent <n> --set <epic>`) |
-| in_progress / deferred | Project **Status** (`gbd update <n> --status in_progress`) |
+| in_progress / deferred | Project **Status** (`gbd update <n> --status in_progress`; custom names from `.gbd.yml`) |
 | defer until | org field **Start date** (`gbd defer <n> --until tomorrow --reason "…"`) |
 
 `gbd list` is a tree. `gbd dep tree <n>` shows blockers, blockees, and sub-issues.
+
+## Statuses
+
+Built-ins, by category: Ready (`active`), In Progress (`wip`), Blocked (`wip`, derived — not set by hand), Deferred (`frozen`), Done (`done`).
+
+Custom columns are `statuses:` in `.gbd.yml`, or `gbd config set status.custom "name:category,…"`. Categories are `active` (ready work), `wip`, `frozen`, and `done`. Names are lowercase `[a-z0-9_]`. `gbd prime` prints the ones this repo configured, including each column's Title Case name (`in_review` → In Review). `gbd update <n> --status <name>` moves the card. `gbd ready` lists `active` columns only. Removing a name from the config leaves the column on the board.
 
 ## Memories
 

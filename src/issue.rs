@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::fields;
 use crate::gh;
 use crate::repo::Repo;
+use crate::status::{self, CustomStatus};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +49,9 @@ pub struct Issue {
     pub memory: bool,
     /// Project Status option name, when the issue is on the configured board.
     pub status: Option<String>,
+    /// Category of `status` (`active`, `wip`, `frozen`, `done`).
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// `show`: the record plus everything hanging off it.
@@ -401,6 +405,7 @@ fn node_id_at(data: &Value, key: &str, repo: &Repo, number: u64) -> Result<Strin
 pub struct Scope<'a> {
     pub project: Option<u64>,
     pub owner: &'a str,
+    pub customs: &'a [CustomStatus],
 }
 
 /// Page every open issue into memory. One GraphQL call per 100 issues.
@@ -554,7 +559,7 @@ pub fn from_graphql(node: &Value, scope: Scope<'_>, today: &str) -> Option<Issue
         _ => State::Open,
     };
     let start_date = fields::graphql_start_date(node);
-    Some(Issue {
+    let mut issue = Issue {
         id: str_at(node, "id").unwrap_or("").to_string(),
         number,
         title,
@@ -589,7 +594,19 @@ pub fn from_graphql(node: &Value, scope: Scope<'_>, today: &str) -> Option<Issue
             }
             status
         }),
-    })
+        category: None,
+    };
+    annotate(&mut issue, scope.customs);
+    Some(issue)
+}
+
+/// Fill `category` from the column name and the configured customs.
+pub fn annotate(issue: &mut Issue, customs: &[CustomStatus]) {
+    issue.category = issue
+        .status
+        .as_deref()
+        .and_then(|s| status::category_of(s, customs))
+        .map(|c| c.as_str().to_string());
 }
 
 fn related(node: &Value, key: &str, scope: Scope<'_>, today: &str) -> Vec<Issue> {
@@ -714,6 +731,7 @@ mod tests {
         Scope {
             project,
             owner: "acme",
+            customs: &[],
         }
     }
 

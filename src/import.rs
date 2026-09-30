@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::beads::{self, Bead, Export, Kind, Status};
 use crate::project;
+use crate::status::{self, CustomStatus};
 
 /// GitHub's three close reasons, chosen from Beads' free-text
 /// `close_reason`.
@@ -91,8 +92,8 @@ pub struct Item {
     pub blocked_by: Vec<String>,
     pub assignee: Option<String>,
     pub state: State,
-    /// Board Status once created.
-    pub status: &'static str,
+    /// Board Status once created. A custom column is its Title Case name.
+    pub status: String,
     /// Org field Start date, `YYYY-MM-DD`.
     pub start_date: Option<String>,
     /// Beads labels. Never written as labels: they go into the body's
@@ -382,16 +383,25 @@ fn comments_of(b: &Bead) -> Vec<String> {
 }
 
 /// Where the card lands. `open_blocker` says whether any blocker in the
-/// export is still open.
-fn board_status(b: &Bead, open_blocker: bool) -> &'static str {
-    match b.status {
-        Status::Closed => project::STATUS_DONE,
-        // A date wins over in_progress: deferred work is not being worked.
-        Status::Deferred => project::STATUS_DEFERRED,
-        _ if b.defer_until.is_some() => project::STATUS_DEFERRED,
-        Status::InProgress => project::STATUS_IN_PROGRESS,
-        _ if open_blocker => project::STATUS_BLOCKED,
-        _ => project::STATUS_READY,
+/// export is still open. A configured custom of the same name wins; else
+/// the Beads category (export `status.custom`, or `pinned` / `hooked`)
+/// maps to that category's built-in column.
+fn board_status(
+    b: &Bead,
+    open_blocker: bool,
+    gbd: &[CustomStatus],
+    beads_cfg: &[CustomStatus],
+) -> String {
+    match &b.status {
+        Status::Closed => project::STATUS_DONE.to_string(),
+        // A date wins over in_progress and over a custom: deferred work is
+        // not being worked.
+        Status::Deferred => project::STATUS_DEFERRED.to_string(),
+        _ if b.defer_until.is_some() => project::STATUS_DEFERRED.to_string(),
+        Status::InProgress => project::STATUS_IN_PROGRESS.to_string(),
+        Status::Other(name) => status::column_for_beads_custom(name, open_blocker, gbd, beads_cfg),
+        _ if open_blocker => project::STATUS_BLOCKED.to_string(),
+        _ => project::STATUS_READY.to_string(),
     }
 }
 
@@ -556,6 +566,12 @@ pub const SUB_ISSUE_CAP: usize = 100;
 pub const SUB_ISSUE_CAP_WHY: &str = "GitHub allows 100 sub-issues per parent";
 
 pub fn plan(export: &Export) -> Plan {
+    plan_configured(export, &[])
+}
+
+/// `gbd_statuses` is this repo's `.gbd.yml`. The export's own
+/// `status.custom` is the fallback for a name this repo has not configured.
+pub fn plan_configured(export: &Export, gbd_statuses: &[CustomStatus]) -> Plan {
     let by_id: HashMap<&str, &Bead> = export.issues.iter().map(|b| (b.id.as_str(), b)).collect();
     let (placed, stuck) = order(export);
     let (behind, cycle_groups) = residual(export, &stuck);
@@ -666,7 +682,7 @@ pub fn plan(export: &Export) -> Plan {
             blocked_by,
             assignee: b.assignee.clone(),
             state,
-            status: board_status(b, open_blocker),
+            status: board_status(b, open_blocker, gbd_statuses, &export.status_custom),
             start_date,
             labels: b.labels.clone(),
             body: body_of(b, &dropped, &relates_to),
@@ -1478,7 +1494,7 @@ pub fn render(p: &Plan, source: &str, order_lines: usize) -> String {
         format!("{label:<11} {}\n", parts.join(", "))
     };
     out.push_str(&line("By type:", &count(&|i| i.issue_type.to_string())));
-    out.push_str(&line("Board:", &count(&|i| i.status.to_string())));
+    out.push_str(&line("Board:", &count(&|i| i.status.clone())));
     out.push_str(&line(
         "State:",
         &count(&|i| match i.state {
@@ -2460,6 +2476,102 @@ mod tests {
         assert!(
             text.contains("← parent wx-1, blocked by wx-2")
                 || render(&p, "x", 8).contains("← parent wx-1, blocked by wx-2")
+        );
+    }
+
+    fn bead(status: &str, blocked_by: &str) -> String {
+        let dep = if blocked_by.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#","dependencies":[{{"issue_id":"p-1","depends_on_id":"{blocked_by}","type":"blocks"}}]"#
+            )
+        };
+        format!(
+            r#"{{"_type":"issue","id":"p-1","title":"pin","issue_type":"task","status":"{status}","priority":2,"created_at":"t"{dep}}}"#
+        )
+    }
+
+    #[test]
+    fn pinned_uses_the_configured_column_or_deferred() {
+        let lines = bead("pinned", "");
+        let export = beads::parse(lines.as_bytes()).unwrap();
+        assert!(
+            export
+                .problems
+                .iter()
+                .all(|p| !p.what.contains("unknown status")),
+            "pinned is a known Beads status: {:?}",
+            export.problems
+        );
+        assert_eq!(plan(&export).items[0].status, project::STATUS_DEFERRED);
+        let configured = plan_configured(
+            &export,
+            &[CustomStatus {
+                name: "pinned".into(),
+                category: crate::status::Category::Frozen,
+            }],
+        );
+        assert_eq!(configured.items[0].status, "Pinned");
+
+        let hooked = beads::parse(bead("hooked", "").as_bytes()).unwrap();
+        assert_eq!(plan(&hooked).items[0].status, project::STATUS_IN_PROGRESS);
+
+        let mut with_blocker = bead("triage", "gone");
+        with_blocker.push('\n');
+        with_blocker.push_str(
+            r#"{"_type":"issue","id":"gone","title":"open","issue_type":"task","status":"open","priority":2,"created_at":"t"}"#,
+        );
+        with_blocker.push('\n');
+        with_blocker.push_str(
+            r#"{"_type":"config","key":"status.custom","value":"triage:active,pinned:frozen"}"#,
+        );
+        let export = beads::parse(with_blocker.as_bytes()).unwrap();
+        assert_eq!(export.status_custom.len(), 2);
+        assert_eq!(
+            plan(&export)
+                .items
+                .iter()
+                .find(|i| i.bead == "p-1")
+                .unwrap()
+                .status,
+            project::STATUS_BLOCKED,
+            "an active custom with an open blocker is Blocked even when only the export names it"
+        );
+        let free = beads::parse(
+            format!(
+                "{}\n{{\"id\":\"t-2\",\"title\":\"triage\",\"issue_type\":\"task\",\"status\":\"triage\",\"priority\":2,\"created_at\":\"t\"}}\n{{\"_type\":\"config\",\"key\":\"status.custom\",\"value\":\"triage:active\"}}\n",
+                bead("pinned", "")
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan(&free)
+                .items
+                .iter()
+                .find(|i| i.bead == "t-2")
+                .unwrap()
+                .status,
+            project::STATUS_READY,
+            "unconfigured active custom with no blocker uses Ready"
+        );
+        let configured = plan_configured(
+            &export,
+            &[CustomStatus {
+                name: "triage".into(),
+                category: crate::status::Category::Active,
+            }],
+        );
+        assert_eq!(
+            configured
+                .items
+                .iter()
+                .find(|i| i.bead == "p-1")
+                .unwrap()
+                .status,
+            project::STATUS_BLOCKED,
+            "configured active custom with an open blocker is Blocked"
         );
     }
 }

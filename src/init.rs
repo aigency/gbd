@@ -21,7 +21,7 @@ This repo tracks work with **gbd** (GitHub Issues + Projects). Do not use Beads 
 - Session start: `gbd prime`
 - Loop: `gbd ready` → `gbd show <n>` → `gbd update <n> --claim` → `gbd close <n>`
 - Create: `gbd create "…" -t Task -p 1 --parent 88 --deps 12`
-- State: `gbd update <n> --status in_progress|deferred|ready` (board), `gbd priority <n> P1` (org field). Never labels.
+- State: `gbd update <n> --status in_progress|deferred|ready` (board; custom statuses in `.gbd.yml`), `gbd priority <n> P1` (org field). Never labels.
 - Lore: `gbd remember "insight"` (not MEMORY.md)
 - Migrate from Beads: `gbd import --from-beads FILE --dry-run` (one shot, not a sync)
 
@@ -68,10 +68,16 @@ One command. Type, priority, parent, blocked-by together:
 | blocks / blocked-by | issue dependencies (`gbd dep add <n> <blocker>`) |
 | related / relates-to | relates-to relationship (`gbd dep relate <a> <b>`, bidirectional, does not block) |
 | parent / epic | sub-issues (`gbd parent <n> --set <epic>`) |
-| in_progress / deferred | Project **Status** (`gbd update <n> --status in_progress`) |
+| in_progress / deferred | Project **Status** (`gbd update <n> --status in_progress`; custom names from `.gbd.yml`) |
 | defer until | org field **Start date** (`gbd defer <n> --until tomorrow --reason "…"`) |
 
 `gbd list` is a tree. `gbd dep tree <n>` shows blockers, blockees, and sub-issues.
+
+## Statuses
+
+Built-ins, by category: Ready (`active`), In Progress (`wip`), Blocked (`wip`, derived — not set by hand), Deferred (`frozen`), Done (`done`).
+
+Custom columns are `statuses:` in `.gbd.yml`, or `gbd config set status.custom "name:category,…"`. Categories are `active` (ready work), `wip`, `frozen`, and `done`. Names are lowercase `[a-z0-9_]`. `gbd prime` prints the ones this repo configured, including each column's Title Case name (`in_review` → In Review). `gbd update <n> --status <name>` moves the card. `gbd ready` lists `active` columns only. Removing a name from the config leaves the column on the board.
 
 ## Memories
 
@@ -356,7 +362,7 @@ fn ensure_board(repo: &Repo, cfg: &mut Config) -> Result<Board> {
         Some(n) => n,
         None => match project::find_linked(repo, &title)?.as_slice() {
             [] => {
-                let board = project::create(repo, &title)?;
+                let board = project::create(repo, &title, &cfg.statuses)?;
                 cfg.project = Some(board.number);
                 return Ok(board);
             }
@@ -371,7 +377,7 @@ fn ensure_board(repo: &Repo, cfg: &mut Config) -> Result<Board> {
         },
     };
     let mut board = Board::load(repo.owner(), number)?;
-    board.ensure_statuses(false)?;
+    board.ensure_statuses(false, &cfg.statuses)?;
     cfg.project = Some(number);
     Ok(board)
 }
@@ -758,12 +764,18 @@ pub fn doctor(
             ),
             Some(n) => match Board::load(repo.owner(), n) {
                 Ok(b) => {
-                    let missing: Vec<&str> = project::STATUSES
+                    let missing: Vec<String> = crate::status::column_order(&cfg.statuses)
                         .iter()
-                        .map(|(name, _)| *name)
-                        .filter(|name| !b.has_status(name))
+                        .filter(|c| !b.has_column(&c.name))
+                        .map(|c| c.name.clone())
                         .collect();
-                    if missing.is_empty() {
+                    let uncategorized: Vec<String> = b
+                        .status_options
+                        .iter()
+                        .filter(|o| crate::status::category_of(&o.name, &cfg.statuses).is_none())
+                        .map(|o| o.name.clone())
+                        .collect();
+                    if missing.is_empty() && uncategorized.is_empty() {
                         push(
                             &mut lines,
                             "board",
@@ -772,16 +784,23 @@ pub fn doctor(
                             false,
                         );
                     } else {
-                        push(
-                            &mut lines,
-                            "board",
-                            true,
+                        let mut detail = if missing.is_empty() {
+                            format!("#{n} {} {}", b.title, b.url)
+                        } else {
                             format!(
                                 "#{n} missing Status options {}. Run: gbd init",
                                 missing.join(", ")
-                            ),
-                            true,
-                        );
+                            )
+                        };
+                        if !uncategorized.is_empty() {
+                            let _ = write!(
+                                detail,
+                                " Status option{} with no category: {}.",
+                                if uncategorized.len() == 1 { "" } else { "s" },
+                                uncategorized.join(", ")
+                            );
+                        }
+                        push(&mut lines, "board", true, detail, true);
                     }
                     let by_hand = format!(
                         "By hand: name {}, board layout, filter {}",
