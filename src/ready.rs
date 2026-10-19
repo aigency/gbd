@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use crate::issue::Issue;
+use crate::status::{self, Category, CustomStatus};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReadyItem {
@@ -18,6 +19,10 @@ pub struct ReadyItem {
     pub height: u32,
     pub parent: Option<u64>,
     pub explain: String,
+    /// Board column, when the issue is on one.
+    pub status: Option<String>,
+    /// Always `active`: `ready` only returns active columns.
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,6 +113,13 @@ pub fn critical_path_height(issues: &[Issue]) -> HashMap<u64, u32> {
 }
 
 pub fn rank(issues: &[Issue], opts: &RankOpts) -> Vec<ReadyItem> {
+    rank_with(issues, opts, &[])
+}
+
+/// `customs` decides which columns are `active`. A future Start date still
+/// defers. No column keeps the old signals: an assignee is in progress, a
+/// future Start date is deferred.
+pub fn rank_with(issues: &[Issue], opts: &RankOpts, customs: &[CustomStatus]) -> Vec<ReadyItem> {
     let blocked = blocked_set(issues, opts.strict_parent);
     let heights = critical_path_height(issues);
     let mut items: Vec<ReadyItem> = issues
@@ -116,8 +128,8 @@ pub fn rank(issues: &[Issue], opts: &RankOpts) -> Vec<ReadyItem> {
             i.is_open()
                 && !i.memory
                 && !blocked.contains(&i.number)
-                && !i.is_deferred()
-                && !i.in_progress()
+                && !i.deferred
+                && active_column(i, customs)
                 // Unclaimed is its own predicate, separate from board Status:
                 // claim fails on any assigned issue (spec), so an issue someone
                 // owns but left at Ready is not offerable to other agents.
@@ -140,6 +152,8 @@ pub fn rank(issues: &[Issue], opts: &RankOpts) -> Vec<ReadyItem> {
                     "no open blockers; unblocks {unblocks}; path height {height}; P{}",
                     i.priority
                 ),
+                status: i.status.clone(),
+                category: Some(Category::Active.as_str().to_string()),
             }
         })
         .collect();
@@ -166,6 +180,15 @@ pub fn rank(issues: &[Issue], opts: &RankOpts) -> Vec<ReadyItem> {
     items
 }
 
+/// Ready, a custom `active` column, or no column at all. `wip`, `frozen`,
+/// `done`, and a column with no category are not candidates.
+fn active_column(i: &Issue, customs: &[CustomStatus]) -> bool {
+    match i.status.as_deref() {
+        None => i.assignees.is_empty(),
+        Some(s) => status::category_of(s, customs) == Some(Category::Active),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +212,7 @@ mod tests {
             deferred: false,
             memory: false,
             status: None,
+            category: None,
         }
     }
 
@@ -326,5 +350,40 @@ mod tests {
         assert_eq!(h[&1], 3);
         assert_eq!(h[&2], 2);
         assert_eq!(h[&3], 1);
+    }
+
+    #[test]
+    fn custom_active_is_ready_wip_and_frozen_are_not() {
+        let customs = [
+            CustomStatus {
+                name: "triage".into(),
+                category: Category::Active,
+            },
+            CustomStatus {
+                name: "in_review".into(),
+                category: Category::Wip,
+            },
+            CustomStatus {
+                name: "pinned".into(),
+                category: Category::Frozen,
+            },
+        ];
+        let mut triage = issue(1, "triage");
+        triage.status = Some("Triage".into());
+        let mut review = issue(2, "review");
+        review.status = Some("In Review".into());
+        let mut pinned = issue(3, "pin");
+        pinned.status = Some("pinned".into());
+        let mut blocked = issue(4, "held");
+        blocked.status = Some("Triage".into());
+        blocked.open_blockers = 1;
+        let items = rank_with(
+            &[triage, review, pinned, blocked],
+            &RankOpts::default(),
+            &customs,
+        );
+        assert_eq!(numbers(&items), vec![1]);
+        assert_eq!(items[0].category.as_deref(), Some("active"));
+        assert_eq!(items[0].status.as_deref(), Some("Triage"));
     }
 }

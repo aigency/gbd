@@ -14,6 +14,7 @@ pub mod project;
 pub mod ready;
 pub mod render;
 pub mod repo;
+pub mod status;
 
 pub fn run() -> anyhow::Result<u8> {
     cli::run()

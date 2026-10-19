@@ -4,7 +4,7 @@ This repo tracks work with **gbd** (GitHub Issues + Projects). Do not use Beads 
 - Session start: `gbd prime`
 - Loop: `gbd ready` → `gbd show <n>` → `gbd update <n> --claim` → `gbd close <n>`
 - Create: `gbd create "…" -t Task -p 1 --parent 88 --deps 12`
-- State: `gbd update <n> --status in_progress|deferred|ready` (board), `gbd priority <n> P1` (org field). Never labels.
+- State: `gbd update <n> --status in_progress|deferred|ready` (board; custom statuses in `.gbd.yml`), `gbd priority <n> P1` (org field). Never labels.
 - Lore: `gbd remember "insight"` (not MEMORY.md)
 - Migrate from Beads: `gbd import --from-beads FILE --dry-run` (one shot, not a sync)
 

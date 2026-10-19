@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- feat(status): custom board columns with Beads categories (`active`, `wip`, `frozen`, `done`), including import of `pinned` and `hooked`
+
 ## [1.9.0] - 2026-09-30
 
 ### Added

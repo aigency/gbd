@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::fields;
 use crate::gh;
 use crate::repo::Repo;
+use crate::status::{self, CustomStatus};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +49,9 @@ pub struct Issue {
     pub memory: bool,
     /// Project Status option name, when the issue is on the configured board.
     pub status: Option<String>,
+    /// Category of `status` (`active`, `wip`, `frozen`, `done`).
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// `show`: the record plus everything hanging off it.
@@ -401,6 +405,7 @@ fn node_id_at(data: &Value, key: &str, repo: &Repo, number: u64) -> Result<Strin
 pub struct Scope<'a> {
     pub project: Option<u64>,
     pub owner: &'a str,
+    pub customs: &'a [CustomStatus],
 }
 
 /// Page every open issue into memory. One GraphQL call per 100 issues.
@@ -453,6 +458,58 @@ pub fn search(q: &str, limit: usize, scope: Scope<'_>) -> Result<Vec<Issue>> {
     }
     all.truncate(limit);
     Ok(all)
+}
+
+/// Like [`search`], but keep paging until `limit` issues pass `keep` or the
+/// search runs out. Callers that drop rows after the fact (frozen cards in
+/// `gbd stale`) would otherwise fill the cap with issues they then discard
+/// and never see the later pages. Scanning stops at 5000 nodes, the same
+/// bound as [`snapshot`](crate::issue::snapshot).
+pub fn search_where(
+    q: &str,
+    limit: usize,
+    scope: Scope<'_>,
+    keep: impl Fn(&Issue) -> bool,
+) -> Result<Vec<Issue>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query = search_query(scope.project.is_some());
+    let today = fields::today_utc();
+    let mut kept = Vec::new();
+    let mut scanned = 0usize;
+    let mut cursor: Option<String> = None;
+    let mut capped = false;
+    loop {
+        let first = (limit - kept.len()).min(100).to_string();
+        let mut vars: Vec<(&str, &str)> = vec![("q", q), ("first", &first)];
+        if let Some(c) = &cursor {
+            vars.push(("cursor", c));
+        }
+        let data = gh::graphql(&query, &vars)?;
+        let (page, next) = page(&data, &["data", "search"], scope, &today)?;
+        if page.is_empty() {
+            break;
+        }
+        scanned += page.len();
+        kept.extend(page.into_iter().filter(|i| keep(i)));
+        if next.is_some() && next == cursor {
+            bail!("pagination did not advance (cursor {next:?} repeated)");
+        }
+        cursor = next;
+        if cursor.is_none() || kept.len() >= limit {
+            break;
+        }
+        if scanned >= 5000 {
+            capped = true;
+            break;
+        }
+    }
+    if capped {
+        eprintln!("warning: stopped after scanning {scanned} issues; more may match");
+    }
+    kept.truncate(limit);
+    Ok(kept)
 }
 
 pub fn fetch(repo: &Repo, number: u64, scope: Scope<'_>) -> Result<Detail> {
@@ -554,7 +611,7 @@ pub fn from_graphql(node: &Value, scope: Scope<'_>, today: &str) -> Option<Issue
         _ => State::Open,
     };
     let start_date = fields::graphql_start_date(node);
-    Some(Issue {
+    let mut issue = Issue {
         id: str_at(node, "id").unwrap_or("").to_string(),
         number,
         title,
@@ -589,7 +646,19 @@ pub fn from_graphql(node: &Value, scope: Scope<'_>, today: &str) -> Option<Issue
             }
             status
         }),
-    })
+        category: None,
+    };
+    annotate(&mut issue, scope.customs);
+    Some(issue)
+}
+
+/// Fill `category` from the column name and the configured customs.
+pub fn annotate(issue: &mut Issue, customs: &[CustomStatus]) {
+    issue.category = issue
+        .status
+        .as_deref()
+        .and_then(|s| status::category_of(s, customs))
+        .map(|c| c.as_str().to_string());
 }
 
 fn related(node: &Value, key: &str, scope: Scope<'_>, today: &str) -> Vec<Issue> {
@@ -714,6 +783,7 @@ mod tests {
         Scope {
             project,
             owner: "acme",
+            customs: &[],
         }
     }
 
